@@ -1,0 +1,22 @@
+package com.user.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class ReturnPolicyConditionResponseDTO {
+
+	private Long id;
+
+	private Long policyId;
+
+	private String conditionType;
+
+	private String conditionValue;
+
+}

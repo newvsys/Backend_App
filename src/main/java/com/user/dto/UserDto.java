@@ -1,9 +1,11 @@
 package com.user.dto;
 
-import lombok.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.time.OffsetDateTime;
-import java.util.UUID;
 
 @Data
 @NoArgsConstructor
@@ -11,16 +13,34 @@ import java.util.UUID;
 @Builder
 public class UserDto {
 
-    private UUID id;
-    private String email;
-    private String phone;
-    private String firstName;
-    private String lastName;
-    private Boolean isActive=true;
-    private String locale="en";
-    private OffsetDateTime emailVerifiedAt;
-    private OffsetDateTime phoneVerifiedAt;
-    private String metadata;
-    private OffsetDateTime createdAt= OffsetDateTime.now();
-    private OffsetDateTime updatedAt=OffsetDateTime.now();
+	private Integer id;
+
+	private String email;
+
+	private String role;
+
+	private String phone;
+
+	private String firstName;
+
+	private String lastName;
+
+	private String password;
+
+	private String passwordHash;
+
+	private Boolean isActive = true;
+
+	private String locale = "en";
+
+	private OffsetDateTime emailVerifiedAt;
+
+	private OffsetDateTime phoneVerifiedAt;
+
+	private String metadata;
+
+	private OffsetDateTime createdAt = OffsetDateTime.now();
+
+	private OffsetDateTime updatedAt = OffsetDateTime.now();
+
 }
