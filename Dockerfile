@@ -1,26 +1,48 @@
-# ======================
-# Build Stage
-# ======================
-FROM maven:3.9.6-eclipse-temurin-21 AS builder
-WORKDIR /app
-COPY . .
-RUN mvn clean package -DskipTests
+version: '3.9'
 
-# ======================
-# Run Stage
-# ======================
-FROM eclipse-temurin:21-jdk
-WORKDIR /app
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: onlineshopping
+      POSTGRES_DB: onlineshop
+      TZ: Asia/Kolkata
+      PGTZ: Asia/Kolkata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # <== FIXED
+    healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres"]
+          interval: 10s
+          timeout: 5s
+          retries: 5
+    networks:
+      - mynetwork
 
-# Copy jar from builder stage
-COPY --from=builder /app/target/*.jar app.jar
 
-# Ensure logs directory exists for Log4j2 file appender
-RUN mkdir -p /app/logs
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/onlineshop
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: onlineshopping
+    ports:
+      - "8080:8080"
 
-# Expose ports (application + debug)
-EXPOSE 8080
-EXPOSE 5005
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - mynetwork
 
-# Enable Remote Debugging
-ENTRYPOINT ["java", "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005", "-jar", "app.jar"]
+volumes:
+  postgres_data:
+
+
+networks:
+  mynetwork:
+
