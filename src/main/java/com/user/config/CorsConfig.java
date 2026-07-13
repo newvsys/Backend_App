@@ -47,6 +47,9 @@ public class CorsConfig {
 		return new RestTemplate();
 	}
 
+	@Value("${cors.allowed-origins}")
+	private String allowedOrigins;
+
 	@Value("${label.pdf.dir:/public/labels/}")
 	private String labelPdfDir;
 
@@ -56,7 +59,7 @@ public class CorsConfig {
 			@Override
 			public void addCorsMappings(CorsRegistry registry) {
 				registry.addMapping("/**")
-					.allowedOrigins("http://localhost:3000")
+					.allowedOrigins(allowedOrigins.split(","))
 					.allowedMethods("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
 					.allowedHeaders("*")
 					.allowCredentials(true);
