@@ -7,6 +7,7 @@ WORKDIR /build
 
 # Copy Maven wrapper and POM first (layer-cache friendly)
 COPY mvnw mvnw.cmd ./
+COPY .mvn .mvn
 COPY pom.xml ./
 
 # Make the Maven wrapper executable
