@@ -27,6 +27,9 @@ FROM eclipse-temurin:21-jre-alpine
 
 WORKDIR /app
 
+# Install su-exec for privilege dropping in the entrypoint
+RUN apk add --no-cache su-exec
+
 # Create a non-root user for security
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
@@ -36,8 +39,9 @@ RUN mkdir -p /app/logs && chown -R appuser:appgroup /app
 # Copy the fat JAR from the builder stage
 COPY --from=builder /build/target/*.jar app.jar
 
-# Switch to the non-root user
-USER appuser
+# Copy and enable the entrypoint script (runs as root to fix volume permissions)
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Expose the application port
 EXPOSE 8080
@@ -45,5 +49,5 @@ EXPOSE 8080
 # JVM tuning: use container-aware memory settings
 ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/./urandom"
 
-ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+ENTRYPOINT ["/entrypoint.sh"]
 
