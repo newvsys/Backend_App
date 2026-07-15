@@ -35,8 +35,12 @@ public class ProductCategoriesEO {
 	@Column(length = 300, nullable = false)
 	private String href;
 
-	@Column(length = 300)
+	@Column(columnDefinition = "text")
 	private String src;
+
+	/** Cloudinary public_id for the category image (used for deletion on update). */
+	@Column(name = "src_public_id", columnDefinition = "text")
+	private String srcPublicId;
 
 	@Column(columnDefinition = "text")
 	private String description;

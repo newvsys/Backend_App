@@ -9,6 +9,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
+import jakarta.servlet.DispatcherType;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -23,11 +24,12 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 import org.springframework.web.filter.CorsFilter;
-import org.springframework.web.servlet.config.annotation.CorsRegistry;
 import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @Configuration
@@ -63,11 +65,16 @@ public class CorsConfig {
 	public FilterRegistrationBean<CorsFilter> corsFilterRegistration() {
 		CorsConfiguration config = new CorsConfiguration();
 		config.setAllowCredentials(true);
-		Arrays.stream(allowedOriginPatterns.split(","))
+
+		List<String> origins = Arrays.stream(allowedOriginPatterns.split(","))
 				.map(String::trim)
-				.forEach(config::addAllowedOriginPattern);
+				.filter(s -> !s.isEmpty())
+				.toList();
+		origins.forEach(config::addAllowedOriginPattern);
+
 		config.addAllowedHeader("*");
 		config.addAllowedMethod("*");
+		config.setExposedHeaders(List.of("Authorization", "Content-Disposition", "X-Total-Count"));
 		config.setMaxAge(3600L);
 
 		UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
@@ -75,26 +82,21 @@ public class CorsConfig {
 
 		FilterRegistrationBean<CorsFilter> bean = new FilterRegistrationBean<>(new CorsFilter(source));
 		bean.setOrder(Ordered.HIGHEST_PRECEDENCE);
+		// Also apply CORS headers on error-dispatched responses so the browser
+		// sees the real HTTP error (404, 500…) instead of a fake CORS error.
+		bean.setDispatcherTypes(EnumSet.of(
+				DispatcherType.REQUEST,
+				DispatcherType.ASYNC,
+				DispatcherType.ERROR
+		));
 		return bean;
 	}
 
 	@Bean
-	public WebMvcConfigurer corsConfigurer() {
+	public WebMvcConfigurer webMvcConfigurer() {
 		return new WebMvcConfigurer() {
 			@Override
-			public void addCorsMappings(CorsRegistry registry) {
-				registry.addMapping("/**")
-						.allowedOriginPatterns(allowedOriginPatterns.split(","))
-						.allowedMethods("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
-						.allowedHeaders("*")
-						.allowCredentials(true);
-			}
-
-			@Override
 			public void addResourceHandlers(ResourceHandlerRegistry registry) {
-				// Serve generated label PDFs from the /public/labels/ filesystem
-				// directory
-				// e.g. GET /labels/labels_xxx.pdf → /public/labels/labels_xxx.pdf
 				String dir = labelPdfDir.endsWith("/") ? labelPdfDir : labelPdfDir + "/";
 				registry.addResourceHandler("/labels/**").addResourceLocations("file:" + dir);
 			}

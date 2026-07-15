@@ -1,8 +1,7 @@
-version: '3.9'
-
 services:
   db:
     image: postgres:15
+    container_name: app-db
     restart: always
     environment:
       POSTGRES_USER: postgres
@@ -11,23 +10,29 @@ services:
       TZ: Asia/Kolkata
       PGTZ: Asia/Kolkata
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data   # <== FIXED
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - mynetwork
-
 
   app:
     build: .
     container_name: springboot_app
     restart: always
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/onlineshop
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: onlineshopping
+      CORS_ALLOWED_ORIGIN_PATTERNS: "http://localhost:3000,http://localhost:8080,https://*.vercel.app,https://kuchimittai.com,https://www.kuchimittai.com"
     ports:
       - "8080:8080"
       - "5005:5005"
@@ -39,7 +44,6 @@ services:
 
 volumes:
   postgres_data:
-    name: postgres_data
 
 networks:
   mynetwork:

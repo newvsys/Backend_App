@@ -129,6 +129,9 @@ public class OrderServiceImpl implements OrderService {
 	private String returnImageUploadDir;
 
 	@Autowired
+	private CloudinaryMediaService cloudinaryMediaService;
+
+	@Autowired
 	private ShipmentTrackingHistoryRepository shipmentTrackingHistoryRepository;
 
 	@Autowired
@@ -1286,24 +1289,16 @@ public class OrderServiceImpl implements OrderService {
 			if (images != null && !images.isEmpty()) {
 				for (MultipartFile image : images) {
 					try {
-						String originalFilename = image.getOriginalFilename();
-						String uploadDir = normalizedUploadDir(returnImageUploadDir);
-						File dir = new File(uploadDir);
-						if (!dir.exists()) {
-							dir.mkdirs();
-						}
-						String timestamp = String.valueOf(System.currentTimeMillis());
-						String filename = timestamp + "_" + originalFilename;
-						String filePath = uploadDir + filename;
-						image.transferTo(new File(filePath));
+						Map<String, String> uploadResult = cloudinaryMediaService.uploadImage(image,
+								"kuchimittai/returns");
 						ReturnImageEO returnImage = new ReturnImageEO();
 						returnImage.setReturnRequest(savedReturn);
-						returnImage.setImageUrl(filePath);
+						returnImage.setImageUrl(uploadResult.get("secure_url"));
 						returnImageRepository.save(returnImage);
-						logger.info("Saved return image={} for returnId={}", filename, savedReturn.getReturnId());
+						logger.info("Saved return image to Cloudinary for returnId={}", savedReturn.getReturnId());
 					}
 					catch (Exception e) {
-						logger.error("Failed to save image for returnId={}: {}", savedReturn.getReturnId(),
+						logger.error("Failed to upload return image for returnId={}: {}", savedReturn.getReturnId(),
 								e.getMessage(), e);
 					}
 				}

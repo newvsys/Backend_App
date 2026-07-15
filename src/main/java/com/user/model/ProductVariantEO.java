@@ -89,8 +89,12 @@ public class ProductVariantEO {
 	@Column(name = "weight", precision = 10, scale = 2)
 	private BigDecimal weight;
 
-	@Column(name = "video_url", length = 500)
+	@Column(name = "video_url", columnDefinition = "text")
 	private String videoUrl;
+
+	/** Cloudinary public_id for the variant video (used for deletion on update). */
+	@Column(name = "video_public_id", columnDefinition = "text")
+	private String videoPublicId;
 
 	@PrePersist
 	protected void onCreate() {

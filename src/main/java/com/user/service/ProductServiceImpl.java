@@ -113,6 +113,9 @@ public class ProductServiceImpl implements ProductService {
 	@org.springframework.context.annotation.Lazy
 	private OrderService orderService;
 
+	@Autowired
+	private CloudinaryMediaService cloudinaryMediaService;
+
 	@Override
 	@CacheEvict(value = "categories", allEntries = true)
 	public CategoryDTO createProductCat(CategoryCreateDTO categoryCreateDTO, MultipartFile imageFile) {
@@ -152,6 +155,10 @@ public class ProductServiceImpl implements ProductService {
 		}
 
 		if (imageFile != null && !imageFile.isEmpty()) {
+			// Delete old image from Cloudinary before uploading the replacement
+			if (existing.getSrcPublicId() != null && !existing.getSrcPublicId().isBlank()) {
+				cloudinaryMediaService.delete(existing.getSrcPublicId(), "image");
+			}
 			savePngToUploadDirAndSetSrc(existing, imageFile);
 		}
 
@@ -384,15 +391,9 @@ public class ProductServiceImpl implements ProductService {
 						&& !videoFilename.toLowerCase().endsWith(".webm"))) {
 					throw new IllegalArgumentException("Only MP4, MOV, AVI, WEBM video files are allowed.");
 				}
-				String uploadDir = normalizedUploadDir(categoryImageUploadDir);
-				File dir = new File(uploadDir);
-				if (!dir.exists()) {
-					dir.mkdirs();
-				}
-				String timestamp = String.valueOf(System.currentTimeMillis());
-				String filename = timestamp + "_" + videoFilename;
-				video.transferTo(new File(uploadDir + filename));
-				productVarEO.setVideoUrl(filename);
+				Map<String, String> videoResult = cloudinaryMediaService.uploadVideo(video, "kuchimittai/products");
+				productVarEO.setVideoUrl(videoResult.get("secure_url"));
+				productVarEO.setVideoPublicId(videoResult.get("public_id"));
 			}
 
 			ProductVariantEO savedEntity = productVariantRepository.save(productVarEO);
@@ -407,23 +408,15 @@ public class ProductServiceImpl implements ProductService {
 						continue;
 					}
 
-					String originalFilename = image.getOriginalFilename();
-					if (originalFilename == null || !originalFilename.toLowerCase().endsWith(".png")) {
-						throw new IllegalArgumentException("Only PNG images are allowed.");
-					}
-					String uploadDir = normalizedUploadDir(categoryImageUploadDir);
-					File dir = new File(uploadDir);
-					if (!dir.exists()) {
-						dir.mkdirs();
-					}
-					String timestamp = String.valueOf(System.currentTimeMillis());
-					String filename = timestamp + "_" + originalFilename;
-					String filePath = uploadDir + filename;
-					image.transferTo(new File(filePath));
-					ProductImageEO productImageEO = new ProductImageEO();
-					productImageEO.setProductVar(savedEntity);
-					productImageEO.setImagePath(filePath);
-					productImageEO.setImage(filename);
+				String originalFilename = image.getOriginalFilename();
+				if (originalFilename == null || !originalFilename.toLowerCase().endsWith(".png")) {
+					throw new IllegalArgumentException("Only PNG images are allowed.");
+				}
+				Map<String, String> imgResult = cloudinaryMediaService.uploadImage(image, "kuchimittai/products");
+				ProductImageEO productImageEO = new ProductImageEO();
+				productImageEO.setProductVar(savedEntity);
+				productImageEO.setImage(imgResult.get("secure_url"));
+				productImageEO.setImagePath(imgResult.get("public_id"));
 					productImageEO.setIsMainImage(imageCounter == effectiveMainIndex ? "Y" : "N");
 					imageCounter++;
 					productImageEO = productImageRepository.save(productImageEO);
@@ -496,19 +489,13 @@ public class ProductServiceImpl implements ProductService {
 						&& !videoFilename.toLowerCase().endsWith(".webm"))) {
 					throw new IllegalArgumentException("Only MP4, MOV, AVI, WEBM video files are allowed.");
 				}
-				String uploadDir = normalizedUploadDir(categoryImageUploadDir);
-				new File(uploadDir).mkdirs();
-				// Delete the existing video file from filesystem before saving new one
-				if (existingVariant.getVideoUrl() != null && !existingVariant.getVideoUrl().isEmpty()) {
-					File oldFile = new File(uploadDir + existingVariant.getVideoUrl());
-					if (oldFile.exists()) {
-						oldFile.delete();
-						logger.info("Deleted old video file: {}", oldFile.getAbsolutePath());
-					}
+				// Delete the existing video from Cloudinary before uploading the new one
+				if (existingVariant.getVideoPublicId() != null && !existingVariant.getVideoPublicId().isBlank()) {
+					cloudinaryMediaService.delete(existingVariant.getVideoPublicId(), "video");
 				}
-				String filename = System.currentTimeMillis() + "_" + videoFilename;
-				video.transferTo(new File(uploadDir + filename));
-				existingVariant.setVideoUrl(filename);
+				Map<String, String> videoResult = cloudinaryMediaService.uploadVideo(video, "kuchimittai/products");
+				existingVariant.setVideoUrl(videoResult.get("secure_url"));
+				existingVariant.setVideoPublicId(videoResult.get("public_id"));
 			}
 
 			ProductVariantEO savedVariant = productVariantRepository.save(existingVariant);
@@ -524,8 +511,6 @@ public class ProductServiceImpl implements ProductService {
 					}
 					productImageRepository.saveAll(existingImages);
 				}
-				String uploadDir = normalizedUploadDir(categoryImageUploadDir);
-				new File(uploadDir).mkdirs();
 				int imageCounter = 0;
 				for (MultipartFile image : images) {
 					if (image == null || image.isEmpty()) {
@@ -536,13 +521,11 @@ public class ProductServiceImpl implements ProductService {
 					if (originalFilename == null || !originalFilename.toLowerCase().endsWith(".png")) {
 						throw new IllegalArgumentException("Only PNG images are allowed.");
 					}
-					String filename = System.currentTimeMillis() + "_" + originalFilename;
-					String filePath = uploadDir + filename;
-					image.transferTo(new File(filePath));
+					Map<String, String> imgResult = cloudinaryMediaService.uploadImage(image, "kuchimittai/products");
 					ProductImageEO productImageEO = new ProductImageEO();
 					productImageEO.setProductVar(savedVariant);
-					productImageEO.setImagePath(filePath);
-					productImageEO.setImage(filename);
+					productImageEO.setImage(imgResult.get("secure_url"));
+					productImageEO.setImagePath(imgResult.get("public_id"));
 					productImageEO.setIsMainImage(imageCounter == effectiveMainIndex ? "Y" : "N");
 					imageCounter++;
 					productImageRepository.save(productImageEO);
@@ -1001,6 +984,8 @@ public class ProductServiceImpl implements ProductService {
 			}
 			boolean wasMain = "Y".equals(image.getIsMainImage());
 			ProductVariantEO variant = image.getProductVar();
+			// Delete asset from Cloudinary (imagePath now stores the public_id)
+			cloudinaryMediaService.delete(image.getImagePath(), "image");
 			productImageRepository.delete(image);
 			// If the deleted image was the main image, promote the first remaining image
 			if (wasMain) {
@@ -1037,15 +1022,11 @@ public class ProductServiceImpl implements ProductService {
 				result.setResponseMessage("No video exists for variant ID: " + variantId);
 				return result;
 			}
-			// Delete the video file from the filesystem
-			String uploadDir = normalizedUploadDir(categoryImageUploadDir);
-			File videoFile = new File(uploadDir + variant.getVideoUrl());
-			if (videoFile.exists()) {
-				videoFile.delete();
-				logger.info("Deleted video file: {}", videoFile.getAbsolutePath());
-			}
-			// Clear the videoUrl in DB
+			// Delete the video asset from Cloudinary
+			cloudinaryMediaService.delete(variant.getVideoPublicId(), "video");
+			// Clear the videoUrl and videoPublicId in DB
 			variant.setVideoUrl(null);
+			variant.setVideoPublicId(null);
 			productVariantRepository.save(variant);
 			result.setResponseStatus(Constants.SUCCESS_STATUS);
 			result.setResponseMessage("Video deleted successfully");
@@ -1213,23 +1194,12 @@ public class ProductServiceImpl implements ProductService {
 			if (originalFilename == null || !originalFilename.toLowerCase().endsWith(".png")) {
 				throw new IllegalArgumentException("Only PNG images are allowed.");
 			}
-
-			String uploadDir = normalizedUploadDir(categoryImageUploadDir);
-			File dir = new File(uploadDir);
-			if (!dir.exists()) {
-				dir.mkdirs();
-			}
-
-			String timestamp = String.valueOf(System.currentTimeMillis());
-			String filename = timestamp + "_" + originalFilename;
-			String filePath = uploadDir + filename;
-
-			imageFile.transferTo(new File(filePath));
-			category.setSrc("/" + filename);
-
+			Map<String, String> result = cloudinaryMediaService.uploadImage(imageFile, "kuchimittai/categories");
+			category.setSrc(result.get("secure_url"));
+			category.setSrcPublicId(result.get("public_id"));
 		}
 		catch (Exception e) {
-			throw new RuntimeException("Failed to save image file", e);
+			throw new RuntimeException("Failed to upload category image to Cloudinary", e);
 		}
 	}
 
@@ -1504,27 +1474,33 @@ public class ProductServiceImpl implements ProductService {
 				labels.add(ld);
 			}
 
-			// ── Generate PDF ─────────────────────────────────────────────────
-			String dir = labelPdfDir.endsWith("/") || labelPdfDir.endsWith("\\") ? labelPdfDir : labelPdfDir + "/";
-			new File(dir).mkdirs();
-			String filename = "labels_" + System.currentTimeMillis() + ".pdf";
-			String filePath = dir + filename;
-			buildLabelPdf(labels, filePath, labelConfig);
+			// ── Generate PDF then upload to Cloudinary ───────────────────────
+			java.nio.file.Path tempFile = java.nio.file.Files.createTempFile("labels_", ".pdf");
+			try {
+				buildLabelPdf(labels, tempFile.toString(), labelConfig);
+				byte[] pdfBytes = java.nio.file.Files.readAllBytes(tempFile);
+				Map<String, String> uploadResult = cloudinaryMediaService.uploadBytes(pdfBytes, "kuchimittai/labels",
+						"raw");
+				String pdfUrl = uploadResult.get("secure_url");
+				String pdfPublicId = uploadResult.get("public_id");
 
-			String pdfUrl = "/products/labels/download/" + filename;
-			response.setStatus(Constants.SUCCESS_STATUS);
-			response.setMessage("Label PDF generated successfully");
-			response.setPdfUrl(pdfUrl);
-			response.setLabelCount(labels.size());
+				response.setStatus(Constants.SUCCESS_STATUS);
+				response.setMessage("Label PDF generated successfully");
+				response.setPdfUrl(pdfUrl);
+				response.setLabelCount(labels.size());
 
-			// ── Persist job record ──────────────────────────────────────────
-			String resolved = labels.stream().map(l -> l.barcodeValue).collect(Collectors.joining(","));
-			job.setResolvedBarcodes(resolved);
-			job.setLabelCount(labels.size());
-			job.setPdfUrl(pdfUrl);
-			job.setPdfFilePath(filePath);
-			job.setStatus(Constants.SUCCESS_STATUS);
-			labelPrintJobRepository.save(job);
+				// ── Persist job record ──────────────────────────────────────────
+				String resolved = labels.stream().map(l -> l.barcodeValue).collect(Collectors.joining(","));
+				job.setResolvedBarcodes(resolved);
+				job.setLabelCount(labels.size());
+				job.setPdfUrl(pdfUrl);
+				job.setPdfFilePath(pdfPublicId);
+				job.setStatus(Constants.SUCCESS_STATUS);
+				labelPrintJobRepository.save(job);
+			}
+			finally {
+				java.nio.file.Files.deleteIfExists(tempFile);
+			}
 
 		}
 		catch (Exception e) {
@@ -1585,7 +1561,8 @@ public class ProductServiceImpl implements ProductService {
 
 	/** Converts a job entity to DTO, including pdfFileExists check. */
 	private LabelPrintJobDTO toJobDTO(LabelPrintJobEO job) {
-		boolean exists = job.getPdfFilePath() != null && new File(job.getPdfFilePath()).exists();
+		// pdfUrl is now a Cloudinary URL; "exists" means the job completed with a URL
+		boolean exists = job.getPdfUrl() != null && !job.getPdfUrl().isBlank();
 		String configName = null;
 		if (job.getLabelConfigId() != null) {
 			configName = labelConfigRepository.findById(job.getLabelConfigId())
@@ -2139,19 +2116,23 @@ public class ProductServiceImpl implements ProductService {
 			// ── Download ──────────────────────────────────────────────────────
 			byte[] pdfBytes = downloadUrlBytes(request.getPdfUrl().trim());
 
-			// ── Resize & save ─────────────────────────────────────────────────
-			String dir = labelPdfDir.endsWith("/") || labelPdfDir.endsWith("\\") ? labelPdfDir : labelPdfDir + "/";
-			new File(dir).mkdirs();
-			String filename = "resized_" + System.currentTimeMillis() + ".pdf";
-			String filePath = dir + filename;
-
-			int pageCount = scalePdfToThermalLabel(pdfBytes, filePath);
-
-			String pdfUrl = "/products/labels/download/" + filename;
-			response.setStatus(Constants.SUCCESS_STATUS);
-			response.setMessage("PDF resized successfully to 4\"\u00d76\" thermal label format");
-			response.setPdfUrl(pdfUrl);
-			response.setPageCount(pageCount);
+			// ── Resize & upload to Cloudinary ─────────────────────────────────
+			java.nio.file.Path tempFile = java.nio.file.Files.createTempFile("resized_", ".pdf");
+			int pageCount;
+			try {
+				pageCount = scalePdfToThermalLabel(pdfBytes, tempFile.toString());
+				byte[] resizedBytes = java.nio.file.Files.readAllBytes(tempFile);
+				Map<String, String> uploadResult = cloudinaryMediaService.uploadBytes(resizedBytes,
+						"kuchimittai/labels", "raw");
+				String pdfUrl = uploadResult.get("secure_url");
+				response.setStatus(Constants.SUCCESS_STATUS);
+				response.setMessage("PDF resized successfully to 4\"\u00d76\" thermal label format");
+				response.setPdfUrl(pdfUrl);
+				response.setPageCount(pageCount);
+			}
+			finally {
+				java.nio.file.Files.deleteIfExists(tempFile);
+			}
 
 		}
 		catch (Exception e) {
