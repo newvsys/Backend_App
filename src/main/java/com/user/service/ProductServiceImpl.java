@@ -640,45 +640,54 @@ public class ProductServiceImpl implements ProductService {
 			String queryPattern = hasQuery ? "%" + query.toLowerCase().trim() + "%" : "%%";
 			String stemPattern = hasQuery ? "%" + buildStem(query) + "%" : "%%";
 
-			// ── Step 2: fetch matching products (1–2 queries) ───────────────────────────
-			List<ProductEO> products;
-			if (hasCategoryIds && hasQuery) {
-				// Combined filter: products in the given categories whose name/description matches
-				products = productRepository.findByCategoryIdsAndNameOrDescriptionAndStatus(categoryIds, queryPattern,
-						stemPattern, Constants.STATUS_ACTIVE);
-				// No fallback — if the keyword isn't in those category's products, return empty
-			}
-			else if (hasCategoryIds) {
-				products = productRepository.findByCategoryIdsAndStatus(categoryIds, Constants.STATUS_ACTIVE);
-			}
-			else if (hasQuery) {
-				products = productRepository.findByNameOrDescriptionAndStatus(queryPattern, stemPattern,
-						Constants.STATUS_ACTIVE);
-				// Fallback: search category name/description
-				if (products == null || products.isEmpty()) {
-					logger.debug(
-							"No products found by name/description for query='{}', falling back to category search",
-							query);
-					List<ProductCategoriesEO> matchingCategories = productCatRepository
-						.findByNameOrDescriptionAndStatus(query, Constants.STATUS_ACTIVE);
-					if (matchingCategories != null && !matchingCategories.isEmpty()) {
-						products = new ArrayList<>();
-						for (ProductCategoriesEO category : matchingCategories) {
-							List<ProductEO> categoryProducts = productRepository.findByCategoryAndStatus(category,
-									Constants.STATUS_ACTIVE);
-							if (categoryProducts != null)
-								products.addAll(categoryProducts);
-						}
+		// ── Step 2: fetch matching products (1–2 queries) ───────────────────────────
+		// Treat "no query + no category" the same as "all categories" when any
+		// price/stock filter is present — avoids returning empty for requests like
+		// ?price=10000&minPrice=0&inStock=false with no explicit categoryId/query.
+		boolean hasFiltersOnly = !hasQuery && !hasCategoryIds && !isAllCategories
+				&& (price != null || minPrice != null || inStock != null);
+		if (hasFiltersOnly) {
+			isAllCategories = true;
+		}
+
+		List<ProductEO> products;
+		if (hasCategoryIds && hasQuery) {
+			// Combined filter: products in the given categories whose name/description matches
+			products = productRepository.findByCategoryIdsAndNameOrDescriptionAndStatus(categoryIds, queryPattern,
+					stemPattern, Constants.STATUS_ACTIVE);
+			// No fallback — if the keyword isn't in those category's products, return empty
+		}
+		else if (hasCategoryIds) {
+			products = productRepository.findByCategoryIdsAndStatus(categoryIds, Constants.STATUS_ACTIVE);
+		}
+		else if (hasQuery) {
+			products = productRepository.findByNameOrDescriptionAndStatus(queryPattern, stemPattern,
+					Constants.STATUS_ACTIVE);
+			// Fallback: search category name/description
+			if (products == null || products.isEmpty()) {
+				logger.debug(
+						"No products found by name/description for query='{}', falling back to category search",
+						query);
+				List<ProductCategoriesEO> matchingCategories = productCatRepository
+					.findByNameOrDescriptionAndStatus(query, Constants.STATUS_ACTIVE);
+				if (matchingCategories != null && !matchingCategories.isEmpty()) {
+					products = new ArrayList<>();
+					for (ProductCategoriesEO category : matchingCategories) {
+						List<ProductEO> categoryProducts = productRepository.findByCategoryAndStatus(category,
+								Constants.STATUS_ACTIVE);
+						if (categoryProducts != null)
+							products.addAll(categoryProducts);
 					}
 				}
 			}
-			else if (isAllCategories) {
-				logger.debug("categoryId=0 received — fetching all active products (max 500)");
-				products = productRepository.findByStatus(Constants.STATUS_ACTIVE);
-			}
-			else {
-				return productDTOs;
-			}
+		}
+		else if (isAllCategories) {
+			logger.debug("categoryId=0 / filters-only mode — fetching all active products (max 500)");
+			products = productRepository.findByStatus(Constants.STATUS_ACTIVE);
+		}
+		else {
+			return productDTOs;
+		}
 
 			if (products == null || products.isEmpty())
 				return productDTOs;
@@ -779,10 +788,10 @@ public class ProductServiceImpl implements ProductService {
 				else {
 					imagesByVariantId = Collections.emptyMap();
 				}
-			}
-			else {
-				imagesByVariantId = Collections.emptyMap();
-			}
+		}
+		else {
+			imagesByVariantId = Collections.emptyMap();
+		}
 
 		// ── Step 8: build DTOs — 0 additional DB calls ──────────────────────────────
 		productDTOs = new ArrayList<>(Math.min(uniqueProducts.size(), Math.max(limit, 1)));
@@ -822,26 +831,26 @@ public class ProductServiceImpl implements ProductService {
 			productDTOs.add(productDTO);
 		}
 
-			// ── Step 9: sort ────────────────────────────────────────────────────────────
-			if ("lowPrice".equals(sort)) {
-				productDTOs.sort(Comparator.comparing(ProductDTO::getPrice,
-						Comparator.nullsLast(Comparator.naturalOrder())));
-			}
-			else if ("highPrice".equals(sort)) {
-				productDTOs.sort(Comparator.comparing(ProductDTO::getPrice,
-						Comparator.nullsLast(Comparator.reverseOrder())));
-			}
+		// ── Step 9: sort ────────────────────────────────────────────────────────────
+		if ("lowPrice".equals(sort)) {
+			productDTOs.sort(Comparator.comparing(ProductDTO::getPrice,
+					Comparator.nullsLast(Comparator.naturalOrder())));
+		}
+		else if ("highPrice".equals(sort)) {
+			productDTOs.sort(Comparator.comparing(ProductDTO::getPrice,
+					Comparator.nullsLast(Comparator.reverseOrder())));
+		}
 
-			// ── Step 10: paginate ────────────────────────────────────────────────────────
-			if (isAllCategories) {
-				logger.debug("All-categories mode: returning up to 500 products, total built: {}",
-						productDTOs.size());
-				return productDTOs.size() > 500 ? productDTOs.subList(0, 500) : productDTOs;
-			}
-			int fromIndex = (page - 1) * limit;
-			if (fromIndex >= productDTOs.size())
-				return Collections.emptyList();
-			return productDTOs.subList(fromIndex, Math.min(fromIndex + limit, productDTOs.size()));
+		// ── Step 10: paginate ────────────────────────────────────────────────────────
+		if (isAllCategories) {
+			logger.debug("All-categories mode: returning up to 500 products, total built: {}",
+					productDTOs.size());
+			return productDTOs.size() > 500 ? productDTOs.subList(0, 500) : productDTOs;
+		}
+		int fromIndex = (page - 1) * limit;
+		if (fromIndex >= productDTOs.size())
+			return Collections.emptyList();
+		return productDTOs.subList(fromIndex, Math.min(fromIndex + limit, productDTOs.size()));
 		}
 		catch (Exception e) {
 			logger.error("Error in searchProduct: ", e);

@@ -247,7 +247,7 @@ public class ProductController {
 	@GetMapping("/search")
 	public ResponseEntity<List<ProductDTO>> searchProduct(@RequestParam(required = false) String query,
 			@RequestParam(required = false) String search,
-			@RequestParam(required = false) List<Long> categoryId, @RequestParam(required = false) Boolean inStock,
+			@RequestParam(required = false) List<Long> categoryId, @RequestParam(required = false, defaultValue = "false") Boolean inStock,
 			@RequestParam(required = false) Integer minPrice, @RequestParam(required = false) Integer price,
 			@RequestParam(required = false, defaultValue = "defaultSort") String sort,
 			@RequestParam(required = false, defaultValue = "1") int page,
