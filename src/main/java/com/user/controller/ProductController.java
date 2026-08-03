@@ -89,7 +89,7 @@ public class ProductController {
 
 	@GetMapping("/categories")
 	public ResponseEntity<List<CategoryDTO>> getAllCategories() {
-		List<CategoryDTO> categories = new ArrayList<>();
+o		List<CategoryDTO> categories = new ArrayList<>();
 		try {
 			categories = productService.getAllCategories();
 			logger.info("Fetched all categories, count: {}", categories.size());

@@ -737,17 +737,29 @@ public class ProductServiceImpl implements ProductService {
 			for (InventoryEO inv : allInventory)
 				inventoryByVariantId.putIfAbsent(inv.getProductVariant().getId().longValue(), inv);
 
-			// ── Step 6: pre-select one variant per product (cheapest with inventory) ─────
+			// ── Step 6: pre-select one variant per product ───────────────────────────────
+			// - If inStock=true: select cheapest variant WITH inventory (existing behavior)
+			// - If inStock is null/false: select cheapest variant regardless of stock status
 			// This lets us load images only for the winning variant, not every variant.
 			Map<Integer, ProductVariantEO> chosenVariantByProductId = new HashMap<>(uniqueProducts.size() * 2);
 			for (ProductEO product : uniqueProducts) {
 				List<ProductVariantEO> variants = variantsByProductId.get(product.getId());
 				if (variants == null)
 					continue;
-				for (ProductVariantEO v : variants) {
-					if (inventoryByVariantId.containsKey(v.getId().longValue())) {
-						chosenVariantByProductId.put(product.getId(), v);
-						break; // variants sorted price ASC — first match = cheapest in-stock
+
+				if (Boolean.TRUE.equals(inStock)) {
+					// inStock=true: only select variants with inventory
+					for (ProductVariantEO v : variants) {
+						if (inventoryByVariantId.containsKey(v.getId().longValue())) {
+							chosenVariantByProductId.put(product.getId(), v);
+							break; // variants sorted price ASC — first match = cheapest in-stock
+						}
+					}
+				} else {
+					// inStock is null/false: select cheapest variant regardless of stock
+					// (variants are already sorted by price ASC)
+					if (!variants.isEmpty()) {
+						chosenVariantByProductId.put(product.getId(), variants.get(0));
 					}
 				}
 			}
@@ -772,34 +784,43 @@ public class ProductServiceImpl implements ProductService {
 				imagesByVariantId = Collections.emptyMap();
 			}
 
-			// ── Step 8: build DTOs — 0 additional DB calls ──────────────────────────────
-			productDTOs = new ArrayList<>(Math.min(uniqueProducts.size(), Math.max(limit, 1)));
-			for (ProductEO product : uniqueProducts) {
-				ProductVariantEO chosenVariant = chosenVariantByProductId.get(product.getId());
-				if (chosenVariant == null)
-					continue; // no variant with a matching inventory record
+		// ── Step 8: build DTOs — 0 additional DB calls ──────────────────────────────
+		productDTOs = new ArrayList<>(Math.min(uniqueProducts.size(), Math.max(limit, 1)));
+		for (ProductEO product : uniqueProducts) {
+			ProductVariantEO chosenVariant = chosenVariantByProductId.get(product.getId());
+			if (chosenVariant == null)
+				continue; // no variant selected for this product
 
-				// Inventory is guaranteed non-null: chosenVariant was selected because it
-				// has an entry in inventoryByVariantId.
-				InventoryEO inventory = inventoryByVariantId.get(chosenVariant.getId().longValue());
+			// Inventory may be null if:
+			// - inStock filter was NOT applied (null/false) and variant has no inventory
+			// - inStock filter WAS applied and no inventory exists for any variant
+			InventoryEO inventory = inventoryByVariantId.get(chosenVariant.getId().longValue());
 
-				ProductDTO productDTO = UserMapper.toProductDTO(product);
-				productDTO.setId(product.getId());
-				productDTO.setIsReturnable("N"); // detail page fetches the real return policy
+			ProductDTO productDTO = UserMapper.toProductDTO(product);
+			productDTO.setId(product.getId());
+			productDTO.setIsReturnable("N"); // detail page fetches the real return policy
 
-				List<ProductImageEO> images = imagesByVariantId.get(chosenVariant.getId());
-				if (images != null && !images.isEmpty()) {
-					productDTO.setMainImage(resolveMainImage(images).getImage());
-				}
-				productDTO.setPrice(chosenVariant.getSellingPrice());
-				productDTO.setMrp(chosenVariant.getMrp());
-				productDTO.setCurrency("INR");
-				productDTO.setSku(chosenVariant.getSkuCode());
+			List<ProductImageEO> images = imagesByVariantId.get(chosenVariant.getId());
+			if (images != null && !images.isEmpty()) {
+				productDTO.setMainImage(resolveMainImage(images).getImage());
+			}
+			productDTO.setPrice(chosenVariant.getSellingPrice());
+			productDTO.setMrp(chosenVariant.getMrp());
+			productDTO.setCurrency("INR");
+			productDTO.setSku(chosenVariant.getSkuCode());
+			
+			// Handle inventory: null (out-of-stock) or present
+			if (inventory != null) {
 				productDTO.setStock(inventory.getAvailableQty());
 				productDTO.setInStock(
 						inventory.getAvailableQty() != null && inventory.getAvailableQty() > 0 ? 1 : 0);
-				productDTOs.add(productDTO);
+			} else {
+				// No inventory record: out-of-stock product
+				productDTO.setStock(0);
+				productDTO.setInStock(0);
 			}
+			productDTOs.add(productDTO);
+		}
 
 			// ── Step 9: sort ────────────────────────────────────────────────────────────
 			if ("lowPrice".equals(sort)) {
@@ -1147,20 +1168,24 @@ public class ProductServiceImpl implements ProductService {
 						.filter(v -> v.getSellingPrice() != null)
 						.min((v1, v2) -> v1.getSellingPrice().compareTo(v2.getSellingPrice()))
 						.orElse(existingVariants.get(0));
-					List<ProductImageEO> images = productImageRepository.findByProductVar(cheapestVariant);
-					if (images != null && !images.isEmpty()) {
-						productDTO.setMainImage(resolveMainImage(images).getImage());
-					}
-					productDTO.setPrice(cheapestVariant.getSellingPrice());
-					productDTO.setMrp(cheapestVariant.getMrp());
-					productDTO.setCurrency(Constants.PAYMENT_CURRENCY);
-					productDTO.setSku(cheapestVariant.getSkuCode());
-					InventoryEO inventory = inventoryRepository.findByProductVariant(cheapestVariant);
-					if (inventory != null) {
-						productDTO.setStock(inventory.getAvailableQty());
-						productDTO
-							.setInStock(inventory.getAvailableQty() != null && inventory.getAvailableQty() > 0 ? 1 : 0);
-					}
+				List<ProductImageEO> images = productImageRepository.findByProductVar(cheapestVariant);
+				if (images != null && !images.isEmpty()) {
+					productDTO.setMainImage(resolveMainImage(images).getImage());
+				}
+				productDTO.setPrice(cheapestVariant.getSellingPrice());
+				productDTO.setMrp(cheapestVariant.getMrp());
+				productDTO.setCurrency(Constants.PAYMENT_CURRENCY);
+				productDTO.setSku(cheapestVariant.getSkuCode());
+				InventoryEO inventory = inventoryRepository.findByProductVariant(cheapestVariant);
+				if (inventory != null) {
+					productDTO.setStock(inventory.getAvailableQty());
+					productDTO
+						.setInStock(inventory.getAvailableQty() != null && inventory.getAvailableQty() > 0 ? 1 : 0);
+				} else {
+					// No inventory record: out-of-stock product
+					productDTO.setStock(0);
+					productDTO.setInStock(0);
+				}
 				}
 				productDTOs.add(productDTO);
 			}
