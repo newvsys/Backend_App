@@ -83,6 +83,9 @@ public class OrderServiceImpl implements OrderService {
 	private NotificationService notificationService;
 
 	@Autowired
+	private PushNotificationService pushNotificationService;
+
+	@Autowired
 	@Lazy
 	private ShippingService shippingService;
 
@@ -430,6 +433,16 @@ public class OrderServiceImpl implements OrderService {
 			responseDTO.setMessage(Constants.ORDER_CREATED_SUCCESS);
 			responseDTO.setStatus(Constants.STATUS_SUCCESS);
 
+			// Notify admins (Admin web app) of the new order via Firebase push
+			// notification. Best-effort: never fails order creation.
+			try {
+				pushNotificationService.notifyAdminsNewOrder(savedOrder);
+			}
+			catch (Exception pushEx) {
+				logger.error("Failed to send new-order push notification for orderNumber={}: {}",
+						savedOrder.getOrderNumber(), pushEx.getMessage(), pushEx);
+			}
+
 			logger.info(
 					"Order created successfully for userId={}, customerId={}, orderNumber={}, subtotal={}, shippingFee={}, total={}",
 					orderCreateDTO.getUserId(), orderCreateDTO.getCustomerId(), order.getOrderNumber(), subtotalAmount,
@@ -567,38 +580,6 @@ public class OrderServiceImpl implements OrderService {
 
 		dto.setProducts(products);
 
-		/**
-		 * // send notification event to kafka String email =
-		 * order.getCustomer().getEmail(); String mobile =
-		 * order.getCustomer().getMobileNumber(); String customerName =
-		 * order.getCustomer().getFirstName(); Double amount =
-		 * order.getTotalAmount().doubleValue(); String emailsubject = "Order Status
-		 * Update - " + order.getOrderNumber(); String emailMessage = String.format( "Hi
-		 * %s,\n\nYour order with order number %s is currently in %s status.\nOrder
-		 * Amount: %.2f\n\nThank you for shopping with us!", customerName,
-		 * order.getOrderNumber(), order.getOrderStatus(), amount ); String smsSubject =
-		 * "Order Status Update"; String smsMessage = String.format( "Order #%s is now %s.
-		 * Amount: %.2f. Thank you, %s!", order.getOrderNumber(), order.getOrderStatus(),
-		 * amount, customerName );
-		 *
-		 * // Build EmailDetails for the Order Status Update template
-		 * com.user.communication.event.EmailDetails emailDetails =
-		 * com.user.communication.event.EmailDetails.builder()
-		 * .orderId(order.getOrderNumber()) .customerName(customerName)
-		 * .orderStatus(order.getOrderStatus()) .trackingNumber(dto.getAwbCode())
-		 * .expectedDelivery(dto.getEstimatedDelivery())
-		 * .trackingUrl(dto.getTrackOrderUrl()) .build();
-		 *
-		 * // Build Event directly (no ObjectMapper) and attach EmailDetails
-		 * com.user.communication.event.Event notificationEvent =
-		 * com.user.communication.event.Event.builder() .email(email) .mobile(mobile)
-		 * .purpose(Constants.COMMUNICATION_PURPOSE_ORDER_CONFIRMATION)
-		 * .emailSubject(emailsubject) .emailMessage(emailMessage) .smsSubject(smsSubject)
-		 * .smsMessage(smsMessage) .channel(Constants.COMMUNICATION_CHANNEL_BOTH)
-		 * .emailDetails(emailDetails) .build();
-		 *
-		 * kafkaTemplate.send(Constants.CUSTOMER_EVENTS_TOPIC, notificationEvent);
-		 */
 
 		return dto;
 	}

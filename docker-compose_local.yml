@@ -33,12 +33,16 @@ services:
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: onlineshopping
       CORS_ALLOWED_ORIGIN_PATTERNS: "http://localhost:3000,http://localhost:8080,https://*.vercel.app,https://kuchimittai.com,https://www.kuchimittai.com"
+      JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
+      FIREBASE_ENABLED: "true"
+      FIREBASE_SERVICE_ACCOUNT_FILE: "file:/app/secrets/firebase-service-account.json"
     ports:
       - "8080:8080"
       - "5005:5005"
     volumes:
-      - ../../webappOnly/public:/public
+      - ../../webapp/public:/public
       - ./logs:/app/logs
+      - ./secrets/kuchimittai-dd858-firebase-adminsdk-fbsvc-5caaee8749.json:/app/secrets/firebase-service-account.json:ro
     networks:
       - mynetwork
 
@@ -47,4 +51,5 @@ volumes:
 
 networks:
   mynetwork:
-    driver: bridge
+    external: true
+    name: mynetwork

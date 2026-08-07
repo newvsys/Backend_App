@@ -7,9 +7,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
- * EventListener – previously a Kafka consumer. Kafka dependency has been removed; events
- * are now processed via direct method calls. This class is kept for reference and can be
- * removed if no longer needed.
+ * EventListener – events are processed via direct method calls (no message broker).
+ * This class is kept for reference and can be removed if no longer needed.
  */
 @Component
 public class EventListener {

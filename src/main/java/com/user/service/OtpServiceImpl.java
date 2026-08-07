@@ -134,14 +134,6 @@ public class OtpServiceImpl implements OtpService {
 			 */
 			// Save new OTP
 
-			/**
-			 * // Send OTP via NotificationService (Kafka) String smsSubject = "OTP for "
-			 * + purpose; String smsMessage = "Your OTP for " + purpose + " is :" + otp;
-			 * kafkaTemplate.send( Constants.CUSTOMER_EVENTS_TOPIC,
-			 * ObjectMapper.buildEventObject( null, identifier, purpose, null, null,
-			 * smsSubject, smsMessage, Constants.COMMUNICATION_CHANNEL_SMS) );
-			 * logger.info("Sent OTP notification for identifier: {}", identifier);
-			 **/
 
 			return ResponseDTO.builder().responseStatus(status).responseMessage(responsemessage).build();
 		}

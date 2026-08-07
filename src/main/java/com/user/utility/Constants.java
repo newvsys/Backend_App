@@ -24,6 +24,8 @@ public class Constants {
 	// User Roles
 	public static final String ROLE_USER = "user";
 
+	public static final String ROLE_ADMIN = "admin";
+
 	// Order Payment & Status
 	public static final String ORDER_PAYMENT_STATUS_PENDING = "PENDING";
 
@@ -202,16 +204,6 @@ public class Constants {
 
 	public static final String COMMUNICATION_STATUS_SENT = "SENT";
 
-	public static final String KAFKA_COMMUNICATION_GROUP_ID = "communication-group";
-
-	// Kafka Topics
-	public static final String CUSTOMER_EVENTS_TOPIC = "customer-events";
-
-	public static final String ORDER_EVENTS_TOPIC = "order-events";
-
-	public static final String REFUND_EVENTS_TOPIC = "refund-events";
-
-	public static final String SHIPROCKET_EVENTS_TOPIC = "shiprocket-events";
 
 	// Unified order event types
 	public static final String ORDER_EVENT_TYPE_CREATED = "ORDER_CREATED";

@@ -17,6 +17,21 @@
             <AppenderRef ref="Console"/>
             <AppenderRef ref="FileLogger"/>
         </Logger>
+
+        <!-- Firebase push notification logging (kept at INFO regardless of the
+             overall com.user error level, so init/send status is visible). -->
+        <Logger name="com.user.config.FirebaseConfig" level="info" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="FileLogger"/>
+        </Logger>
+        <Logger name="com.user.service.PushNotificationServiceImpl" level="info" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="FileLogger"/>
+        </Logger>
+        <Logger name="com.user.controller.NotificationController" level="info" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="FileLogger"/>
+        </Logger>
     </Loggers>
 </Configuration>
 

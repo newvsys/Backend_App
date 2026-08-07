@@ -218,7 +218,7 @@ public class ShippingServiceImpl implements ShippingService {
 					shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_STATUS_CREATED_REMARK);
 					shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
 
-					// Save ShipmentItemEO records so the Kafka listener can fetch them
+					// Save ShipmentItemEO records so downstream processing can fetch them
 					for (OrderItemEO item : itemsForWarehouse) {
 						ShipmentItemEO shipmentItemEO = new ShipmentItemEO();
 						shipmentItemEO.setShipment(savedShippingEO);
@@ -227,7 +227,7 @@ public class ShippingServiceImpl implements ShippingService {
 						shippingItemRepository.save(shipmentItemEO);
 					}
 
-					// Publish Kafka event to trigger Shiprocket order creation
+					// Build event and trigger Shiprocket order creation directly (in-process)
 					ShiprocketOrderEvent shiprocketEvent = ShiprocketOrderEvent.builder()
 						.shipmentId(savedShippingEO.getShipmentId() != null
 								? savedShippingEO.getShipmentId().longValue() : null)
@@ -1158,7 +1158,7 @@ public class ShippingServiceImpl implements ShippingService {
 			logger.info("Created RefundTransactionEO id={} refundReference={} for orderId={}", savedRefund.getId(),
 					refundReference, order.getOrderId());
 
-			// Publish RefundInitiatedEvent to Kafka
+			// Build RefundInitiatedEvent and process it directly (in-process)
 			RefundInitiatedEvent event = RefundInitiatedEvent.builder()
 				.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
 				.refundReference(refundReference)

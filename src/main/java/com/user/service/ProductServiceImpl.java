@@ -871,13 +871,33 @@ public class ProductServiceImpl implements ProductService {
 
 			if (product != null && existingVariants != null) {
 
+				final List<ProductVariantEO> finalExistingVariants = existingVariants;
+
 				productDTO = UserMapper.toProductDTO(product);
 
-				// ProductVariantEO existingVariant = existingVariants.get(0);
+				// ── Batch-fetch inventory for ALL variants (avoids N+1 queries) ──────────
+				List<Long> allVariantIds = existingVariants.stream()
+					.map(v -> v.getId().longValue())
+					.collect(Collectors.toList());
+				List<InventoryEO> allInventoryList = inventoryRepository.findAllByProductVariantIdIn(allVariantIds);
+				Map<Long, InventoryEO> inventoryMap = new HashMap<>();
+				for (InventoryEO inv : allInventoryList)
+					inventoryMap.put(inv.getProductVariant().getId().longValue(), inv);
+
+				// ── Select default variant: cheapest IN-STOCK first ───────────────────────
+				// If no variant is in stock, fall back to cheapest out-of-stock variant.
 				ProductVariantEO existingVariant = existingVariants.stream()
 					.filter(v -> v.getSellingPrice() != null)
-					.min((v1, v2) -> v1.getSellingPrice().compareTo(v2.getSellingPrice()))
-					.orElse(existingVariants.get(0));
+					.filter(v -> {
+						InventoryEO inv = inventoryMap.get(v.getId().longValue());
+						return inv != null && inv.getAvailableQty() != null && inv.getAvailableQty() > 0;
+					})
+					.min(Comparator.comparing(ProductVariantEO::getSellingPrice))
+					.orElseGet(() -> finalExistingVariants.stream()
+						.filter(v -> v.getSellingPrice() != null)
+						.min(Comparator.comparing(ProductVariantEO::getSellingPrice))
+						.orElse(finalExistingVariants.get(0)));
+
 				productDTO.setId(existingVariant.getId());
 				productDTO.setProductId(product.getId());
 				List<ProductImageEO> productImages = productImageRepository.findByProductVar(existingVariant);
@@ -905,11 +925,14 @@ public class ProductServiceImpl implements ProductService {
 				productDTO.setSku(existingVariant.getSkuCode());
 				productDTO.setVideoUrl(existingVariant.getVideoUrl());
 
-				InventoryEO inventory = inventoryRepository.findByProductVariant(existingVariant);
+				InventoryEO inventory = inventoryMap.get(existingVariant.getId().longValue());
 				if (inventory != null) {
 					productDTO.setStock(inventory.getAvailableQty());
-					productDTO
-						.setInStock(inventory.getAvailableQty() != null && inventory.getAvailableQty() > 0 ? 1 : 0);
+					productDTO.setInStock(
+							inventory.getAvailableQty() != null && inventory.getAvailableQty() > 0 ? 1 : 0);
+				} else {
+					productDTO.setStock(0);
+					productDTO.setInStock(0);
 				}
 
 				ReturnPolicyDetailDTO returnPolicy = orderService
@@ -930,7 +953,6 @@ public class ProductServiceImpl implements ProductService {
 						continue; // skip the main variant already used
 					}
 					ProductDTO varDTO = UserMapper.toProductDTO(product);
-					// Set variant-specific fields
 					varDTO.setPrice(variant.getSellingPrice());
 					varDTO.setMrp(variant.getMrp());
 					varDTO.setSku(variant.getSkuCode());
@@ -956,12 +978,15 @@ public class ProductServiceImpl implements ProductService {
 						}).collect(Collectors.toList());
 						varDTO.setAttributes(varAttributeDTOs);
 					}
-					// Set stock and inStock for this variant
-					InventoryEO varInventory = inventoryRepository.findByProductVariant(variant);
+					// Reuse batch-fetched inventory map (no extra DB call per variant)
+					InventoryEO varInventory = inventoryMap.get(variant.getId().longValue());
 					if (varInventory != null) {
 						varDTO.setStock(varInventory.getAvailableQty());
 						varDTO.setInStock(
 								varInventory.getAvailableQty() != null && varInventory.getAvailableQty() > 0 ? 1 : 0);
+					} else {
+						varDTO.setStock(0);
+						varDTO.setInStock(0);
 					}
 					// Set return policy for this variant
 					ReturnPolicyDetailDTO varReturnPolicy = orderService
