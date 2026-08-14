@@ -10,4 +10,7 @@ public interface ProductAttributeRepository extends JpaRepository<ProductAttribu
 
 	List<ProductAttributeEO> findByProductVar(ProductVariantEO productVariant);
 
+	/** Same as {@link #findByProductVar(ProductVariantEO)} but pre-sorted by {@code displayOrder} ascending. */
+	List<ProductAttributeEO> findByProductVarOrderByDisplayOrderAsc(ProductVariantEO productVariant);
+
 }

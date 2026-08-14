@@ -8,11 +8,13 @@ import com.user.dto.InventoryUpdateDatesDTO;
 import com.user.dto.InventoryUpdateDatesResponseDTO;
 import com.user.dto.LoadInventoryRequestDTO;
 import com.user.dto.LoadInventoryResponseDTO;
+import com.user.dto.OutOfStockResponseDTO;
 import com.user.dto.RemoveInventoryRequestDTO;
 import com.user.dto.RemoveInventoryResponseDTO;
 import com.user.dto.ResponseDTO;
 import com.user.dto.RestoreInventoryRequestDTO;
 import com.user.dto.RestoreInventoryResponseDTO;
+import com.user.dto.StockReportResponseDTO;
 import com.user.service.InventoryService;
 import com.user.utility.Constants;
 import org.slf4j.Logger;
@@ -295,6 +297,105 @@ public class InventoryController {
 			ResponseDTO error = new ResponseDTO();
 			error.setResponseStatus(Constants.FAILURE_STATUS);
 			error.setResponseMessage("Failed to refresh inventory counts: " + e.getMessage());
+			return ResponseEntity.status(500).body(error);
+		}
+	}
+
+	/**
+	 * GET /api/inventory/stock-report
+	 * <p>
+	 * Generate/view the current stock report — combines category, product, product
+	 * variant, warehouse, and inventory (stock) details in a single response. All query
+	 * parameters are optional and can be combined to narrow the report.
+	 *
+	 * <ul>
+	 * <li>{@code warehouseId} — filter by warehouse ID</li>
+	 * <li>{@code categoryId} — filter by product category ID</li>
+	 * <li>{@code productId} — filter by product ID</li>
+	 * <li>{@code productVarId} — filter by product variant ID</li>
+	 * <li>{@code status} — filter by inventory status (defaults to {@code "A"} — active
+	 * inventory records only)</li>
+	 * <li>{@code availableQty} — filter by available quantity. Accepts a plain number
+	 * for an exact match (e.g. {@code "10"}), or a comparison expression prefixed with
+	 * {@code >}, {@code <}, {@code >=}, or {@code <=} (e.g. {@code ">10"},
+	 * {@code "<5"}, {@code ">=10"}, {@code "<=5"})</li>
+	 * </ul>
+	 *
+	 * Examples: <pre>
+	 *   GET /api/inventory/stock-report
+	 *   GET /api/inventory/stock-report?warehouseId=2
+	 *   GET /api/inventory/stock-report?categoryId=3&productId=101
+	 *   GET /api/inventory/stock-report?categoryId=4&productId=41&productVarId=140&status=A&availableQty=10
+	 *   GET /api/inventory/stock-report?availableQty=>10
+	 *   GET /api/inventory/stock-report?availableQty=<5
+	 * </pre>
+	 */
+	@GetMapping("/stock-report")
+	public ResponseEntity<?> getCurrentStockReport(@RequestParam(required = false) Long warehouseId,
+			@RequestParam(required = false) Integer categoryId, @RequestParam(required = false) Integer productId,
+			@RequestParam(required = false) Integer productVarId,
+			@RequestParam(required = false, defaultValue = "A") String status,
+			@RequestParam(required = false) String availableQty) {
+		logger.info(
+				"Current stock report request — warehouseId={}, categoryId={}, productId={}, productVarId={}, status={}, availableQty={}",
+				warehouseId, categoryId, productId, productVarId, status, availableQty);
+		try {
+			StockReportResponseDTO response = inventoryService.getCurrentStockReport(warehouseId, categoryId,
+					productId, productVarId, status, availableQty);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("Unexpected error in getCurrentStockReport", e);
+			ResponseDTO error = new ResponseDTO();
+			error.setResponseStatus(Constants.FAILURE_STATUS);
+			error.setResponseMessage("Failed to generate current stock report: " + e.getMessage());
+			return ResponseEntity.status(500).body(error);
+		}
+	}
+
+	/**
+	 * GET /api/inventory/out-of-stock
+	 * <p>
+	 * Generate/view the list of Out of Stock products and product variants. A product
+	 * variant is considered out of stock if it has NO inventory record with
+	 * {@code availableQty > 0} in ANY warehouse — i.e. either no inventory record exists
+	 * for it at all, or every existing record is depleted. All query parameters are
+	 * optional and can be combined to narrow the report.
+	 *
+	 * <ul>
+	 * <li>{@code categoryId} — filter by product category ID</li>
+	 * <li>{@code productId} — filter by product ID</li>
+	 * <li>{@code productVarId} — filter by product variant ID</li>
+	 * </ul>
+	 *
+	 * Examples: <pre>
+	 *   GET /api/inventory/out-of-stock
+	 *   GET /api/inventory/out-of-stock?categoryId=3
+	 *   GET /api/inventory/out-of-stock?productId=101
+	 *   GET /api/inventory/out-of-stock?productVarId=101
+	 * </pre>
+	 */
+	@GetMapping("/out-of-stock")
+	public ResponseEntity<?> getOutOfStockReport(@RequestParam(required = false) Integer categoryId,
+			@RequestParam(required = false) Integer productId, @RequestParam(required = false) Integer productVarId) {
+		logger.info("Out-of-stock report request — categoryId={}, productId={}, productVarId={}", categoryId,
+				productId, productVarId);
+		try {
+			OutOfStockResponseDTO response = inventoryService.getOutOfStockReport(categoryId, productId,
+					productVarId);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("Unexpected error in getOutOfStockReport", e);
+			ResponseDTO error = new ResponseDTO();
+			error.setResponseStatus(Constants.FAILURE_STATUS);
+			error.setResponseMessage("Failed to generate out-of-stock report: " + e.getMessage());
 			return ResponseEntity.status(500).body(error);
 		}
 	}

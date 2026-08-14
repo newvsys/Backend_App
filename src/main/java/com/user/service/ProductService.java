@@ -13,6 +13,10 @@ import com.user.dto.ProdVarCreateDTO;
 import com.user.dto.ProdVarDTO;
 import com.user.dto.ProdVarUpdateDTO;
 import com.user.dto.ProductAttributeCreateDTO;
+import com.user.dto.AttributeSequenceUpdateDTO;
+import com.user.dto.BulkAttributeSequenceUpdateDTO;
+import com.user.dto.ImageSequenceUpdateDTO;
+import com.user.dto.BulkImageSequenceUpdateDTO;
 import com.user.dto.ProductAttributeDTO;
 import com.user.dto.ProductCreateDTO;
 import com.user.dto.ProductDTO;
@@ -75,6 +79,27 @@ public interface ProductService {
 	ProductAttributeDTO updateProductAttribute(Long attributeId, ProductAttributeCreateDTO productAttributeCreateDTO);
 
 	void deleteProductAttribute(Long attributeId);
+
+	List<ProductAttributeDTO> updateAttributeSequence(Long variantId, AttributeSequenceUpdateDTO request);
+
+	/**
+	 * Bulk-updates the {@code displayOrder} of attributes across one or more
+	 * product variants in a single transaction/API call.
+	 */
+	List<ProductAttributeDTO> bulkUpdateAttributeSequence(BulkAttributeSequenceUpdateDTO request);
+
+	/** Updates the {@code displayOrder} of one or more images belonging to a single product variant. */
+	List<ProductImageDTO> updateImageSequence(Long variantId, ImageSequenceUpdateDTO request);
+
+	/**
+	 * Bulk-updates the {@code displayOrder} of images across one or more
+	 * product variants in a single transaction/API call.
+	 */
+	List<ProductImageDTO> bulkUpdateImageSequence(BulkImageSequenceUpdateDTO request);
+
+
+
+
 
 	List<ProductDTO> getProductsByCategoryId(Integer categoryId);
 

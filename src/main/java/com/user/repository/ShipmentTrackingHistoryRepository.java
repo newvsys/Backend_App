@@ -12,4 +12,6 @@ public interface ShipmentTrackingHistoryRepository extends JpaRepository<Shipmen
 
 	List<ShipmentTrackingHistoryEO> findByShipmentOrderByUpdatedAtAsc(ShippingEO shipment);
 
+	boolean existsByShipmentAndStatusIgnoreCase(ShippingEO shipment, String status);
+
 }

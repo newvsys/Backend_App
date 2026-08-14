@@ -108,6 +108,9 @@ public class ShippingServiceImpl implements ShippingService {
 	private ShiprocketOrderLogRepository shiprocketOrderLogRepository;
 
 	@Autowired
+	private PushNotificationService pushNotificationService;
+
+	@Autowired
 	private CourierSelectionLogRepository courierSelectionLogRepository;
 
 	@Autowired
@@ -391,6 +394,22 @@ public class ShippingServiceImpl implements ShippingService {
 			// Step 1: Create Order on Shiprocket
 			Integer shipOrderId = null;
 			Integer shipmentId = null;
+			// ── Idempotency / retrigger guard ──────────────────────────────────
+			// If this shipment already has a Shiprocket order (e.g. this call is a
+			// manual admin retrigger after a downstream step failed), reuse the
+			// existing order/shipment ids instead of calling createOrder again —
+			// that would create a duplicate order on Shiprocket.
+			if (shippingEO.getShipOrderId() != null && shippingEO.getShipShipmentId() != null) {
+				shipOrderId = shippingEO.getShipOrderId();
+				shipmentId = shippingEO.getShipShipmentId();
+				shippingRepository.save(shippingEO); // persist carton dims computed above
+				saveStepLog(event, "CREATE_ORDER", "SKIPPED",
+						"Shiprocket order already exists (order_id=" + shipOrderId + ", shipment_id=" + shipmentId
+								+ "); reusing existing order instead of creating a duplicate");
+				logger.info("Step CREATE_ORDER SKIPPED (already exists): reusing order_id={}, shipment_id={}",
+						shipOrderId, shipmentId);
+			}
+			else
 			try {
 				Map response = shiprocketService.createOrder(shiprocketOrderRequest);
 				if (response != null) {
@@ -533,8 +552,42 @@ public class ShippingServiceImpl implements ShippingService {
 						event.getShipmentId(), ex.getMessage());
 			}
 
-			// Step 2: Generate AWB — try best couriers in order; fall back to auto-assign
-			// if list is empty
+			// Step 1.6: If no eligible courier was found via getBestCourierServices, the
+			// Shiprocket order is already created (Step 1) — stop here and flag the
+			// shipment for manual processing instead of attempting AWB/pickup
+			// auto-assign, which is unreliable when Shiprocket itself found no
+			// serviceable courier for this route/weight/COD combination.
+			if (bestCourierIds.isEmpty()) {
+				shippingEO.setShipmentStatus(Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED);
+				shippingRepository.save(shippingEO);
+
+				ShipmentTrackingHistoryEO manualTrackingEntry = new ShipmentTrackingHistoryEO();
+				manualTrackingEntry.setShipment(shippingEO);
+				manualTrackingEntry.setStatus(Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED);
+				manualTrackingEntry.setRemarks(
+						"No eligible courier found for this route/weight/COD combination. Shiprocket order created (order_id="
+								+ shipOrderId + "); shipment requires manual courier assignment.");
+				shipmentTrackingHistoryRepository.save(manualTrackingEntry);
+
+				saveStepLog(event, "GENERATE_AWB", "SKIPPED",
+						"No eligible courier found via getBestCourierServices; Shiprocket order was created successfully, shipment will be processed manually");
+				logger.warn(
+						"Step GENERATE_AWB SKIPPED for shipmentId={}: no eligible courier found. Shiprocket order_id={} was created; shipment flagged for manual processing.",
+						event.getShipmentId(), shipOrderId);
+
+				// Best-effort admin push notification — never breaks order processing.
+				try {
+					pushNotificationService.notifyAdminsNoCourierFound(shippingEO, shipOrderId);
+				}
+				catch (Exception pushEx) {
+					logger.error("Failed to send no-courier-found push notification for shipmentId={}: {}",
+							event.getShipmentId(), pushEx.getMessage(), pushEx);
+				}
+
+				return;
+			}
+
+			// Step 2: Generate AWB — try best couriers in order
 			String awbCode = null;
 			int usedCourierIndex = -1;
 			try {
@@ -545,10 +598,9 @@ public class ShippingServiceImpl implements ShippingService {
 					return;
 				}
 
-				// Determine couriers to attempt (use ranked list, or null for
-				// auto-assign)
-				List<Integer> couriersToTry = bestCourierIds.isEmpty() ? java.util.Collections.singletonList(null)
-						: bestCourierIds;
+				// Only ranked/eligible couriers are attempted now — bestCourierIds is
+				// guaranteed non-empty at this point.
+				List<Integer> couriersToTry = bestCourierIds;
 
 				Integer courierCompanyId = null;
 				String courierName = null;
@@ -1067,6 +1119,26 @@ public class ShippingServiceImpl implements ShippingService {
 				response.setStatusMessage("Shipment not found");
 				return response;
 			}
+
+			// ── Idempotency guard ────────────────────────────────────────────
+			// The same status can arrive twice for a shipment: once when it is
+			// updated in-app (e.g. as part of the order-cancel flow) and again via
+			// the Shiprocket webhook callback. Check ShipmentTrackingHistoryEO for
+			// an existing record with the same status for this shipment before
+			// creating a new one, so the Track Order page doesn't show the same
+			// status twice.
+			boolean alreadyRecorded = shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(shipment,
+					requestDTO.getStatus());
+			if (alreadyRecorded) {
+				logger.info(
+						"ShipmentTrackingHistoryEO already has a record with status='{}' for trackingNumber={}. Skipping duplicate status update (likely already updated in-app; webhook update ignored).",
+						requestDTO.getStatus(), trackingNumber);
+				response.setStatus(Constants.SUCCESS_STATUS);
+				response.setStatusMessage("Shipment already has a tracking history record with status: "
+						+ requestDTO.getStatus() + ". No update performed.");
+				return response;
+			}
+
 			ShipmentTrackingHistoryEO history = new ShipmentTrackingHistoryEO();
 			history.setShipment(shipment);
 			history.setStatus(requestDTO.getStatus());
@@ -1867,10 +1939,6 @@ public class ShippingServiceImpl implements ShippingService {
 				shippingEO.setShipmentStatus(request.getShipmentStatus().trim());
 				anyFieldUpdated = true;
 			}
-			if (request.getLabelUrl() != null && !request.getLabelUrl().trim().isEmpty()) {
-				shippingEO.setLabelUrl(request.getLabelUrl().trim());
-				anyFieldUpdated = true;
-			}
 			if (request.getTrackUrl() != null && !request.getTrackUrl().trim().isEmpty()) {
 				shippingEO.setTrackUrl(request.getTrackUrl().trim());
 				anyFieldUpdated = true;
@@ -2169,6 +2237,7 @@ public class ShippingServiceImpl implements ShippingService {
 			ShippingEO saved = shippingRepository.save(eo);
 
 			boolean historyCreated = saveTrackingHistoryIfRequested(saved, request);
+			syncOrderStatusWithShipment(saved);
 			logShiprocketOrderLog(saved, "MANUAL_UPDATE", request.getNotes());
 
 			buildManualUpdateResponse(response, saved, historyCreated, "MANUAL_UPDATE");
@@ -2235,6 +2304,7 @@ public class ShippingServiceImpl implements ShippingService {
 			ShippingEO saved = shippingRepository.save(eo);
 
 			boolean historyCreated = saveTrackingHistoryIfRequested(saved, request);
+			syncOrderStatusWithShipment(saved);
 			logShiprocketOrderLog(saved, "MANUAL_CREATE", request.getNotes());
 
 			buildManualUpdateResponse(response, saved, historyCreated, "MANUAL_CREATE");
@@ -2246,6 +2316,509 @@ public class ShippingServiceImpl implements ShippingService {
 			response.setResponseMessage("An error occurred while creating shipping record: " + e.getMessage());
 		}
 		return response;
+	}
+
+	/**
+	 * GET — Fetch the live Shiprocket shipment data for the given order number, shaped
+	 * exactly like the PUT /api/shipment/order/{orderNumber} request body.
+	 * <p>
+	 * This method does NOT read from the local shipping DB at all — the Shiprocket
+	 * order is located purely via the live Shiprocket "search orders" API (matching on
+	 * {@code channel_order_id}, which is the internal order number sent to Shiprocket
+	 * at order-creation time), and all fields are then populated/refreshed from the
+	 * live Shiprocket "order details" and "track AWB" APIs.
+	 */
+	@Override
+	@Transactional(readOnly = true)
+	public ShipmentPutPayloadResponseDTO getShiprocketPutPayloadByOrderNumber(String orderNumber) {
+		ShipmentPutPayloadResponseDTO response = new ShipmentPutPayloadResponseDTO();
+		try {
+			if (orderNumber == null || orderNumber.trim().isEmpty()) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Order number must not be null or empty.");
+				return response;
+			}
+			String trimmedOrderNumber = orderNumber.trim();
+
+			// ── Resolve the Shiprocket order id live via Shiprocket's order search API ──
+			// (no local DB lookup — the internal order number is the channel_order_id)
+			Integer shiprocketOrderId = null;
+			Map<String, Object> matchedOrder = null;
+			try {
+				Map<String, Object> searchResult = shiprocketService.searchOrdersByChannelOrderId(trimmedOrderNumber);
+				List<Map<String, Object>> orders = extractOrderList(searchResult);
+
+				List<Map<String, Object>> exactMatches = new ArrayList<>();
+				for (Map<String, Object> order : orders) {
+					Object channelOrderIdObj = order.get("channel_order_id");
+					if (channelOrderIdObj != null
+							&& trimmedOrderNumber.equalsIgnoreCase(channelOrderIdObj.toString().trim())) {
+						exactMatches.add(order);
+					}
+				}
+				List<Map<String, Object>> candidates = exactMatches.isEmpty() ? orders : exactMatches;
+
+				// Prefer an active (non-cancelled) order, same precedence as before
+				matchedOrder = candidates.stream()
+					.filter(o -> {
+						Object status = o.get("status");
+						return status == null || !status.toString().toUpperCase().contains("CANCEL");
+					})
+					.findFirst()
+					.orElse(candidates.isEmpty() ? null : candidates.get(0));
+
+				if (matchedOrder != null) {
+					Object idObj = matchedOrder.get("id");
+					if (idObj == null)
+						idObj = matchedOrder.get("order_id");
+					shiprocketOrderId = toInteger(idObj);
+				}
+			}
+			catch (Exception ex) {
+				logger.warn(
+						"getShiprocketPutPayloadByOrderNumber: Shiprocket order search failed for orderNumber={} — {}",
+						trimmedOrderNumber, ex.getMessage());
+			}
+
+			if (shiprocketOrderId == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("No shipment found on Shiprocket for order number: " + trimmedOrderNumber);
+				return response;
+			}
+
+			response.setShiprocketOrderId(shiprocketOrderId);
+			if (matchedOrder != null) {
+				populateFromShiprocketOrderSummary(response, matchedOrder);
+			}
+
+			// ── Refresh order/shipment level info live from Shiprocket (order/show) ──
+			if (response.getShiprocketOrderId() != null) {
+				try {
+					Map orderDetails = shiprocketService.getOrderDetails(response.getShiprocketOrderId());
+					Object dataObj = orderDetails != null ? orderDetails.get("data") : null;
+					if (dataObj instanceof Map) {
+						Map data = (Map) dataObj;
+						Object shipmentsObj = data.get("shipments");
+						Map shipment = null;
+						if (shipmentsObj instanceof List && !((List) shipmentsObj).isEmpty()) {
+							Object first = ((List) shipmentsObj).get(0);
+							if (first instanceof Map) {
+								shipment = (Map) first;
+							}
+						}
+						if (shipment != null) {
+							if (shipment.get("id") != null) {
+								response.setShiprocketShipmentId(toInteger(shipment.get("id")));
+							}
+							if (shipment.get("awb") != null && !shipment.get("awb").toString().trim().isEmpty()) {
+								response.setAwbCode(shipment.get("awb").toString().trim());
+							}
+							if (shipment.get("courier") != null) {
+								response.setCourierName(shipment.get("courier").toString());
+							}
+							if (shipment.get("status") != null) {
+								response.setShipmentStatus(shipment.get("status").toString());
+							}
+						}
+					}
+				}
+				catch (Exception ex) {
+					logger.warn(
+							"getShiprocketPutPayloadByOrderNumber: could not fetch live order details from Shiprocket for orderNumber={}, shiprocketOrderId={} — {}",
+							orderNumber, shiprocketOrderId, ex.getMessage());
+				}
+			}
+
+			// ── Refresh AWB / courier tracking data live from Shiprocket (track/awb) ──
+			if (response.getAwbCode() != null && !response.getAwbCode().trim().isEmpty()) {
+				try {
+					Map trackingData = shiprocketService.trackShipment(response.getAwbCode().trim());
+					Object dataObj = trackingData != null ? trackingData.get("tracking_data") : null;
+					if (dataObj instanceof Map) {
+						Map trackingInfo = (Map) dataObj;
+						if (trackingInfo.get("courier_name") != null) {
+							response.setCourierName(trackingInfo.get("courier_name").toString());
+						}
+						if (trackingInfo.get("edd") != null
+								&& !trackingInfo.get("edd").toString().trim().isEmpty()) {
+							response.setExpectedDeliveryDate(trackingInfo.get("edd").toString().trim());
+						}
+						if (trackingInfo.get("shipment_status") != null) {
+							response.setShipmentStatus(trackingInfo.get("shipment_status").toString());
+						}
+					}
+				}
+				catch (Exception ex) {
+					logger.warn(
+							"getShiprocketPutPayloadByOrderNumber: could not fetch live AWB tracking from Shiprocket for orderNumber={}, awb={} — {}",
+							orderNumber, response.getAwbCode(), ex.getMessage());
+				}
+			}
+
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage("Fetched live Shiprocket shipment payload successfully.");
+		}
+		catch (Exception e) {
+			logger.error("getShiprocketPutPayloadByOrderNumber: error for orderNumber={} — {}", orderNumber,
+					e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage(
+					"An error occurred while fetching the Shiprocket shipment payload: " + e.getMessage());
+		}
+		return response;
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Retrigger shipping process (admin manual retry after a failure)
+	// ──────────────────────────────────────────────────────────────────────────
+
+	@Override
+	public RetriggerShippingResponseDTO retriggerShippingProcess(String orderNumber) {
+		logger.info("retriggerShippingProcess called for orderNumber={}", orderNumber);
+		RetriggerShippingResponseDTO response = new RetriggerShippingResponseDTO();
+		response.setOrderNumber(orderNumber);
+		List<ShipmentRetriggerResultDTO> results = new ArrayList<>();
+		response.setResults(results);
+
+		if (orderNumber == null || orderNumber.isBlank()) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("orderNumber must not be null/blank");
+			return response;
+		}
+
+		try {
+			OrderEO order = orderRepository.findByOrderNumber(orderNumber).orElse(null);
+			if (order == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("No order found for orderNumber=" + orderNumber);
+				return response;
+			}
+			response.setOrderId(order.getOrderId() != null ? order.getOrderId().longValue() : null);
+
+			List<ShippingEO> shipments = shippingRepository.findByOrder(order);
+			List<ShippingEO> retriableShipments = shipments == null ? Collections.emptyList()
+					: shipments.stream()
+						.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType()))
+						.filter(s -> !Constants.SHIPMENT_STATUS_CANCELLED.equalsIgnoreCase(s.getShipmentStatus())
+								&& !Constants.SHIPMENT_STATUS_DELIVERED.equalsIgnoreCase(s.getShipmentStatus()))
+						.collect(Collectors.toList());
+
+			if (retriableShipments.isEmpty()) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage(
+						"No active FORWARD shipment found to retrigger for orderNumber=" + orderNumber
+								+ " (shipment may not exist yet, or is already CANCELLED/DELIVERED)");
+				return response;
+			}
+
+			int retriggeredCount = 0;
+			int alreadyProcessedCount = 0;
+			for (ShippingEO shippingEO : retriableShipments) {
+				String previousStatus = shippingEO.getShipmentStatus();
+				ShipmentRetriggerResultDTO.ShipmentRetriggerResultDTOBuilder resultBuilder = ShipmentRetriggerResultDTO
+					.builder()
+					.shipmentId(shippingEO.getShipmentId())
+					.trackingNumber(shippingEO.getTrackingNumber())
+					.previousStatus(previousStatus);
+
+				try {
+					// ── Already-processed guard: don't reprocess a shipment that has ──
+					// ── already completed the full Shiprocket flow successfully.    ──
+					if (isShipmentFullyProcessed(shippingEO)) {
+						alreadyProcessedCount++;
+						results.add(resultBuilder.currentStatus(previousStatus)
+							.action("SKIPPED")
+							.message("Shipment is already fully processed (AWB=" + shippingEO.getAwb()
+									+ ", pickup scheduled, label & tracking generated); retrigger is not needed")
+							.build());
+						logger.info(
+								"retriggerShippingProcess: shipmentId={} already fully processed, skipping",
+								shippingEO.getShipmentId());
+						continue;
+					}
+
+					// ── Cooldown guard: avoid re-hitting Shiprocket too soon ──
+					Optional<ShiprocketOrderLogEO> lastLog = shiprocketOrderLogRepository
+						.findFirstByShipmentIdOrderByCreatedAtDesc(shippingEO.getShipmentId());
+					if (lastLog.isPresent() && lastLog.get().getCreatedAt() != null) {
+						LocalDateTime cooldownUntil = lastLog.get()
+							.getCreatedAt()
+							.plusMinutes(Constants.RETRIGGER_SHIPPING_COOLDOWN_MINUTES);
+						if (LocalDateTime.now().isBefore(cooldownUntil)) {
+							results.add(resultBuilder.currentStatus(previousStatus)
+								.action("SKIPPED")
+								.message("Please wait before retrying; last attempt was at " + lastLog.get()
+									.getCreatedAt()
+									+ ". Try again after " + cooldownUntil)
+								.build());
+							logger.info(
+									"retriggerShippingProcess: shipmentId={} still in cooldown until {}, skipping",
+									shippingEO.getShipmentId(), cooldownUntil);
+							continue;
+						}
+					}
+
+					Long warehouseId = shippingEO.getWarehouse() != null ? shippingEO.getWarehouse().getWarehouseId()
+							: null;
+					ShiprocketOrderEvent event = ShiprocketOrderEvent.builder()
+						.shipmentId(shippingEO.getShipmentId())
+						.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
+						.warehouseId(warehouseId)
+						.build();
+
+					saveStepLog(event, "RETRIGGER", "IN_PROGRESS", "Manually retriggered by admin from status="
+							+ previousStatus + " on orderNumber=" + orderNumber);
+					logger.info("retriggerShippingProcess: retriggering shipmentId={} (previousStatus={})",
+							shippingEO.getShipmentId(), previousStatus);
+
+					// processShiprocketOrderEvent internally skips CREATE_ORDER if a
+					// Shiprocket order already exists for this shipment (see
+					// idempotency guard in Step 1), so this safely resumes from the
+					// courier-selection step onwards without duplicating the order. All
+					// downstream steps (AWB, pickup, label, tracking) persist their own
+					// updates to the shippingEO/ShiprocketOrderLog/tracking-history
+					// tables as part of that call, so retriggering keeps every internal
+					// table in sync for the shipment that actually got processed.
+					this.processShiprocketOrderEvent(event);
+
+					ShippingEO refreshed = shippingRepository.findById(shippingEO.getShipmentId()).orElse(shippingEO);
+					String refreshedStatus = refreshed.getShipmentStatus();
+
+					// ── Determine real outcome: processShiprocketOrderEvent swallows its
+					// ── own internal step errors (it never rethrows), so a successful
+					// ── return here does NOT necessarily mean the shipment actually
+					// ── progressed. Check the resulting state and, if it still isn't
+					// ── fully processed (and isn't the intentional
+					// ── MANUAL_PROCESSING_REQUIRED stop-state), look up the most recent
+					// ── FAILED step log for this shipment to surface a detailed reason.
+					if (isShipmentFullyProcessed(refreshed)
+							|| Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED.equalsIgnoreCase(refreshedStatus)) {
+						results.add(resultBuilder.currentStatus(refreshedStatus)
+							.action("RETRIGGERED")
+							.message(shippingEO.getShipOrderId() != null
+									? "Resumed processing for existing Shiprocket order_id=" + shippingEO.getShipOrderId()
+									: "Restarted Shiprocket order creation from scratch")
+							.build());
+						retriggeredCount++;
+					}
+					else {
+						Optional<ShiprocketOrderLogEO> failedLog = shiprocketOrderLogRepository
+							.findFirstByShipmentIdAndStatusOrderByCreatedAtDesc(shippingEO.getShipmentId(), "FAILED");
+						String failedStep = failedLog.map(ShiprocketOrderLogEO::getStep).orElse("UNKNOWN");
+						String reason = failedLog.map(ShiprocketOrderLogEO::getErrorMessage)
+							.filter(m -> m != null && !m.isBlank())
+							.orElse("Retrigger did not complete successfully and no detailed error was captured. "
+									+ "Please check shiprocket_order_log for shipmentId=" + shippingEO.getShipmentId()
+									+ " or contact support.");
+						results.add(resultBuilder.currentStatus(refreshedStatus)
+							.action("FAILED")
+							.failedStep(failedStep)
+							.failureReason(reason)
+							.message("Retrigger attempt did not complete successfully at step '" + failedStep
+									+ "'. Reason: " + reason)
+							.build());
+						logger.warn(
+								"retriggerShippingProcess: shipmentId={} still not fully processed after retrigger; failedStep={}, reason={}",
+								shippingEO.getShipmentId(), failedStep, reason);
+					}
+				}
+				catch (Exception shipmentEx) {
+					Throwable rootCause = shipmentEx;
+					while (rootCause.getCause() != null && rootCause.getCause() != rootCause) {
+						rootCause = rootCause.getCause();
+					}
+					String reason = rootCause.getMessage() != null ? rootCause.getMessage() : rootCause.toString();
+					logger.error("retriggerShippingProcess: error retriggering shipmentId={}: {}",
+							shippingEO.getShipmentId(), reason, shipmentEx);
+					results.add(resultBuilder.currentStatus(previousStatus)
+						.action("FAILED")
+						.failedStep("RETRIGGER")
+						.failureReason(reason)
+						.message("Unexpected error while retriggering: " + reason)
+						.build());
+				}
+			}
+
+			if (retriggeredCount > 0) {
+				response.setResponseStatus(Constants.SUCCESS_STATUS);
+				response.setResponseMessage(
+						"Retriggered shipping process for " + retriggeredCount + " of " + retriableShipments.size()
+								+ " shipment(s) under orderNumber=" + orderNumber
+								+ (alreadyProcessedCount > 0
+										? " (" + alreadyProcessedCount + " shipment(s) skipped, already processed)"
+										: ""));
+			}
+			else if (alreadyProcessedCount == retriableShipments.size()) {
+				response.setResponseStatus(Constants.SUCCESS_STATUS);
+				response.setResponseMessage(
+						"All " + alreadyProcessedCount + " shipment(s) under orderNumber=" + orderNumber
+								+ " are already fully processed; nothing to retrigger");
+			}
+			else {
+				// ── Aggregate the individual failure reasons into the top-level
+				// ── message so the UI doesn't have to dig through `results` to show
+				// ── the admin something actionable.
+				String aggregatedReasons = results.stream()
+					.filter(r -> "FAILED".equals(r.getAction()))
+					.map(r -> "shipmentId=" + r.getShipmentId() + " [" + r.getFailedStep() + "]: "
+							+ r.getFailureReason())
+					.collect(Collectors.joining("; "));
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage(
+						"No shipment could be retriggered for orderNumber=" + orderNumber
+								+ (aggregatedReasons.isEmpty() ? " (see results for reasons)"
+										: ". Reason(s): " + aggregatedReasons));
+			}
+		}
+		catch (Exception e) {
+			Throwable rootCause = e;
+			while (rootCause.getCause() != null && rootCause.getCause() != rootCause) {
+				rootCause = rootCause.getCause();
+			}
+			String reason = rootCause.getMessage() != null ? rootCause.getMessage() : rootCause.toString();
+			logger.error("retriggerShippingProcess: unexpected error for orderNumber={}: {}", orderNumber, reason, e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while retriggering the shipping process: " + reason);
+		}
+		return response;
+	}
+
+	/**
+	 * A shipment is considered fully/successfully processed by Shiprocket once it has
+	 * an AWB assigned, a pickup scheduled, a shipping label generated and a tracking
+	 * URL captured. Once all of these are present there is nothing left for a retrigger
+	 * to do, so it should be reported as SKIPPED rather than re-run (which would just
+	 * repeat no-op API calls against Shiprocket, or worse, request a fresh pickup for an
+	 * already-picked-up shipment).
+	 */
+	private boolean isShipmentFullyProcessed(ShippingEO shippingEO) {
+		if (shippingEO == null) {
+			return false;
+		}
+		return shippingEO.getAwb() != null && !shippingEO.getAwb().isBlank() && shippingEO.getLabelUrl() != null
+				&& shippingEO.getPickupScheduledDate() != null && shippingEO.getTrackUrl() != null;
+	}
+
+	/** Best-effort conversion of a numeric-like Object (Integer/Long/Double/String) to Integer. */
+	private Integer toInteger(Object value) {
+
+		if (value == null)
+			return null;
+		if (value instanceof Integer)
+			return (Integer) value;
+		if (value instanceof Number)
+			return ((Number) value).intValue();
+		try {
+			return Integer.parseInt(value.toString().trim());
+		}
+		catch (NumberFormatException ex) {
+			return null;
+		}
+	}
+
+	/** Best-effort conversion of a numeric-like Object (Integer/Long/Double/String) to Double. */
+	private Double toDouble(Object value) {
+		if (value == null)
+			return null;
+		if (value instanceof Double)
+			return (Double) value;
+		if (value instanceof Number)
+			return ((Number) value).doubleValue();
+		try {
+			return Double.parseDouble(value.toString().trim());
+		}
+		catch (NumberFormatException ex) {
+			return null;
+		}
+	}
+
+	/**
+	 * Extracts the list of order maps from the raw Shiprocket "search orders" response
+	 * (GET /orders?search=...). Shiprocket's response shape can vary slightly across
+	 * accounts/API versions, so this defensively looks for a List either directly under
+	 * "data", nested one level deeper under "data" -> "data"/"orders", or under a
+	 * top-level "orders" key — falling back to an empty list if nothing usable is found.
+	 */
+	private List<Map<String, Object>> extractOrderList(Map<String, Object> searchResult) {
+		List<Map<String, Object>> orders = new ArrayList<>();
+		if (searchResult == null)
+			return orders;
+		orders.addAll(extractMapsFromAnyShape(searchResult.get("data")));
+		if (orders.isEmpty()) {
+			orders.addAll(extractMapsFromAnyShape(searchResult.get("orders")));
+		}
+		return orders;
+	}
+
+	/** Pulls a List<Map> out of an Object that may be a List directly, or a Map wrapping one. */
+	@SuppressWarnings("unchecked")
+	private List<Map<String, Object>> extractMapsFromAnyShape(Object obj) {
+		List<Map<String, Object>> result = new ArrayList<>();
+		if (obj instanceof List) {
+			for (Object item : (List<?>) obj) {
+				if (item instanceof Map)
+					result.add((Map<String, Object>) item);
+			}
+		}
+		else if (obj instanceof Map) {
+			Map<?, ?> map = (Map<?, ?>) obj;
+			Object nested = map.get("data");
+			if (nested == null)
+				nested = map.get("orders");
+			if (nested instanceof List) {
+				for (Object item : (List<?>) nested) {
+					if (item instanceof Map)
+						result.add((Map<String, Object>) item);
+				}
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Best-effort population of the response DTO using the order summary object returned
+	 * by Shiprocket's "search orders" API (GET /orders?search=...). Any shipment/AWB/
+	 * courier/status/dimension fields set here are provisional and will be overwritten
+	 * later by the live "order/show" and "track/awb" calls, when available.
+	 */
+	private void populateFromShiprocketOrderSummary(ShipmentPutPayloadResponseDTO response,
+			Map<String, Object> matchedOrder) {
+		if (matchedOrder == null)
+			return;
+
+		if (matchedOrder.get("status") != null) {
+			response.setShipmentStatus(matchedOrder.get("status").toString());
+		}
+		Double length = toDouble(matchedOrder.get("length"));
+		if (length != null)
+			response.setLength(length);
+		Double breadth = toDouble(matchedOrder.get("breadth"));
+		if (breadth != null)
+			response.setBreadth(breadth);
+		Double height = toDouble(matchedOrder.get("height"));
+		if (height != null)
+			response.setHeight(height);
+		Double weight = toDouble(matchedOrder.get("weight"));
+		if (weight != null)
+			response.setWeight(weight);
+
+		Object shipmentsObj = matchedOrder.get("shipments");
+		Map<?, ?> shipment = null;
+		if (shipmentsObj instanceof List && !((List<?>) shipmentsObj).isEmpty()) {
+			Object first = ((List<?>) shipmentsObj).get(0);
+			if (first instanceof Map)
+				shipment = (Map<?, ?>) first;
+		}
+		if (shipment != null) {
+			if (shipment.get("id") != null)
+				response.setShiprocketShipmentId(toInteger(shipment.get("id")));
+			if (shipment.get("awb") != null && !shipment.get("awb").toString().trim().isEmpty())
+				response.setAwbCode(shipment.get("awb").toString().trim());
+			if (shipment.get("courier") != null)
+				response.setCourierName(shipment.get("courier").toString());
+			if (shipment.get("status") != null)
+				response.setShipmentStatus(shipment.get("status").toString());
+		}
 	}
 
 	// ─── Private helpers shared by create / update ────────────────────────────
@@ -2313,19 +2886,89 @@ public class ShippingServiceImpl implements ShippingService {
 		}
 	}
 
-	/** Inserts a tracking history row if historyStatus is provided in the request. */
+	/**
+	 * Inserts a tracking history row for this shipment.
+	 * <p>
+	 * If {@code historyStatus} is explicitly provided in the request, that value is
+	 * used (as before). Otherwise, this falls back to auto-recording the shipment's
+	 * <b>current</b> status ({@code saved.getShipmentStatus()}) as a history entry —
+	 * but only if a record with that exact status doesn't already exist for this
+	 * shipment, so the Track Order history list doesn't show duplicate entries and
+	 * the current status is never silently missing from the history table.
+	 */
 	private boolean saveTrackingHistoryIfRequested(ShippingEO saved, ShippingOrderRequestDTO req) {
-		if (req.getHistoryStatus() == null || req.getHistoryStatus().trim().isEmpty())
+		String statusToRecord;
+		String location;
+		String remarks;
+		if (req.getHistoryStatus() != null && !req.getHistoryStatus().trim().isEmpty()) {
+			statusToRecord = req.getHistoryStatus().trim();
+			location = req.getHistoryLocation();
+			remarks = req.getHistoryRemarks() != null ? req.getHistoryRemarks() : "Manual action by admin.";
+		}
+		else if (saved.getShipmentStatus() != null && !saved.getShipmentStatus().trim().isEmpty()) {
+			statusToRecord = saved.getShipmentStatus().trim();
+			location = null;
+			remarks = "Auto-recorded: current shipment status.";
+		}
+		else {
 			return false;
+		}
+
+		// Idempotency guard — don't insert a duplicate row if this status is already
+		// present in the history table for this shipment.
+		boolean alreadyRecorded = shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(saved,
+				statusToRecord);
+		if (alreadyRecorded) {
+			logger.info(
+					"saveTrackingHistoryIfRequested: shipmentId={} already has a history record with status='{}'. Skipping duplicate insert.",
+					saved.getShipmentId(), statusToRecord);
+			return false;
+		}
+
 		ShipmentTrackingHistoryEO history = ShipmentTrackingHistoryEO.builder()
 			.shipment(saved)
-			.status(req.getHistoryStatus().trim())
-			.location(req.getHistoryLocation())
-			.remarks(req.getHistoryRemarks() != null ? req.getHistoryRemarks() : "Manual action by admin.")
+			.status(statusToRecord)
+			.location(location)
+			.remarks(remarks)
 			.updatedAt(LocalDateTime.now())
 			.build();
 		shipmentTrackingHistoryRepository.save(history);
 		return true;
+	}
+
+	/**
+	 * Keeps the parent {@link OrderEO#getOrderStatus()} in sync with the shipment's
+	 * current status after a manual create/update, mirroring the mapping used by the
+	 * Shiprocket-webhook-driven {@link #shipmentStatusUpdate} flow. Only writes to the
+	 * order if its status actually differs from the derived value, so we don't perform
+	 * unnecessary DB writes when the order is already up to date.
+	 */
+	private void syncOrderStatusWithShipment(ShippingEO saved) {
+		try {
+			if (saved == null || saved.getOrder() == null || saved.getShipmentStatus() == null
+					|| saved.getShipmentStatus().trim().isEmpty()) {
+				return;
+			}
+			OrderEO order = saved.getOrder();
+			String shipmentStatus = saved.getShipmentStatus().trim();
+			String derivedOrderStatus = Constants.SHIPMENT_STATUS_DELIVERED.equalsIgnoreCase(shipmentStatus)
+					? Constants.ORDER_STATUS_DELIVERED : shipmentStatus;
+
+			if (!derivedOrderStatus.equalsIgnoreCase(order.getOrderStatus())) {
+				logger.info("syncOrderStatusWithShipment: updating orderId={} status from '{}' to '{}'",
+						order.getOrderId(), order.getOrderStatus(), derivedOrderStatus);
+				order.setOrderStatus(derivedOrderStatus);
+				orderRepository.save(order);
+			}
+			else {
+				logger.debug("syncOrderStatusWithShipment: orderId={} status already '{}'. No update needed.",
+						order.getOrderId(), derivedOrderStatus);
+			}
+		}
+		catch (Exception ex) {
+			logger.warn("syncOrderStatusWithShipment: failed to sync order status for shipmentId={} — {}",
+					saved != null ? saved.getShipmentId() : null, ex.getMessage());
+		}
 	}
 
 	/** Writes an entry to shiprocket_order_log for audit purposes. */

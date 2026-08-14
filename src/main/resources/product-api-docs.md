@@ -29,10 +29,14 @@
 | 15 | `DELETE` | `/api/products/productsVariant/{variant_id}`      | Soft-delete a product variant                    |
 | 16 | `DELETE` | `/api/products/productsVariant/{variant_id}/video`| Delete the video of a product variant            |
 | 17 | `GET`    | `/api/products/productsVariant/{product_id}`      | Get variants by product ID (images + `isMainImage`) |
-| 18 | `POST`   | `/api/products/productAttributes`                 | Create a product attribute                       |
-| 19 | `PUT`    | `/api/products/productAttributes/{attributeId}`   | Update a product attribute                       |
-| 20 | `DELETE` | `/api/products/productAttributes/{attributeId}`   | Delete a product attribute                       |
-| 21 | `GET`    | `/api/products/productImage/{productId}`          | Get images by product variant ID                 |
+| 18 | `POST`   | `/api/products/productAttributes`                 | [Create a product attribute](#post-apiproductsproductattributes--create-a-product-attribute) |
+| 19 | `PUT`    | `/api/products/productAttributes/{attributeId}`   | [Update a product attribute](#put-apiproductsproductattributesattributeid--update-a-product-attribute) |
+| 20 | `DELETE` | `/api/products/productAttributes/{attributeId}`   | [Delete a product attribute](#delete-apiproductsproductattributesattributeid--delete-a-product-attribute) |
+| 20a | `PUT`   | `/api/products/productsVariant/{variantId}/attributes/sequence` | [Update attribute display sequence for a variant](#put-apiproductsproductsvariantvariantidattributessequence--update-attribute-sequence) |
+| 20b | `PUT`   | `/api/products/productsVariant/attributes/sequence/bulk` | Bulk update attribute display sequence (multi-variant) |
+| 20c | `PUT`   | `/api/products/productsVariant/{variantId}/images/sequence` | [Update image display sequence for a variant](#put-apiproductsproductsvariantvariantidimagessequence--update-image-sequence) |
+| 20d | `PUT`   | `/api/products/productsVariant/images/sequence/bulk` | [Bulk update image display sequence (multi-variant)](#put-apiproductsproductsvariantimagessequencebulk--bulk-update-image-sequence-multi-variant) |
+| 21 | `GET`    | `/api/products/productImage/{productId}`          | Get images by product variant ID (includes `displayOrder`) |
 | 22 | `DELETE` | `/api/products/productImage/{image_id}`           | Delete a product image by ID                     |
 | 23 | `GET`    | `/api/products/shop/{category}`                   | Get products by category name with filters       |
 | 24 | `GET`    | `/api/products/search`                            | **Search products with full filter support**     |
@@ -189,7 +193,7 @@ curl -X POST http://localhost:8080/api/products/productsVariant \
 
 ### `PUT /api/products/productsVariant`
 
-Updates an existing product variant. Optionally uploads new images and/or a replacement video. Returns the full variant DTO including all images (existing + new) with `isMainImage` and attributes.
+Updates an existing product variant. Optionally uploads new images and/or a replacement video. Returns the full variant DTO including all images (existing + new) with `isMainImage` and attributes (`attributes` is always ordered by `displayOrder` ascending).
 
 **Content-Type:** `multipart/form-data`
 
@@ -333,7 +337,7 @@ curl -X DELETE http://localhost:8080/api/products/productsVariant/14/video
 
 ### `GET /api/products/productSlug/{productSlug}`
 
-Returns full product details for the given slug. The selected (cheapest) variant's `videoUrl` is included at the top level, and every entry in `productvarlist` also has its own `videoUrl`.
+Returns full product details for the given slug. The selected (cheapest) variant's `videoUrl` is included at the top level, and every entry in `productvarlist` also has its own `videoUrl`. `attributes` for the selected variant and for every variant in `productvarlist` is always ordered by `displayOrder` ascending.
 
 **Example:**
 ```
@@ -401,7 +405,7 @@ GET /api/products/productSlug/walnuts
 | `inStock`        | `Integer`     | `1` if stock > 0, else `0` |
 | `isReturnable`   | `String`      | `"Y"` or `"N"` |
 | `returnPolicy`   | `Object/null` | Return policy details, or `null` |
-| `attributes`     | `Array`       | Attribute name-value pairs |
+| `attributes`     | `Array`       | Attribute name-value pairs (ordered by `displayOrder` ascending) |
 | `productvarlist` | `Array`       | Other variants — each a `ProductDTO` with its own `videoUrl`, `mainImage`, etc. |
 
 ---
@@ -410,7 +414,7 @@ GET /api/products/productSlug/walnuts
 
 ### `GET /api/products/productsVariant/{product_id}`
 
-Returns all active variants for a product. Each variant includes its full `productImages` list (with `isMainImage`) and `attributes`.
+Returns all active variants for a product. Each variant includes its full `productImages` list (with `isMainImage`) and `attributes` (always ordered by `displayOrder` ascending).
 
 > **Auto-fix**: If no image for a variant has `isMainImage = "Y"`, the first image is automatically promoted and persisted as the main image.
 
@@ -451,6 +455,439 @@ GET /api/products/productsVariant/3
     ]
   }
 ]
+```
+
+---
+
+## Product Attribute APIs
+
+Manage individual attribute name/value pairs (e.g. `"Weight" = "250g"`) attached to a product variant.
+
+> **Ordering**: Wherever a variant's `attributes` list is returned by any Product API (e.g. Update Product Variant, Get Product by Slug, Get Variants by Product ID), the list is always sorted by `displayOrder` ascending — i.e. the attribute sequence number.
+
+### `POST /api/products/productAttributes` — Create a Product Attribute
+
+**Content-Type:** `application/json`
+
+#### Request Body
+
+```json
+{
+  "variantId": 14,
+  "attributeName": "Weight",
+  "attributeValue": "250g",
+  "displayOrder": 1
+}
+```
+
+#### Request Fields
+
+| Field            | Type      | Required | Description |
+|------------------|-----------|----------|-------------|
+| `variantId`      | `Long`    | ✅ Yes   | ID of the product variant this attribute belongs to |
+| `attributeName`  | `String`  | ✅ Yes   | Attribute name (e.g. `"Weight"`, `"Color"`) |
+| `attributeValue` | `String`  | ✅ Yes   | Attribute value (e.g. `"250g"`, `"Red"`) |
+| `displayOrder`   | `Integer` | ❌ No    | Optional. Controls the display/sort order of attributes (lower = shown first). Omit to leave unset. |
+
+#### Response — `200 OK`
+
+```json
+{
+  "id": 5,
+  "variantId": 14,
+  "attributeName": "Weight",
+  "attributeValue": "250g",
+  "displayOrder": 1
+}
+```
+
+#### curl Example
+
+```bash
+curl -X POST http://localhost:8080/api/products/productAttributes \
+  -H "Content-Type: application/json" \
+  -d '{"variantId":14,"attributeName":"Weight","attributeValue":"250g","displayOrder":1}'
+```
+
+---
+
+### `PUT /api/products/productAttributes/{attributeId}` — Update a Product Attribute
+
+**Content-Type:** `application/json`
+
+#### Path Parameter
+
+| Parameter     | Type   | Description |
+|---------------|--------|-------------|
+| `attributeId` | `Long` | ID of the attribute to update |
+
+#### Request Body (all fields optional — only provided fields are updated)
+
+```json
+{
+  "attributeName": "Weight",
+  "attributeValue": "500g",
+  "displayOrder": 2
+}
+```
+
+| Field            | Type      | Required | Description |
+|------------------|-----------|----------|-------------|
+| `attributeName`  | `String`  | ❌ No    | New attribute name |
+| `attributeValue` | `String`  | ❌ No    | New attribute value |
+| `displayOrder`   | `Integer` | ❌ No    | New display/sort order value |
+
+#### Response — `200 OK`
+
+```json
+{
+  "id": 5,
+  "variantId": 14,
+  "attributeName": "Weight",
+  "attributeValue": "500g",
+  "displayOrder": 2
+}
+```
+
+#### Error Response (not found)
+
+```json
+{ "error": "Product Attribute not found with ID: 5" }
+```
+
+#### curl Example
+
+```bash
+curl -X PUT http://localhost:8080/api/products/productAttributes/5 \
+  -H "Content-Type: application/json" \
+  -d '{"attributeValue":"500g","displayOrder":2}'
+```
+
+---
+
+### `DELETE /api/products/productAttributes/{attributeId}` — Delete a Product Attribute
+
+#### Path Parameter
+
+| Parameter     | Type   | Description |
+|---------------|--------|-------------|
+| `attributeId` | `Long` | ID of the attribute to delete |
+
+#### Response — `200 OK`
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Product Attribute deleted successfully"
+}
+```
+
+#### curl Example
+
+```bash
+curl -X DELETE http://localhost:8080/api/products/productAttributes/5
+```
+
+---
+
+### `PUT /api/products/productsVariant/{variantId}/attributes/sequence` — Update Attribute Sequence
+
+Bulk-updates the `displayOrder` of one or more attributes belonging to a single product variant, in a single transaction. Use this to reorder the attributes shown on a variant/product (e.g. drag-and-drop reordering in an admin UI).
+
+**Content-Type:** `application/json`
+
+#### Path Parameter
+
+| Parameter   | Type   | Description                                        |
+|-------------|--------|-----------------------------------------------------|
+| `variantId` | `Long` | ID of the product variant whose attributes to reorder |
+
+#### Request Body
+
+```json
+{
+  "attributes": [
+    { "attributeId": 5, "displayOrder": 1 },
+    { "attributeId": 6, "displayOrder": 2 },
+    { "attributeId": 7, "displayOrder": 3 }
+  ]
+}
+```
+
+| Field                    | Type      | Required | Description |
+|--------------------------|-----------|----------|-------------|
+| `attributes`             | `Array`   | ✅ Yes   | List of attribute-id/displayOrder pairs. Must not be empty. |
+| `attributes[].attributeId` | `Long` | ✅ Yes   | ID of an existing attribute — **must already belong to `variantId`** |
+| `attributes[].displayOrder` | `Integer` | ✅ Yes | New sort order for this attribute (lower = shown first) |
+
+#### Response — `200 OK`
+
+Returns the updated attributes for the variant, sorted by `displayOrder` ascending (`null` values last).
+
+```json
+[
+  { "id": 5, "variantId": 14, "attributeName": "Weight", "attributeValue": "250g", "displayOrder": 1 },
+  { "id": 6, "variantId": 14, "attributeName": "Color", "attributeValue": "Red", "displayOrder": 2 },
+  { "id": 7, "variantId": 14, "attributeName": "Material", "attributeValue": "Cotton", "displayOrder": 3 }
+]
+```
+
+#### Validation / Error Conditions
+
+| Condition | Result |
+|-----------|--------|
+| `variantId` does not exist | `RuntimeException`: `"Product Variant not found with ID: {variantId}"` |
+| `attributes` is missing/empty | `RuntimeException`: `"attributes list must not be empty"` |
+| An `attributeId` does not exist | `RuntimeException`: `"Product Attribute not found with ID: {attributeId}"` |
+| An `attributeId` belongs to a **different** variant | `RuntimeException`: `"Attribute ID {attributeId} does not belong to variant ID {variantId}"` — the whole request is rolled back (no partial updates) |
+
+#### curl Example
+
+```bash
+curl -X PUT http://localhost:8080/api/products/productsVariant/14/attributes/sequence \
+  -H "Content-Type: application/json" \
+  -d '{"attributes":[{"attributeId":5,"displayOrder":1},{"attributeId":6,"displayOrder":2}]}'
+```
+
+---
+
+### `PUT /api/products/productsVariant/attributes/sequence/bulk` — Bulk Update Attribute Sequence (Multi-Variant)
+
+Bulk-updates the `displayOrder` of attributes across **one or more product variants in a single API call**, in a single transaction. Use this when reordering attributes for several variants at once (e.g. saving multiple drag-and-drop reorderings in one admin action) instead of issuing one request per variant.
+
+**Content-Type:** `application/json`
+
+#### Request Body
+
+```json
+{
+  "variants": [
+    {
+      "variantId": 14,
+      "attributes": [
+        { "attributeId": 5, "displayOrder": 1 },
+        { "attributeId": 6, "displayOrder": 2 }
+      ]
+    },
+    {
+      "variantId": 15,
+      "attributes": [
+        { "attributeId": 8, "displayOrder": 1 },
+        { "attributeId": 9, "displayOrder": 2 },
+        { "attributeId": 10, "displayOrder": 3 }
+      ]
+    }
+  ]
+}
+```
+
+| Field                                  | Type      | Required | Description |
+|-----------------------------------------|-----------|----------|-------------|
+| `variants`                               | `Array`   | ✅ Yes   | List of per-variant attribute-sequence updates. Must not be empty. |
+| `variants[].variantId`                   | `Long`    | ✅ Yes   | ID of the product variant whose attributes to reorder |
+| `variants[].attributes`                  | `Array`   | ✅ Yes   | List of attribute-id/displayOrder pairs for this variant. Must not be empty. |
+| `variants[].attributes[].attributeId`    | `Long`    | ✅ Yes   | ID of an existing attribute — **must already belong to the corresponding `variantId`** |
+| `variants[].attributes[].displayOrder`   | `Integer` | ✅ Yes   | New sort order for this attribute (lower = shown first) |
+
+#### Response — `200 OK`
+
+Returns all updated attributes across every variant in the request, sorted by `variantId` then by `displayOrder` ascending (`null` values last).
+
+```json
+[
+  { "id": 5, "variantId": 14, "attributeName": "Weight", "attributeValue": "250g", "displayOrder": 1 },
+  { "id": 6, "variantId": 14, "attributeName": "Color", "attributeValue": "Red", "displayOrder": 2 },
+  { "id": 8, "variantId": 15, "attributeName": "Weight", "attributeValue": "500g", "displayOrder": 1 },
+  { "id": 9, "variantId": 15, "attributeName": "Color", "attributeValue": "Blue", "displayOrder": 2 },
+  { "id": 10, "variantId": 15, "attributeName": "Material", "attributeValue": "Wool", "displayOrder": 3 }
+]
+```
+
+#### Validation / Error Conditions
+
+The entire request is applied atomically — if **any** entry for **any** variant fails validation, the whole batch is rolled back (no partial updates across any variant).
+
+| Condition | Result |
+|-----------|--------|
+| `variants` is missing/empty | `RuntimeException`: `"variants list must not be empty"` |
+| A `variantId` is `null` | `RuntimeException`: `"variantId must not be null"` |
+| A variant's `attributes` is missing/empty | `RuntimeException`: `"attributes list must not be empty for variantId {variantId}"` |
+| A `variantId` does not exist | `RuntimeException`: `"Product Variant not found with ID: {variantId}"` |
+| An `attributeId` does not exist | `RuntimeException`: `"Product Attribute not found with ID: {attributeId}"` |
+| An `attributeId` belongs to a **different** variant than declared | `RuntimeException`: `"Attribute ID {attributeId} does not belong to variant ID {variantId}"` |
+
+#### curl Example
+
+```bash
+curl -X PUT http://localhost:8080/api/products/productsVariant/attributes/sequence/bulk \
+  -H "Content-Type: application/json" \
+  -d '{"variants":[{"variantId":14,"attributes":[{"attributeId":5,"displayOrder":1},{"attributeId":6,"displayOrder":2}]},{"variantId":15,"attributes":[{"attributeId":8,"displayOrder":1}]}]}'
+```
+
+---
+
+### `ProductAttributeDTO` Field Reference
+
+| Field            | Type      | Description |
+|------------------|-----------|-------------|
+| `id`             | `Long`    | Attribute ID (PK) |
+| `variantId`      | `Long`    | Parent product variant ID |
+| `attributeName`  | `String`  | Attribute name |
+| `attributeValue` | `String`  | Attribute value |
+| `displayOrder`   | `Integer` | Optional display/sort order. `null` if not set. Also returned wherever `attributes[]` appears (variant, product-by-slug, search results, etc.). |
+
+---
+
+### Product Image Sequence Number (`displayOrder`)
+
+`ProductImageEO` / `ProductImageDTO` now carry a `displayOrder` field (image sequence number) that controls the order images are shown in for a variant.
+
+- **Auto-assigned on upload**: when images are uploaded via `POST /api/products/productsVariant` or `PUT /api/products/productsVariant` (multipart `images` field), each image is automatically assigned a `displayOrder` based on its position in the uploaded list — `0, 1, 2, ...`. On update, newly-added images continue the sequence after the current maximum `displayOrder` of the variant's existing images.
+- **Returned everywhere `productImages[]` / image lists appear** — e.g. `GET /api/products/productImage/{productId}`, `GET /api/products/productsVariant/{product_id}`, `POST`/`PUT /api/products/productsVariant` responses. Images are returned sorted by `displayOrder` ascending.
+- **Reordering** existing images (without re-uploading) is done via the two endpoints below, mirroring the attribute-sequence pattern.
+
+### `PUT /api/products/productsVariant/{variantId}/images/sequence` — Update Image Sequence
+
+Bulk-updates the `displayOrder` of one or more images belonging to a single product variant, in a single transaction. Use this to reorder the images shown for a variant (e.g. drag-and-drop reordering in an admin UI).
+
+**Content-Type:** `application/json`
+
+#### Path Parameter
+
+| Parameter   | Type   | Description                                    |
+|-------------|--------|-------------------------------------------------|
+| `variantId` | `Long` | ID of the product variant whose images to reorder |
+
+#### Request Body
+
+```json
+{
+  "images": [
+    { "imageId": 101, "displayOrder": 1 },
+    { "imageId": 102, "displayOrder": 2 },
+    { "imageId": 103, "displayOrder": 3 }
+  ]
+}
+```
+
+| Field                      | Type      | Required | Description |
+|----------------------------|-----------|----------|-------------|
+| `images`                   | `Array`   | ✅ Yes   | List of image-id/displayOrder pairs. Must not be empty. |
+| `images[].imageId`         | `Long`    | ✅ Yes   | ID of an existing image — **must already belong to `variantId`** |
+| `images[].displayOrder`    | `Integer` | ✅ Yes   | New sort order for this image (lower = shown first) |
+
+#### Response — `200 OK`
+
+Returns the updated images for the variant, sorted by `displayOrder` ascending (`null` values last).
+
+```json
+[
+  { "id": 101, "productID": "14", "image": "https://...", "imagePath": "...", "isMainImage": "Y", "displayOrder": 1 },
+  { "id": 102, "productID": "14", "image": "https://...", "imagePath": "...", "isMainImage": "N", "displayOrder": 2 }
+]
+```
+
+#### Validation / Error Conditions
+
+| Condition | Result |
+|-----------|--------|
+| `variantId` does not exist | `RuntimeException`: `"Product Variant not found with ID: {variantId}"` |
+| `images` is missing/empty | `RuntimeException`: `"images list must not be empty"` |
+| An `imageId` does not exist | `RuntimeException`: `"Product Image not found with ID: {imageId}"` |
+| An `imageId` belongs to a **different** variant | `RuntimeException`: `"Image ID {imageId} does not belong to variant ID {variantId}"` — the whole request is rolled back (no partial updates) |
+
+#### curl Example
+
+```bash
+curl -X PUT http://localhost:8080/api/products/productsVariant/14/images/sequence \
+  -H "Content-Type: application/json" \
+  -d '{"images":[{"imageId":101,"displayOrder":1},{"imageId":102,"displayOrder":2}]}'
+```
+
+---
+
+### `PUT /api/products/productsVariant/images/sequence/bulk` — Bulk Update Image Sequence (Multi-Variant)
+
+Bulk-updates the `displayOrder` of images across **one or more product variants in a single API call**, in a single transaction.
+
+**Content-Type:** `application/json`
+
+#### Request Body
+
+```json
+{
+  "variants": [
+    {
+      "variantId": 14,
+      "images": [
+        { "imageId": 101, "displayOrder": 1 },
+        { "imageId": 102, "displayOrder": 2 }
+      ]
+    },
+    {
+      "variantId": 15,
+      "images": [
+        { "imageId": 201, "displayOrder": 1 }
+      ]
+    }
+  ]
+}
+```
+
+| Field                             | Type      | Required | Description |
+|------------------------------------|-----------|----------|-------------|
+| `variants`                         | `Array`   | ✅ Yes   | List of per-variant image-sequence updates. Must not be empty. |
+| `variants[].variantId`             | `Long`    | ✅ Yes   | ID of the product variant whose images to reorder |
+| `variants[].images`                | `Array`   | ✅ Yes   | List of image-id/displayOrder pairs for this variant. Must not be empty. |
+| `variants[].images[].imageId`      | `Long`    | ✅ Yes   | ID of an existing image — **must already belong to the corresponding `variantId`** |
+| `variants[].images[].displayOrder` | `Integer` | ✅ Yes   | New sort order for this image (lower = shown first) |
+
+#### Response — `200 OK`
+
+Returns all updated images across every variant in the request, sorted by `variantId` then by `displayOrder` ascending (`null` values last).
+
+#### Validation / Error Conditions
+
+The entire request is applied atomically — if **any** entry for **any** variant fails validation, the whole batch is rolled back.
+
+| Condition | Result |
+|-----------|--------|
+| `variants` is missing/empty | `RuntimeException`: `"variants list must not be empty"` |
+| A `variantId` is `null` | `RuntimeException`: `"variantId must not be null"` |
+| A variant's `images` is missing/empty | `RuntimeException`: `"images list must not be empty for variantId {variantId}"` |
+| A `variantId` does not exist | `RuntimeException`: `"Product Variant not found with ID: {variantId}"` |
+| An `imageId` does not exist | `RuntimeException`: `"Product Image not found with ID: {imageId}"` |
+| An `imageId` belongs to a **different** variant than declared | `RuntimeException`: `"Image ID {imageId} does not belong to variant ID {variantId}"` |
+
+#### curl Example
+
+```bash
+curl -X PUT http://localhost:8080/api/products/productsVariant/images/sequence/bulk \
+  -H "Content-Type: application/json" \
+  -d '{"variants":[{"variantId":14,"images":[{"imageId":101,"displayOrder":1},{"imageId":102,"displayOrder":2}]},{"variantId":15,"images":[{"imageId":201,"displayOrder":1}]}]}'
+```
+
+---
+
+### `ProductImageDTO` Field Reference
+
+| Field         | Type      | Description |
+|---------------|-----------|-------------|
+| `id`          | `Integer` | Image ID (PK) |
+| `imageID`     | `String`  | (Legacy/unused convenience field) |
+| `productID`   | `String`  | Parent product ID |
+| `productName` | `String`  | Parent product name |
+| `image`       | `String`  | Cloudinary secure URL |
+| `imagePath`   | `String`  | Cloudinary public ID |
+| `isMainImage` | `String`  | `"Y"` if this is the main image for the variant, else `"N"` |
+| `displayOrder`| `Integer` | Image sequence number — lower shows first. `null` if not set. |
+
+
+> **Note:** `displayOrder` was added to the `product_attributes` table and is optional — existing rows/requests without it continue to work unchanged (`displayOrder` will be `null`).
+
+```sql
+-- Migration for existing tables:
+ALTER TABLE product_attributes ADD COLUMN display_order INT NULL;
 ```
 
 ---

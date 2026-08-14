@@ -5,17 +5,30 @@ import com.user.model.CartonEO;
 import com.user.model.OrderItemEO;
 import com.user.model.ProductVariantEO;
 import com.user.repository.CartonRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.annotation.Autowired;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 
 @Service
 public class CartonSelectionService {
 
+	private static final Logger logger = LoggerFactory.getLogger(CartonSelectionService.class);
+
+	/** Extra padding applied to computed dimensions/weight when auto-creating a carton. */
+	private static final double DIMENSION_BUFFER = 1.10;
+
+	private static final double WEIGHT_BUFFER = 1.15;
+
 	@Autowired
 	private CartonRepository cartonRepository;
+
+	@Autowired
+	private PushNotificationService pushNotificationService;
 
 	/**
 	 * Main method — call this when order is placed Returns the best carton for the order
@@ -34,8 +47,8 @@ public class CartonSelectionService {
 			totalWeight += variant.getWeight() * qty;
 		}
 
-		// Step 2: Add 20% buffer volume for padding/air gaps
-		double bufferedVolume = totalVolume * 1.20;
+		// Step 2: Add 10% buffer volume for padding/air gaps
+		double bufferedVolume = totalVolume * 1.10;
 
 		System.out.println("Total Volume : " + bufferedVolume + " cm³");
 		System.out.println("Total Weight : " + totalWeight + " kg");
@@ -54,9 +67,99 @@ public class CartonSelectionService {
 			}
 		}
 
-		// Step 5: If no single carton fits → use largest + flag for multi-box
-		System.out.println("⚠️ Order needs multiple boxes!");
-		return cartonRepository.findLargest();
+		// Step 5: No existing carton fits — dynamically create a properly sized new
+		// carton based on the order items/quantities (with buffer), persist it, notify
+		// admins via Firebase push, and return it to the caller.
+		logger.warn("No existing carton fits the order (volume={} cm³, weight={} kg). Auto-creating a new carton.",
+				bufferedVolume, totalWeight);
+		return createCartonForOrder(orderItems, totalWeight);
+	}
+
+	/**
+	 * Dynamically builds and persists a new {@link CartonEO} sized to fit the given
+	 * order items (with a safety buffer), then sends a best-effort Firebase push
+	 * notification to admins informing them a new carton was auto-created.
+	 */
+	private CartonEO createCartonForOrder(List<OrderItemEO> orderItems, double totalWeight) {
+		double maxLength = 0;
+		double maxBreadth = 0;
+		double totalHeight = 0;
+
+		for (OrderItemEO item : orderItems) {
+			ProductVariantEO variant = item.getProductVar();
+			int qty = item.getQuantity();
+
+			double itemLength = toDouble(variant.getLength());
+			double itemBreadth = toDouble(variant.getBreadth());
+			double itemHeight = toDouble(variant.getHeight());
+
+			maxLength = Math.max(maxLength, itemLength);
+			maxBreadth = Math.max(maxBreadth, itemBreadth);
+			// Items are assumed stacked vertically inside the carton.
+			totalHeight += itemHeight * qty;
+		}
+
+		double newLength = roundUp(maxLength * DIMENSION_BUFFER);
+		double newBreadth = roundUp(maxBreadth * DIMENSION_BUFFER);
+		double newHeight = roundUp(totalHeight * DIMENSION_BUFFER);
+
+		// Fallback to a cube derived from total buffered volume if item dimensions were
+		// missing/zero (e.g. legacy variants without length/breadth/height set).
+		if (newLength <= 0 || newBreadth <= 0 || newHeight <= 0) {
+			double totalVolume = 0;
+			for (OrderItemEO item : orderItems) {
+				ProductVariantEO variant = item.getProductVar();
+				totalVolume += variant.getVolume() * item.getQuantity();
+			}
+			double bufferedVolume = Math.max(totalVolume * DIMENSION_BUFFER, 1);
+			double cubeSide = roundUp(Math.cbrt(bufferedVolume));
+			newLength = newLength > 0 ? newLength : cubeSide;
+			newBreadth = newBreadth > 0 ? newBreadth : cubeSide;
+			newHeight = newHeight > 0 ? newHeight : cubeSide;
+		}
+
+		double newMaxWeight = roundUp(Math.max(totalWeight * WEIGHT_BUFFER, 0.1));
+		double newEmptyWeight = roundUp(Math.max(totalWeight * 0.05, 0.2));
+
+		String cartonName = String.format("AUTO-%.0fx%.0fx%.0f-%d", newLength, newBreadth, newHeight,
+				System.currentTimeMillis() % 100000);
+
+		CartonEO newCarton = CartonEO.builder()
+			.name(cartonName)
+			.length(newLength)
+			.breadth(newBreadth)
+			.height(newHeight)
+			.maxWeight(newMaxWeight)
+			.emptyWeight(newEmptyWeight)
+			.status("A")
+			.who("SYSTEM_AUTO")
+			.build();
+
+		CartonEO savedCarton = cartonRepository.save(newCarton);
+		System.out.println("🆕 Created new Carton: " + savedCarton.getName());
+		logger.info(
+				"Auto-created new carton id={}, name={}, dimensions={}x{}x{} cm, maxWeight={} kg (no existing carton fit the order)",
+				savedCarton.getId(), savedCarton.getName(), newLength, newBreadth, newHeight, newMaxWeight);
+
+		// Best-effort admin push notification — never breaks order processing.
+		try {
+			pushNotificationService.notifyAdminsNewCarton(savedCarton);
+		}
+		catch (Exception pushEx) {
+			logger.error("Failed to send new-carton push notification for cartonId={}: {}", savedCarton.getId(),
+					pushEx.getMessage(), pushEx);
+		}
+
+		return savedCarton;
+	}
+
+	private double toDouble(BigDecimal value) {
+		return value != null ? value.doubleValue() : 0.0;
+	}
+
+	/** Rounds up to 1 decimal place so computed dimensions/weights never undershoot. */
+	private double roundUp(double value) {
+		return Math.ceil(value * 10.0) / 10.0;
 	}
 
 	/**

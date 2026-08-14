@@ -338,6 +338,46 @@ public class ProductController {
 		return ResponseEntity.noContent().build();
 	}
 
+	@PutMapping("/productsVariant/{variantId}/attributes/sequence")
+	public ResponseEntity<List<ProductAttributeDTO>> updateAttributeSequence(@PathVariable Long variantId,
+			@RequestBody AttributeSequenceUpdateDTO attributeSequenceUpdateDTO) {
+		List<ProductAttributeDTO> updatedAttributes = productService.updateAttributeSequence(variantId,
+				attributeSequenceUpdateDTO);
+		logger.info("Attribute sequence updated successfully for variantId={}: {}", variantId, updatedAttributes);
+		return ResponseEntity.ok(updatedAttributes);
+	}
+
+	@PutMapping("/productsVariant/attributes/sequence/bulk")
+	public ResponseEntity<List<ProductAttributeDTO>> bulkUpdateAttributeSequence(
+			@RequestBody BulkAttributeSequenceUpdateDTO bulkAttributeSequenceUpdateDTO) {
+		List<ProductAttributeDTO> updatedAttributes = productService
+			.bulkUpdateAttributeSequence(bulkAttributeSequenceUpdateDTO);
+		logger.info("Bulk attribute sequence updated successfully for {} variant(s): {}",
+				bulkAttributeSequenceUpdateDTO.getVariants() != null
+						? bulkAttributeSequenceUpdateDTO.getVariants().size() : 0,
+				updatedAttributes);
+		return ResponseEntity.ok(updatedAttributes);
+	}
+
+	@PutMapping("/productsVariant/{variantId}/images/sequence")
+	public ResponseEntity<List<ProductImageDTO>> updateImageSequence(@PathVariable Long variantId,
+			@RequestBody ImageSequenceUpdateDTO imageSequenceUpdateDTO) {
+		List<ProductImageDTO> updatedImages = productService.updateImageSequence(variantId, imageSequenceUpdateDTO);
+		logger.info("Image sequence updated successfully for variantId={}: {}", variantId, updatedImages);
+		return ResponseEntity.ok(updatedImages);
+	}
+
+	@PutMapping("/productsVariant/images/sequence/bulk")
+	public ResponseEntity<List<ProductImageDTO>> bulkUpdateImageSequence(
+			@RequestBody BulkImageSequenceUpdateDTO bulkImageSequenceUpdateDTO) {
+		List<ProductImageDTO> updatedImages = productService.bulkUpdateImageSequence(bulkImageSequenceUpdateDTO);
+		logger.info("Bulk image sequence updated successfully for {} variant(s): {}",
+				bulkImageSequenceUpdateDTO.getVariants() != null ? bulkImageSequenceUpdateDTO.getVariants().size()
+						: 0,
+				updatedImages);
+		return ResponseEntity.ok(updatedImages);
+	}
+
 	@GetMapping("/categories/{category_id}/products")
 	public ResponseEntity<List<ProductDTO>> getActiveProductsByCategoryId(
 			@PathVariable("category_id") Integer categoryId) {

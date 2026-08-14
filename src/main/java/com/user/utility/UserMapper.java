@@ -199,6 +199,7 @@ public final class UserMapper {
 			.image(productImageEO.getImage())
 			.imagePath(productImageEO.getImagePath())
 			.isMainImage(productImageEO.getIsMainImage())
+			.displayOrder(productImageEO.getDisplayOrder())
 			.build();
 	}
 
@@ -217,6 +218,7 @@ public final class UserMapper {
 			.variantId(variantId)
 			.attributeName(entity.getAttributeName())
 			.attributeValue(entity.getAttributeValue())
+			.displayOrder(entity.getDisplayOrder())
 			.build();
 	}
 

@@ -49,4 +49,19 @@ public interface ProductVariantRepository extends JpaRepository<ProductVariantEO
 			@Param("products") Collection<ProductEO> products, @Param("maxPrice") Double maxPrice,
 			@Param("status") String status);
 
+	/**
+	 * Powers the "Out of Stock Report" — returns every active product variant that is
+	 * out of stock, i.e. it has NO {@code InventoryEO} record with {@code availableQty >
+	 * 0} in ANY warehouse (either no inventory record exists at all, or every existing
+	 * record has {@code availableQty <= 0}). All filters are optional (pass {@code null}
+	 * to skip a filter).
+	 */
+	@Query("SELECT v FROM ProductVariantEO v " + "JOIN FETCH v.product p " + "JOIN FETCH p.category c "
+			+ "WHERE v.status = 'A' " + "AND (:categoryId IS NULL OR c.id = :categoryId) "
+			+ "AND (:productId IS NULL OR p.id = :productId) " + "AND (:productVarId IS NULL OR v.id = :productVarId) "
+			+ "AND v.id NOT IN (SELECT i.productVariant.id FROM InventoryEO i WHERE i.availableQty > 0) "
+			+ "ORDER BY c.name ASC, p.name ASC, v.skuCode ASC")
+	List<ProductVariantEO> findOutOfStockVariants(@Param("categoryId") Integer categoryId,
+			@Param("productId") Integer productId, @Param("productVarId") Integer productVarId);
+
 }

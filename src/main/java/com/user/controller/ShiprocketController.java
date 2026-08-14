@@ -69,8 +69,19 @@ public class ShiprocketController {
 		if (request == null || request.getDeliveryPostcode() == null) {
 			return ResponseEntity.badRequest().build();
 		}
-		Map result = shiprocketService.checkServiceAvailability(request);
-		return ResponseEntity.ok(result);
+		try {
+			Map result = shiprocketService.checkServiceAvailability(request);
+			return ResponseEntity.ok(result);
+		}
+		catch (IllegalArgumentException | IllegalStateException ex) {
+			logger.warn("checkServiceAvailability: invalid request - {}", ex.getMessage());
+			return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+		}
+		catch (org.springframework.web.client.RestClientException ex) {
+			logger.error("checkServiceAvailability: Shiprocket API error - {}", ex.getMessage(), ex);
+			return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_GATEWAY)
+				.body(Map.of("error", "Failed to reach Shiprocket serviceability API: " + ex.getMessage()));
+		}
 	}
 
 	/**

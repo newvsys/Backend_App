@@ -474,4 +474,97 @@ public class ShippingController {
 		}
 	}
 
+	/**
+	 * GET /api/shipment/order/{orderNumber}/shiprocket-payload
+	 *
+	 * <p>
+	 * Fetches the live shipment data from the actual Shiprocket API for the given
+	 * internal order number, returned in exactly the shape expected by the request body
+	 * of PUT /api/shipment/order/{orderNumber}. The Shiprocket order/shipment is first
+	 * resolved via the local DB (order number → shiprocketOrderId / AWB), then the
+	 * courier / AWB / status fields are refreshed live from Shiprocket (falls back to
+	 * the last known DB values if the live Shiprocket calls fail).
+	 *
+	 * <p>
+	 * Typical usage: call this GET, copy/adjust the response JSON, then send it as the
+	 * body of the PUT call for the same order number.
+	 */
+	// ──────────────────────────────────────────────────────────────────────────
+	// Retrigger shipping process (admin manual retry after a failure)
+	// ──────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * POST /api/order/{orderNumber}/retrigger-shipping
+	 *
+	 * <p>
+	 * Used by the admin UI to manually retrigger the Shiprocket shipping process
+	 * (find best courier → generate AWB → request pickup → generate label → track
+	 * shipment) for a failed order, by passing the customer-facing order number.
+	 * Typically called some time after the initial failure (e.g.
+	 * MANUAL_PROCESSING_REQUIRED, or a shipment stuck without an AWB/label). If a
+	 * Shiprocket order already exists for the shipment, the retrigger resumes
+	 * processing instead of creating a duplicate order.
+	 * <p>
+	 * Safe to call multiple times: a short cooldown period is enforced per shipment to
+	 * avoid accidental rapid re-triggering, and any shipment that has already been
+	 * fully processed (AWB assigned, pickup scheduled, label generated, tracking
+	 * captured) for this order number is skipped rather than reprocessed/duplicated.
+	 */
+	@PostMapping("/order/{orderNumber}/retrigger-shipping")
+	public ResponseEntity<RetriggerShippingResponseDTO> retriggerShippingProcess(
+			@PathVariable("orderNumber") String orderNumber) {
+		logger.info("retriggerShippingProcess called for orderNumber={}", orderNumber);
+		RetriggerShippingResponseDTO response = new RetriggerShippingResponseDTO();
+		if (orderNumber == null || orderNumber.isBlank()) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("orderNumber must not be null/blank.");
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+			response = shippingService.retriggerShippingProcess(orderNumber);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			Throwable rootCause = e;
+			while (rootCause.getCause() != null && rootCause.getCause() != rootCause) {
+				rootCause = rootCause.getCause();
+			}
+			String reason = rootCause.getMessage() != null ? rootCause.getMessage() : rootCause.toString();
+			logger.error("retriggerShippingProcess: error for orderNumber={} — {}", orderNumber, reason, e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while retriggering the shipping process: " + reason);
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
+	@GetMapping("/shipment/order/{orderNumber}/shiprocket-payload")
+	public ResponseEntity<ShipmentPutPayloadResponseDTO> getShiprocketPutPayloadByOrderNumber(
+			@PathVariable("orderNumber") String orderNumber) {
+		logger.info("getShiprocketPutPayloadByOrderNumber called for orderNumber={}", orderNumber);
+		ShipmentPutPayloadResponseDTO response = new ShipmentPutPayloadResponseDTO();
+		if (orderNumber == null || orderNumber.trim().isEmpty()) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Order number must not be null or empty.");
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+			response = shippingService.getShiprocketPutPayloadByOrderNumber(orderNumber.trim());
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.status(404).body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("getShiprocketPutPayloadByOrderNumber: error for orderNumber={} — {}", orderNumber,
+					e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage(
+					"An error occurred while fetching the Shiprocket shipment payload. Please try again later.");
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
 }

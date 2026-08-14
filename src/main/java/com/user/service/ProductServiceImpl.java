@@ -299,7 +299,8 @@ public class ProductServiceImpl implements ProductService {
 					productDTO.setMainImage(resolveMainImage(images).getImage());
 				}
 
-				List<ProductAttributeEO> attributes = productAttributeRepository.findByProductVar(lowestVariant);
+				List<ProductAttributeEO> attributes = productAttributeRepository
+					.findByProductVarOrderByDisplayOrderAsc(lowestVariant);
 				if (attributes != null && !attributes.isEmpty()) {
 					List<ProductAttributeDTO> attributeDTOs = attributes.stream().map(attr -> {
 						ProductAttributeDTO dto = new ProductAttributeDTO();
@@ -307,6 +308,7 @@ public class ProductServiceImpl implements ProductService {
 						dto.setVariantId(attr.getProductVar().getId());
 						dto.setAttributeName(attr.getAttributeName());
 						dto.setAttributeValue(attr.getAttributeValue());
+						dto.setDisplayOrder(attr.getDisplayOrder());
 						return dto;
 					}).collect(Collectors.toList());
 					productDTO.setAttributes(attributeDTOs);
@@ -418,6 +420,7 @@ public class ProductServiceImpl implements ProductService {
 				productImageEO.setImage(imgResult.get("secure_url"));
 				productImageEO.setImagePath(imgResult.get("public_id"));
 					productImageEO.setIsMainImage(imageCounter == effectiveMainIndex ? "Y" : "N");
+					productImageEO.setDisplayOrder(imageCounter);
 					imageCounter++;
 					productImageEO = productImageRepository.save(productImageEO);
 					productImageDTOs.add(UserMapper.toProductImageDTO(productImageEO));
@@ -511,6 +514,12 @@ public class ProductServiceImpl implements ProductService {
 					}
 					productImageRepository.saveAll(existingImages);
 				}
+				int nextDisplayOrder = (existingImages == null || existingImages.isEmpty()) ? 0
+						: existingImages.stream()
+							.map(ProductImageEO::getDisplayOrder)
+							.filter(java.util.Objects::nonNull)
+							.max(Integer::compareTo)
+							.orElse(-1) + 1;
 				int imageCounter = 0;
 				for (MultipartFile image : images) {
 					if (image == null || image.isEmpty()) {
@@ -527,6 +536,8 @@ public class ProductServiceImpl implements ProductService {
 					productImageEO.setImage(imgResult.get("secure_url"));
 					productImageEO.setImagePath(imgResult.get("public_id"));
 					productImageEO.setIsMainImage(imageCounter == effectiveMainIndex ? "Y" : "N");
+					productImageEO.setDisplayOrder(nextDisplayOrder);
+					nextDisplayOrder++;
 					imageCounter++;
 					productImageRepository.save(productImageEO);
 				}
@@ -536,14 +547,15 @@ public class ProductServiceImpl implements ProductService {
 			ProdVarDTO dto = UserMapper.toProdVarDTO(savedVariant);
 			dto.setVideoUrl(savedVariant.getVideoUrl());
 
-			List<ProductImageEO> allImages = productImageRepository.findByProductVar(savedVariant);
+			List<ProductImageEO> allImages = productImageRepository.findByProductVarOrderByDisplayOrderAsc(savedVariant);
 			if (allImages != null && !allImages.isEmpty()) {
 				resolveMainImage(allImages); // ensure one is marked as main
 				dto.setProductImages(
 						allImages.stream().map(UserMapper::toProductImageDTO).collect(Collectors.toList()));
 			}
 
-			List<ProductAttributeEO> attributes = productAttributeRepository.findByProductVar(savedVariant);
+			List<ProductAttributeEO> attributes = productAttributeRepository
+				.findByProductVarOrderByDisplayOrderAsc(savedVariant);
 			if (attributes != null && !attributes.isEmpty()) {
 				List<ProductAttributeDTO> attrDTOs = attributes.stream().map(attr -> {
 					ProductAttributeDTO attrDto = new ProductAttributeDTO();
@@ -551,6 +563,7 @@ public class ProductServiceImpl implements ProductService {
 					attrDto.setVariantId(attr.getProductVar().getId());
 					attrDto.setAttributeName(attr.getAttributeName());
 					attrDto.setAttributeValue(attr.getAttributeValue());
+					attrDto.setDisplayOrder(attr.getDisplayOrder());
 					return attrDto;
 				}).collect(Collectors.toList());
 				dto.setAttributes(attrDTOs);
@@ -590,7 +603,7 @@ public class ProductServiceImpl implements ProductService {
 				ProdVarDTO dto = UserMapper.toProdVarDTO(variant);
 				dto.setVideoUrl(variant.getVideoUrl());
 				// attach images
-				List<ProductImageEO> images = productImageRepository.findByProductVar(variant);
+				List<ProductImageEO> images = productImageRepository.findByProductVarOrderByDisplayOrderAsc(variant);
 				if (images != null && !images.isEmpty()) {
 					resolveMainImage(images); // ensure one image is marked as main
 					List<ProductImageDTO> imageDTOs = images.stream()
@@ -599,7 +612,8 @@ public class ProductServiceImpl implements ProductService {
 					dto.setProductImages(imageDTOs);
 				}
 				// attach attributes
-				List<ProductAttributeEO> attributes = productAttributeRepository.findByProductVar(variant);
+				List<ProductAttributeEO> attributes = productAttributeRepository
+					.findByProductVarOrderByDisplayOrderAsc(variant);
 				if (attributes != null && !attributes.isEmpty()) {
 					List<ProductAttributeDTO> attrDTOs = attributes.stream().map(attr -> {
 						ProductAttributeDTO attrDto = new ProductAttributeDTO();
@@ -607,6 +621,7 @@ public class ProductServiceImpl implements ProductService {
 						attrDto.setVariantId(attr.getProductVar().getId());
 						attrDto.setAttributeName(attr.getAttributeName());
 						attrDto.setAttributeValue(attr.getAttributeValue());
+						attrDto.setDisplayOrder(attr.getDisplayOrder());
 						return attrDto;
 					}).collect(Collectors.toList());
 					dto.setAttributes(attrDTOs);
@@ -900,8 +915,10 @@ public class ProductServiceImpl implements ProductService {
 
 				productDTO.setId(existingVariant.getId());
 				productDTO.setProductId(product.getId());
-				List<ProductImageEO> productImages = productImageRepository.findByProductVar(existingVariant);
-				List<ProductAttributeEO> attributes = productAttributeRepository.findByProductVar(existingVariant);
+				List<ProductImageEO> productImages = productImageRepository
+					.findByProductVarOrderByDisplayOrderAsc(existingVariant);
+				List<ProductAttributeEO> attributes = productAttributeRepository
+					.findByProductVarOrderByDisplayOrderAsc(existingVariant);
 				if (attributes != null && attributes.size() > 0) {
 					List<ProductAttributeDTO> attributeDTOs = attributes.stream().map(attr -> {
 						ProductAttributeDTO dto = new ProductAttributeDTO();
@@ -909,6 +926,7 @@ public class ProductServiceImpl implements ProductService {
 						dto.setVariantId(attr.getProductVar().getId());
 						dto.setAttributeName(attr.getAttributeName());
 						dto.setAttributeValue(attr.getAttributeValue());
+						dto.setDisplayOrder(attr.getDisplayOrder());
 						return dto;
 					}).collect(Collectors.toList());
 
@@ -966,7 +984,8 @@ public class ProductServiceImpl implements ProductService {
 						varDTO.setMainImage(resolveMainImage(varImages).getImage());
 					}
 					// Set attributes for this variant
-					List<ProductAttributeEO> varAttributes = productAttributeRepository.findByProductVar(variant);
+					List<ProductAttributeEO> varAttributes = productAttributeRepository
+						.findByProductVarOrderByDisplayOrderAsc(variant);
 					if (varAttributes != null && !varAttributes.isEmpty()) {
 						List<ProductAttributeDTO> varAttributeDTOs = varAttributes.stream().map(attr -> {
 							ProductAttributeDTO dto = new ProductAttributeDTO();
@@ -974,6 +993,7 @@ public class ProductServiceImpl implements ProductService {
 							dto.setVariantId(attr.getProductVar().getId());
 							dto.setAttributeName(attr.getAttributeName());
 							dto.setAttributeValue(attr.getAttributeValue());
+							dto.setDisplayOrder(attr.getDisplayOrder());
 							return dto;
 						}).collect(Collectors.toList());
 						varDTO.setAttributes(varAttributeDTOs);
@@ -1021,7 +1041,8 @@ public class ProductServiceImpl implements ProductService {
 		ProductVariantEO existingVariant = productVariantRepository.findById(Long.parseLong(productId))
 			.orElseThrow(() -> new RuntimeException("Product Variant not found for id: " + productId));
 
-		List<ProductImageEO> productImages = productImageRepository.findByProductVar(existingVariant);
+		List<ProductImageEO> productImages = productImageRepository
+			.findByProductVarOrderByDisplayOrderAsc(existingVariant);
 
 		return productImages.stream().map(UserMapper::toProductImageDTO).collect(Collectors.toList());
 	}
@@ -1044,7 +1065,8 @@ public class ProductServiceImpl implements ProductService {
 			productImageRepository.delete(image);
 			// If the deleted image was the main image, promote the first remaining image
 			if (wasMain) {
-				List<ProductImageEO> remaining = productImageRepository.findByProductVar(variant);
+				List<ProductImageEO> remaining = productImageRepository
+					.findByProductVarOrderByDisplayOrderAsc(variant);
 				if (remaining != null && !remaining.isEmpty()) {
 					ProductImageEO newMain = remaining.get(0);
 					newMain.setIsMainImage("Y");
@@ -1135,6 +1157,9 @@ public class ProductServiceImpl implements ProductService {
 		productAttributeEO.setProductVar(existingVariant);
 		productAttributeEO.setAttributeName(productAttributeCreateDTO.getAttributeName());
 		productAttributeEO.setAttributeValue(productAttributeCreateDTO.getAttributeValue());
+		if (productAttributeCreateDTO.getDisplayOrder() != null) {
+			productAttributeEO.setDisplayOrder(productAttributeCreateDTO.getDisplayOrder());
+		}
 
 		ProductAttributeEO savedEntity = productAttributeRepository.save(productAttributeEO);
 
@@ -1143,6 +1168,7 @@ public class ProductServiceImpl implements ProductService {
 		productAttributeDTO.setVariantId(savedEntity.getProductVar().getId());
 		productAttributeDTO.setAttributeName(savedEntity.getAttributeName());
 		productAttributeDTO.setAttributeValue(savedEntity.getAttributeValue());
+		productAttributeDTO.setDisplayOrder(savedEntity.getDisplayOrder());
 
 		return productAttributeDTO;
 	}
@@ -1164,6 +1190,9 @@ public class ProductServiceImpl implements ProductService {
 		if (productAttributeCreateDTO.getAttributeValue() != null) {
 			productAttributeEO.setAttributeValue(productAttributeCreateDTO.getAttributeValue());
 		}
+		if (productAttributeCreateDTO.getDisplayOrder() != null) {
+			productAttributeEO.setDisplayOrder(productAttributeCreateDTO.getDisplayOrder());
+		}
 
 		ProductAttributeEO updatedEntity = productAttributeRepository.save(productAttributeEO);
 		return UserMapper.toProductAttributeDTO(updatedEntity);
@@ -1175,6 +1204,243 @@ public class ProductServiceImpl implements ProductService {
 			throw new RuntimeException("Product Attribute not found with ID: " + attributeId);
 		}
 		productAttributeRepository.deleteById(attributeId);
+	}
+
+	/**
+	 * Bulk-updates the {@code displayOrder} of one or more attributes belonging to a
+	 * single product variant, in a single transaction. Every {@code attributeId} in
+	 * the request must already exist and belong to the given {@code variantId} — if
+	 * any entry fails validation the whole update is rolled back.
+	 */
+	@Override
+	@Transactional
+	public List<ProductAttributeDTO> updateAttributeSequence(Long variantId, AttributeSequenceUpdateDTO request) {
+		ProductVariantEO variant = productVariantRepository.findById(variantId)
+			.orElseThrow(() -> new RuntimeException("Product Variant not found with ID: " + variantId));
+
+		if (request == null || request.getAttributes() == null || request.getAttributes().isEmpty()) {
+			throw new RuntimeException("attributes list must not be empty");
+		}
+
+		List<Long> attributeIds = request.getAttributes()
+			.stream()
+			.map(AttributeSequenceItemDTO::getAttributeId)
+			.collect(Collectors.toList());
+
+		List<ProductAttributeEO> attributeEntities = productAttributeRepository.findAllById(attributeIds);
+
+		Map<Long, ProductAttributeEO> attributeMap = attributeEntities.stream()
+			.collect(Collectors.toMap(a -> Long.valueOf(a.getId()), a -> a));
+
+		for (AttributeSequenceItemDTO item : request.getAttributes()) {
+			ProductAttributeEO attribute = attributeMap.get(item.getAttributeId());
+			if (attribute == null) {
+				throw new RuntimeException("Product Attribute not found with ID: " + item.getAttributeId());
+			}
+			if (attribute.getProductVar() == null || !variant.getId().equals(attribute.getProductVar().getId())) {
+				throw new RuntimeException(
+						"Attribute ID " + item.getAttributeId() + " does not belong to variant ID " + variantId);
+			}
+			attribute.setDisplayOrder(item.getDisplayOrder());
+		}
+
+		List<ProductAttributeEO> saved = productAttributeRepository.saveAll(attributeEntities);
+
+		return saved.stream()
+			.sorted(Comparator.comparing((ProductAttributeEO a) -> a.getProductVar().getId())
+				.thenComparing(ProductAttributeEO::getDisplayOrder, Comparator.nullsLast(Integer::compareTo)))
+			.map(UserMapper::toProductAttributeDTO)
+			.collect(Collectors.toList());
+	}
+
+	/**
+	 * Bulk-updates the {@code displayOrder} of attributes across one or more product
+	 * variants in a single transaction/API call. Every {@code variantId} must exist,
+	 * and every {@code attributeId} nested under it must already exist and belong to
+	 * that variant — if any entry across any variant fails validation the whole
+	 * update is rolled back.
+	 */
+	@Override
+	@Transactional
+	public List<ProductAttributeDTO> bulkUpdateAttributeSequence(BulkAttributeSequenceUpdateDTO request) {
+		if (request == null || request.getVariants() == null || request.getVariants().isEmpty()) {
+			throw new RuntimeException("variants list must not be empty");
+		}
+
+		// Collect all attribute IDs referenced across all variants in one shot.
+		List<Long> allAttributeIds = request.getVariants()
+			.stream()
+			.peek(v -> {
+				if (v.getVariantId() == null) {
+					throw new RuntimeException("variantId must not be null");
+				}
+				if (v.getAttributes() == null || v.getAttributes().isEmpty()) {
+					throw new RuntimeException("attributes list must not be empty for variantId " + v.getVariantId());
+				}
+			})
+			.flatMap(v -> v.getAttributes().stream())
+			.map(AttributeSequenceItemDTO::getAttributeId)
+			.collect(Collectors.toList());
+
+		// Validate every referenced variant exists.
+		List<Long> variantIds = request.getVariants()
+			.stream()
+			.map(VariantAttributeSequenceDTO::getVariantId)
+			.collect(Collectors.toList());
+
+		List<ProductVariantEO> variantEntities = productVariantRepository.findAllById(variantIds);
+		Map<Long, ProductVariantEO> variantMap = variantEntities.stream()
+			.collect(Collectors.toMap(v -> Long.valueOf(v.getId()), v -> v));
+
+		for (Long variantId : variantIds) {
+			if (!variantMap.containsKey(variantId)) {
+				throw new RuntimeException("Product Variant not found with ID: " + variantId);
+			}
+		}
+
+		List<ProductAttributeEO> attributeEntities = productAttributeRepository.findAllById(allAttributeIds);
+		Map<Long, ProductAttributeEO> attributeMap = attributeEntities.stream()
+			.collect(Collectors.toMap(a -> Long.valueOf(a.getId()), a -> a));
+
+		for (VariantAttributeSequenceDTO variantUpdate : request.getVariants()) {
+			ProductVariantEO variant = variantMap.get(variantUpdate.getVariantId());
+			for (AttributeSequenceItemDTO item : variantUpdate.getAttributes()) {
+				ProductAttributeEO attribute = attributeMap.get(item.getAttributeId());
+				if (attribute == null) {
+					throw new RuntimeException("Product Attribute not found with ID: " + item.getAttributeId());
+				}
+				if (attribute.getProductVar() == null || !variant.getId().equals(attribute.getProductVar().getId())) {
+					throw new RuntimeException("Attribute ID " + item.getAttributeId()
+							+ " does not belong to variant ID " + variantUpdate.getVariantId());
+				}
+				attribute.setDisplayOrder(item.getDisplayOrder());
+			}
+		}
+
+		List<ProductAttributeEO> saved = productAttributeRepository.saveAll(attributeEntities);
+
+		return saved.stream()
+			.sorted(Comparator.comparing((ProductAttributeEO a) -> a.getProductVar().getId())
+				.thenComparing(ProductAttributeEO::getDisplayOrder, Comparator.nullsLast(Integer::compareTo)))
+			.map(UserMapper::toProductAttributeDTO)
+			.collect(Collectors.toList());
+	}
+
+	/**
+	 * Updates the {@code displayOrder} of one or more images belonging to a
+	 * single product variant, in a single transaction. Every {@code imageId} in
+	 * the request must already exist and belong to the given {@code variantId} —
+	 * if any entry fails validation the whole update is rolled back.
+	 */
+	@Override
+	@Transactional
+	public List<ProductImageDTO> updateImageSequence(Long variantId, ImageSequenceUpdateDTO request) {
+		ProductVariantEO variant = productVariantRepository.findById(variantId)
+			.orElseThrow(() -> new RuntimeException("Product Variant not found with ID: " + variantId));
+
+		if (request == null || request.getImages() == null || request.getImages().isEmpty()) {
+			throw new RuntimeException("images list must not be empty");
+		}
+
+		List<Long> imageIds = request.getImages()
+			.stream()
+			.map(ImageSequenceItemDTO::getImageId)
+			.collect(Collectors.toList());
+
+		List<ProductImageEO> imageEntities = productImageRepository.findAllById(imageIds);
+
+		Map<Long, ProductImageEO> imageMap = imageEntities.stream()
+			.collect(Collectors.toMap(i -> Long.valueOf(i.getId()), i -> i));
+
+		for (ImageSequenceItemDTO item : request.getImages()) {
+			ProductImageEO image = imageMap.get(item.getImageId());
+			if (image == null) {
+				throw new RuntimeException("Product Image not found with ID: " + item.getImageId());
+			}
+			if (image.getProductVar() == null || !variant.getId().equals(image.getProductVar().getId())) {
+				throw new RuntimeException(
+						"Image ID " + item.getImageId() + " does not belong to variant ID " + variantId);
+			}
+			image.setDisplayOrder(item.getDisplayOrder());
+		}
+
+		List<ProductImageEO> saved = productImageRepository.saveAll(imageEntities);
+
+		return saved.stream()
+			.sorted(Comparator.comparing(ProductImageEO::getDisplayOrder, Comparator.nullsLast(Integer::compareTo)))
+			.map(UserMapper::toProductImageDTO)
+			.collect(Collectors.toList());
+	}
+
+	/**
+	 * Bulk-updates the {@code displayOrder} of images across one or more product
+	 * variants in a single transaction/API call. Every {@code variantId} must
+	 * exist, and every {@code imageId} nested under it must already exist and
+	 * belong to that variant — if any entry across any variant fails validation
+	 * the whole update is rolled back.
+	 */
+	@Override
+	@Transactional
+	public List<ProductImageDTO> bulkUpdateImageSequence(BulkImageSequenceUpdateDTO request) {
+		if (request == null || request.getVariants() == null || request.getVariants().isEmpty()) {
+			throw new RuntimeException("variants list must not be empty");
+		}
+
+		List<Long> allImageIds = request.getVariants()
+			.stream()
+			.peek(v -> {
+				if (v.getVariantId() == null) {
+					throw new RuntimeException("variantId must not be null");
+				}
+				if (v.getImages() == null || v.getImages().isEmpty()) {
+					throw new RuntimeException("images list must not be empty for variantId " + v.getVariantId());
+				}
+			})
+			.flatMap(v -> v.getImages().stream())
+			.map(ImageSequenceItemDTO::getImageId)
+			.collect(Collectors.toList());
+
+		List<Long> variantIds = request.getVariants()
+			.stream()
+			.map(VariantImageSequenceDTO::getVariantId)
+			.collect(Collectors.toList());
+
+		List<ProductVariantEO> variantEntities = productVariantRepository.findAllById(variantIds);
+		Map<Long, ProductVariantEO> variantMap = variantEntities.stream()
+			.collect(Collectors.toMap(v -> Long.valueOf(v.getId()), v -> v));
+
+		for (Long variantId : variantIds) {
+			if (!variantMap.containsKey(variantId)) {
+				throw new RuntimeException("Product Variant not found with ID: " + variantId);
+			}
+		}
+
+		List<ProductImageEO> imageEntities = productImageRepository.findAllById(allImageIds);
+		Map<Long, ProductImageEO> imageMap = imageEntities.stream()
+			.collect(Collectors.toMap(i -> Long.valueOf(i.getId()), i -> i));
+
+		for (VariantImageSequenceDTO variantUpdate : request.getVariants()) {
+			ProductVariantEO variant = variantMap.get(variantUpdate.getVariantId());
+			for (ImageSequenceItemDTO item : variantUpdate.getImages()) {
+				ProductImageEO image = imageMap.get(item.getImageId());
+				if (image == null) {
+					throw new RuntimeException("Product Image not found with ID: " + item.getImageId());
+				}
+				if (image.getProductVar() == null || !variant.getId().equals(image.getProductVar().getId())) {
+					throw new RuntimeException("Image ID " + item.getImageId() + " does not belong to variant ID "
+							+ variantUpdate.getVariantId());
+				}
+				image.setDisplayOrder(item.getDisplayOrder());
+			}
+		}
+
+		List<ProductImageEO> saved = productImageRepository.saveAll(imageEntities);
+
+		return saved.stream()
+			.sorted(Comparator.comparing((ProductImageEO i) -> i.getProductVar().getId())
+				.thenComparing(ProductImageEO::getDisplayOrder, Comparator.nullsLast(Integer::compareTo)))
+			.map(UserMapper::toProductImageDTO)
+			.collect(Collectors.toList());
 	}
 
 	@Override

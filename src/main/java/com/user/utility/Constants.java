@@ -21,6 +21,14 @@ public class Constants {
 	/** Maximum number of best-courier candidates to evaluate per shipment. */
 	public static final int MAX_BEST_COURIER_COUNT = 10;
 
+	/**
+	 * Minimum number of minutes that must pass since the last Shiprocket processing
+	 * attempt for a shipment before an admin can retrigger the shipping process again.
+	 * Prevents accidental rapid double-clicks from creating duplicate calls to
+	 * Shiprocket.
+	 */
+	public static final int RETRIGGER_SHIPPING_COOLDOWN_MINUTES = 2;
+
 	// User Roles
 	public static final String ROLE_USER = "user";
 
@@ -56,6 +64,14 @@ public class Constants {
 	public static final String SHIPMENT_STATUS_CANCELLED = "CANCELLED";
 
 	public static final String SHIPMENT_STATUS_RETURN_REQUESTED = "RETURN_REQUESTED";
+
+	/**
+	 * Set when no eligible courier company was found via getBestCourierServices for a
+	 * shipment. The Shiprocket order is still created, but AWB generation/pickup are
+	 * skipped and the shipment must be assigned a courier manually (e.g. from the
+	 * Shiprocket dashboard or Admin panel).
+	 */
+	public static final String SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED = "MANUAL_PROCESSING_REQUIRED";
 
 	public static final String SHIPMENT_STATUS_RETURN_PICKUP_INITIATED = "RETURN_PICKUP_INITIATED";
 
@@ -217,6 +233,9 @@ public class Constants {
 	public static final String ORDER_EVENT_TYPE_REFUND = "ORDER_REFUND";
 
 	public static final String ORDER_EVENT_TYPE_RETURN_REQUEST = "ORDER_RETURN_REQUESTED";
+
+	// Carton event types
+	public static final String CARTON_EVENT_TYPE_CREATED = "CARTON_CREATED";
 
 	// Reason Types & Status
 	public static final String REASON_TYPE_CANCELLATION = "CANCELLATION";

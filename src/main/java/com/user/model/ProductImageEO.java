@@ -44,4 +44,8 @@ public class ProductImageEO {
 	@Column(name = "is_main_image", length = 1)
 	private String isMainImage = "N";
 
+	/** Display/sort order (image sequence number) for this image — lower shows first. */
+	@Column(name = "display_order")
+	private Integer displayOrder;
+
 }

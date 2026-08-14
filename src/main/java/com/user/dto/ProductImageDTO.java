@@ -25,4 +25,7 @@ public class ProductImageDTO {
 
 	private String isMainImage;
 
+	/** Display/sort order (image sequence number) — lower shows first. */
+	private Integer displayOrder;
+
 }

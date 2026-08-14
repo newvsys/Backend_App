@@ -17,4 +17,7 @@ public class ProductAttributeCreateDTO {
 
 	private String attributeValue;
 
+	/** Optional. Used to control the display/sort order of attributes. */
+	private Integer displayOrder;
+
 }

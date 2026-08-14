@@ -19,6 +19,8 @@
 | 5 | `GET`  | `/api/inventory/details`                | Fetch inventory + per-unit item details (filterable)|
 | 6 | `PUT`  | `/api/inventory/details/dates`          | Update MFG / EXP / best-before dates on detail rows|
 | 7 | `POST` | `/api/inventory/refresh-counts`         | Refresh totalQty & availableQty from inventory_details |
+| 8 | `GET`  | `/api/inventory/stock-report`           | Generate the current stock report (category/product/variant/warehouse/inventory combined) |
+| 9 | `GET`  | `/api/inventory/out-of-stock`           | Generate the out-of-stock report (products/variants with no available stock in any warehouse) |
 
 ---
 
@@ -599,6 +601,316 @@ All fields are **optional**. Supply one filter to limit scope, or send an empty 
 | `400`       | `productVarId` provided but no inventory records found for variant  |
 | `400`       | `warehouseId` provided but no inventory records found for warehouse |
 | `500`       | Unexpected server error                                             |
+
+---
+
+## 8. Current Stock Report
+
+### `GET /api/inventory/stock-report`
+
+Generates/views the current stock report — combines category, product, product variant, warehouse, and inventory (stock) details in a single response. All query parameters are optional and can be combined to narrow the report.
+
+> **No-inventory rows and `availableQty=0`:** A product variant that has **no `InventoryEO` record at all** is treated as having `availableQty = 0`. By default (no `availableQty` filter), the report only returns variants that actually have an inventory record — same as before. But when your `availableQty` filter expression would match `0` (e.g. `availableQty=0`, `availableQty=<5`, `availableQty=<=0`), the report **also** includes variants with no inventory record at all (their `inventoryId`, `warehouseId`, `totalQty`, `reservedQty`, etc. are returned as `null`, `availableQty` is `0`, and `stockStatus` is `"OUT_OF_STOCK"`).
+
+### Query Parameters
+
+| Parameter      | Type      | Required | Description                                                          |
+|----------------|-----------|----------|-----------------------------------------------------------------------|
+| `warehouseId`  | `Long`    | ❌ No   | Filter by warehouse ID                                                |
+| `categoryId`   | `Integer` | ❌ No   | Filter by product category ID                                        |
+| `productId`    | `Integer` | ❌ No   | Filter by product ID                                                 |
+| `productVarId` | `Integer` | ❌ No   | Filter by product variant ID                                         |
+| `status`       | `String`  | ❌ No   | Filter by inventory status. Defaults to `"A"` (active records only). Ignored for variants with no inventory record. |
+| `availableQty` | `String`  | ❌ No   | Filter by available quantity. Accepts a **plain number** for an exact match (e.g. `10`), or a **comparison expression** prefixed with `>`, `<`, `>=`, or `<=` (e.g. `>10`, `<5`, `>=10`, `<=5`). A missing inventory record is treated as `availableQty = 0` when evaluating the expression. |
+
+> **Comparison operator syntax:** Since `>` and `<` are special characters in a URL, either URL-encode them (`%3E` for `>`, `%3C` for `<`) or pass them as-is — most HTTP clients (Postman, curl, browsers) handle it fine unqualified in the query string. Examples: `availableQty=>10`, `availableQty=%3E10`, `availableQty=<=5`.
+
+### Request Examples
+
+```
+GET /api/inventory/stock-report
+GET /api/inventory/stock-report?warehouseId=2
+GET /api/inventory/stock-report?categoryId=3&productId=101
+GET /api/inventory/stock-report?productVarId=101&status=A
+GET /api/inventory/stock-report?categoryId=4&productId=41&productVarId=140&status=A&availableQty=10
+GET /api/inventory/stock-report?availableQty=0
+GET /api/inventory/stock-report?availableQty=>10
+GET /api/inventory/stock-report?availableQty=<5
+GET /api/inventory/stock-report?availableQty=>=10
+GET /api/inventory/stock-report?availableQty=<=5
+```
+
+### Response — `200 OK`
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Stock report generated successfully.",
+  "totalRecords": 1,
+  "totalAvailableQty": 48,
+  "totalStockQty": 50,
+  "reportItems": [
+    {
+      "categoryId": 3,
+      "categoryName": "Snacks",
+      "productId": 101,
+      "productName": "Candy Delight",
+      "productSlug": "candy-delight",
+      "productStatus": "A",
+      "variantId": 101,
+      "skuCode": "SKU-CANDY-250G",
+      "packSize": "250g",
+      "uom": "PACK",
+      "mrp": 120.00,
+      "sellingPrice": 99.00,
+      "currency": "INR",
+      "variantStatus": "A",
+      "warehouseId": 2,
+      "warehouseCode": "WH001",
+      "warehouseName": "Main Warehouse",
+      "warehouseCity": "Bengaluru",
+      "inventoryId": 5,
+      "totalQty": 50,
+      "availableQty": 48,
+      "reservedQty": 0,
+      "quantityReserved": 0,
+      "reorderLevel": 10,
+      "safetyStock": 5,
+      "inventoryStatus": "A",
+      "stockStatus": "IN_STOCK"
+    }
+  ]
+}
+```
+
+### Response — `200 OK` (`availableQty=0`, including a variant with NO inventory record)
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Stock report generated successfully.",
+  "totalRecords": 2,
+  "totalAvailableQty": 0,
+  "totalStockQty": 20,
+  "reportItems": [
+    {
+      "categoryId": 3,
+      "categoryName": "Snacks",
+      "productId": 102,
+      "productName": "Masala Peanuts",
+      "productSlug": "masala-peanuts",
+      "productStatus": "A",
+      "variantId": 210,
+      "skuCode": "MP-500G",
+      "packSize": "500g",
+      "uom": "PACK",
+      "mrp": 150.00,
+      "sellingPrice": 129.00,
+      "currency": "INR",
+      "variantStatus": "A",
+      "warehouseId": 2,
+      "warehouseCode": "WH001",
+      "warehouseName": "Main Warehouse",
+      "warehouseCity": "Bengaluru",
+      "inventoryId": 8,
+      "totalQty": 20,
+      "availableQty": 0,
+      "reservedQty": 0,
+      "quantityReserved": 0,
+      "reorderLevel": 5,
+      "safetyStock": 2,
+      "inventoryStatus": "A",
+      "stockStatus": "OUT_OF_STOCK"
+    },
+    {
+      "categoryId": 3,
+      "categoryName": "Snacks",
+      "productId": 103,
+      "productName": "Banana Chips",
+      "productSlug": "banana-chips",
+      "productStatus": "A",
+      "variantId": 305,
+      "skuCode": "BC-250G",
+      "packSize": "250g",
+      "uom": "PACK",
+      "mrp": 120.00,
+      "sellingPrice": 99.00,
+      "currency": "INR",
+      "variantStatus": "A",
+      "warehouseId": null,
+      "warehouseCode": null,
+      "warehouseName": null,
+      "warehouseCity": null,
+      "inventoryId": null,
+      "totalQty": 0,
+      "availableQty": 0,
+      "reservedQty": null,
+      "quantityReserved": null,
+      "reorderLevel": null,
+      "safetyStock": null,
+      "inventoryStatus": null,
+      "stockStatus": "OUT_OF_STOCK"
+    }
+  ]
+}
+```
+
+> In the second example above, `variantId 305` has **no `InventoryEO` record in the database at all** — the API still returns it (because `availableQty=0` was requested) with all inventory/warehouse fields as `null` and `availableQty: 0`.
+
+
+
+| Field               | Type      | Description                                                |
+|---------------------|-----------|--------------------------------------------------------------|
+| `responseStatus`    | `String`  | `SUCCESS` or `FAILURE`                                       |
+| `responseMessage`   | `String`  | Human-readable result message                                |
+| `totalRecords`      | `Integer` | Number of (product-variant, warehouse) rows returned          |
+| `totalAvailableQty` | `Long`    | Sum of `availableQty` across all returned rows                |
+| `totalStockQty`     | `Long`    | Sum of `totalQty` across all returned rows                    |
+| `reportItems`       | `Array`   | List of `StockReportItemDTO` objects — see below              |
+
+### Response Field Reference — `reportItems[]`
+
+| Field              | Type         | Description                                                         |
+|--------------------|--------------|-----------------------------------------------------------------------|
+| `categoryId`       | `Integer`    | Product category ID                                                 |
+| `categoryName`     | `String`     | Product category name                                                |
+| `productId`        | `Integer`    | Product ID                                                            |
+| `productName`      | `String`     | Product display name                                                  |
+| `productSlug`      | `String`     | Product URL slug                                                      |
+| `productStatus`    | `String`     | Product status (`A` = Active)                                        |
+| `variantId`        | `Integer`    | Product variant ID                                                    |
+| `skuCode`          | `String`     | Product variant SKU code                                             |
+| `packSize`         | `String`     | Pack size (e.g. `"250g"`)                                             |
+| `uom`              | `String`     | Unit of measure (e.g. `"PACK"`)                                       |
+| `mrp`              | `BigDecimal` | Maximum retail price                                                  |
+| `sellingPrice`     | `BigDecimal` | Current selling price                                                 |
+| `currency`         | `String`     | Currency code (e.g. `"INR"`)                                          |
+| `variantStatus`    | `String`     | Product variant status (`A` = Active)                                 |
+| `warehouseId`      | `Long`       | Warehouse ID                                                          |
+| `warehouseCode`    | `String`     | Warehouse code (e.g. `"WH001"`)                                       |
+| `warehouseName`    | `String`     | Warehouse display name                                                |
+| `warehouseCity`    | `String`     | City where the warehouse is located                                   |
+| `inventoryId`      | `Integer`    | Inventory record ID                                                   |
+| `totalQty`         | `Integer`    | Total quantity ever loaded                                            |
+| `availableQty`     | `Integer`    | Currently available qty                                               |
+| `reservedQty`      | `Integer`    | Legacy reserved qty                                                   |
+| `quantityReserved` | `Integer`    | Qty reserved for pending orders                                       |
+| `reorderLevel`     | `Integer`    | Threshold to trigger reorder                                          |
+| `safetyStock`      | `Integer`    | Minimum buffer stock                                                  |
+| `inventoryStatus`  | `String`     | Inventory record status (`A` = Active)                                |
+| `stockStatus`      | `String`     | Derived: `OUT_OF_STOCK` / `LOW_STOCK` / `IN_STOCK` based on `availableQty` vs `reorderLevel` |
+
+### Error Responses
+
+| HTTP Status | Scenario                                                     |
+|-------------|------------------------------------------------------------------|
+| `200`       | Filters valid but no matching records (`totalRecords: 0`)       |
+| `400`       | Invalid `availableQty` filter expression (e.g. `availableQty=abc` or `availableQty=>>10`) |
+| `500`       | Unexpected server error                                         |
+
+
+
+## 9. Out of Stock Report
+
+### `GET /api/inventory/out-of-stock`
+
+Generate/view the list of Out of Stock products and product variants. A product variant is
+considered **out of stock** if it has **NO inventory record with `availableQty > 0` in ANY
+warehouse** — i.e. either no `InventoryEO` record exists for it at all, or every existing
+record across every warehouse is depleted (`availableQty <= 0`).
+  
+**What it does:**
+- Looks up every **active** (`status = 'A'`) product variant matching the optional filters.
+- Excludes any variant that has at least one inventory record with `availableQty > 0` in
+  any warehouse.
+- Batch-fetches the remaining inventory records (if any) for the out-of-stock variants to
+  report `hasInventoryRecord` and the summed `totalAvailableQty`.
+
+### Query Parameters (all optional)
+
+| Parameter      | Type      | Description                                    |
+|----------------|-----------|-------------------------------------------------|
+| `categoryId`   | `Integer` | Filter by product category ID                  |
+| `productId`    | `Integer` | Filter by product ID                           |
+| `productVarId` | `Integer` | Filter by product variant ID                   |
+
+### Request Examples
+
+```
+GET /api/inventory/out-of-stock
+GET /api/inventory/out-of-stock?categoryId=3
+GET /api/inventory/out-of-stock?productId=101
+GET /api/inventory/out-of-stock?productVarId=101
+```
+
+### Response Example
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Out-of-stock report generated successfully.",
+  "totalRecords": 1,
+  "items": [
+    {
+      "categoryId": 3,
+      "categoryName": "Snacks",
+      "productId": 101,
+      "productName": "Banana Chips",
+      "productSlug": "banana-chips",
+      "productStatus": "A",
+      "variantId": 205,
+      "skuCode": "BC-250G",
+      "packSize": "250g",
+      "uom": "PACK",
+      "mrp": 120.00,
+      "sellingPrice": 99.00,
+      "currency": "INR",
+      "variantStatus": "A",
+      "hasInventoryRecord": true,
+      "totalAvailableQty": 0,
+      "stockStatus": "OUT_OF_STOCK"
+    }
+  ]
+}
+```
+
+### Response Field Reference — Top Level
+
+| Field              | Type      | Description                                             |
+|--------------------|-----------|-------------------------------------------------------------|
+| `responseStatus`   | `String`  | `SUCCESS` or `FAILURE`                                       |
+| `responseMessage`  | `String`  | Human-readable result message                                |
+| `totalRecords`     | `Integer` | Number of out-of-stock product variants returned              |
+| `items`            | `Array`   | List of `OutOfStockItemDTO` objects — see below               |
+
+### Response Field Reference — `items[]`
+
+| Field                | Type         | Description                                                         |
+|----------------------|--------------|-----------------------------------------------------------------------|
+| `categoryId`         | `Integer`    | Product category ID                                                 |
+| `categoryName`       | `String`     | Product category name                                                |
+| `productId`          | `Integer`    | Product ID                                                            |
+| `productName`        | `String`     | Product display name                                                  |
+| `productSlug`        | `String`     | Product URL slug                                                      |
+| `productStatus`      | `String`     | Product status (`A` = Active)                                        |
+| `variantId`          | `Integer`    | Product variant ID                                                    |
+| `skuCode`            | `String`     | Product variant SKU code                                             |
+| `packSize`           | `String`     | Pack size (e.g. `"250g"`)                                             |
+| `uom`                | `String`     | Unit of measure (e.g. `"PACK"`)                                       |
+| `mrp`                | `BigDecimal` | Maximum retail price                                                  |
+| `sellingPrice`       | `BigDecimal` | Current selling price                                                 |
+| `currency`           | `String`     | Currency code (e.g. `"INR"`)                                          |
+| `variantStatus`      | `String`     | Product variant status (`A` = Active)                                 |
+| `hasInventoryRecord` | `Boolean`    | `true` if at least one `InventoryEO` record exists for this variant   |
+| `totalAvailableQty`  | `Long`       | Sum of `availableQty` across every warehouse (`0` if none exist)      |
+| `stockStatus`        | `String`     | Always `"OUT_OF_STOCK"` — kept for consistency with the stock-report API |
+
+### Error Responses
+
+| HTTP Status | Scenario                                                     |
+|-------------|------------------------------------------------------------------|
+| `200`       | Filters valid but no out-of-stock records found (`totalRecords: 0`) |
+| `500`       | Unexpected server error                                         |
 
 ---
 

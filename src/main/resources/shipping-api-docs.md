@@ -2,7 +2,7 @@
 
 **Base URL:** `http://localhost:8080/api`  
 **Controller:** `ShippingController`  
-**Last Updated:** 2026-07-02
+**Last Updated:** 2026-08-14
 
 ---
 
@@ -29,6 +29,8 @@
    - 8.1 [Get Shipping Details by Order Number](#81-get-shipping-details-by-order-number)
    - 8.2 [Update Shipping by Order Number](#82-update-shipping-by-order-number)
    - 8.3 [Create Shipping by Order Number](#83-create-shipping-by-order-number)
+   - 8.4 [Get Live Shiprocket PUT Payload by Order Number](#84-get-live-shiprocket-put-payload-by-order-number)
+9. [Retrigger Shipping Process](#9-retrigger-shipping-process)
 
 ---
 
@@ -944,6 +946,25 @@ All fields are optional. Supply only the fields you want to change.
 }
 ```
 
+#### Tracking History & Order Status Sync Behaviour
+
+Every successful PUT automatically keeps the `shipment_tracking_history` table and the parent order's status in sync with the `shipmentStatus` you send — you no longer need to also pass `historyStatus` just to get a history row recorded.
+
+| Field provided in request      | Tracking history behaviour                                                                                   |
+|---------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `historyStatus` provided        | A new history row is inserted with `status = historyStatus`, `location = historyLocation`, `remarks = historyRemarks` (as before). |
+| `historyStatus` **omitted**, `shipmentStatus` provided | **Auto-fallback:** a history row is inserted with `status = shipmentStatus` and `remarks = "Auto-recorded: current shipment status."`, so the current status is never missing from the history list. |
+| Either case                     | **Idempotent** — if a row with that exact status (case-insensitive) already exists for this shipment, no duplicate is inserted and `historyEntryCreated` is `false`. |
+
+Additionally, after the shipment record is saved, the parent `OrderEO.orderStatus` is synced to match:
+
+- If `shipmentStatus` (case-insensitive) equals `DELIVERED` → order status is set to `DELIVERED`.
+- Otherwise → order status is set directly to the new `shipmentStatus` value (e.g. `CANCELLED`, `IN_TRANSIT`, `RETURN_REQUESTED`, etc.).
+- The order is only written to the DB if its current status actually differs from the derived value (no redundant updates).
+- This sync failure is logged but never fails the overall request — a warning is logged if the update can't be applied.
+
+> Example: sending `{"shipmentStatus": "CANCELLED"}` (without `historyStatus`) now (1) inserts a `CANCELLED` tracking-history row if one doesn't already exist, and (2) updates the linked order's `orderStatus` to `CANCELLED` if it isn't already.
+
 #### Error Responses
 
 | Status | Condition                              |
@@ -1023,11 +1044,240 @@ Same fields as [PUT 8.2](#82-update-shipping-by-order-number).
 #### Error Responses
 
 | Status | Condition                                                         |
-|--------|-------------------------------------------------------------------|
+|--------|---------------------------------------------------------------------|
 | 400    | orderNumber or body is null/empty                                 |
 | 400    | Order not found for the given order number                        |
 | 400    | A non-cancelled shipping record already exists (use PUT to update)|
 | 500    | Internal server error                                             |
+
+> Same **Tracking History & Order Status Sync Behaviour** as [PUT 8.2](#tracking-history--order-status-sync-behaviour) applies here — if `historyStatus` is omitted, the current `shipmentStatus` (or the `CREATED` default) is auto-recorded as a history entry, and the linked order's `orderStatus` is synced to match.
+
+---
+
+### 8.4 Get Live Shiprocket PUT Payload by Order Number
+
+Fetches the **live** shipment data directly from the real Shiprocket API for the given internal order number, and returns it in **exactly the same shape** expected by the request body of [PUT /api/shipment/order/{orderNumber}](#82-update-shipping-by-order-number).
+
+Typical usage: call this GET, review/adjust the returned JSON, then send it as the body of the PUT call for the same order number.
+
+> **Note:** This endpoint does **not** read from the local shipping DB at all. The Shiprocket order is located purely via the live Shiprocket "search orders" API (matching on `channel_order_id`, i.e. the internal order number that was sent to Shiprocket at order-creation time). All fields are then populated/refreshed from the live Shiprocket "order details" and "track AWB" APIs. If the live AWB/courier calls fail, the last known values from the order search are used as a fallback.
+
+```
+GET /api/shipment/order/{orderNumber}/shiprocket-payload
+```
+
+#### Path Parameters
+
+| Parameter   | Type   | Required | Description             |
+|-------------|--------|----------|-------------------------|
+| orderNumber | String | Yes      | e.g. `ORD-20260601-001` |
+
+#### Response – 200 OK
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Fetched live Shiprocket shipment payload successfully.",
+  "warehouseId": null,
+  "shiprocketOrderId": 9900001,
+  "shiprocketShipmentId": 8800001,
+  "awbCode": "AWBXYZ123",
+  "courierName": "Delhivery",
+  "courierCompanyId": 7,
+  "shipmentStatus": "IN_TRANSIT",
+  "shipmentType": null,
+  "trackingNumber": null,
+  "length": null,
+  "breadth": null,
+  "height": null,
+  "weight": null,
+  "shippingPrice": null,
+  "labelUrl": null,
+  "trackUrl": null,
+  "estimatedDeliveryDate": null,
+  "expectedDeliveryDate": "2026-06-07"
+}
+```
+
+#### Response Fields
+
+| Field                 | Type       | Description                                                            |
+|-----------------------|------------|--------------------------------------------------------------------------|
+| responseStatus        | String     | `SUCCESS` or `FAILURE`                                                  |
+| responseMessage       | String     | Human-readable result or error                                          |
+| warehouseId           | Long       | Not populated by this endpoint (local DB is not consulted); include manually if needed for the PUT body |
+| shiprocketOrderId     | Integer    | Shiprocket `order_id`, resolved via live Shiprocket order search        |
+| shiprocketShipmentId  | Integer    | Shiprocket `shipment_id`, from live Shiprocket order details            |
+| awbCode               | String     | AWB code, from live Shiprocket order details                           |
+| courierName           | String     | Courier partner name, refreshed from live AWB tracking (falls back to order details / search result) |
+| courierCompanyId      | Integer    | Not currently populated by this endpoint                                |
+| shipmentStatus        | String     | Shipment status, refreshed from live AWB tracking (falls back to order details / search result) |
+| shipmentType          | String     | Not populated by this endpoint                                          |
+| trackingNumber        | String     | Not populated by this endpoint                                          |
+| length / breadth / height / weight | Double | Not populated by this endpoint                              |
+| shippingPrice         | BigDecimal | Not populated by this endpoint                                          |
+| labelUrl / trackUrl   | String     | Not populated by this endpoint                                          |
+| estimatedDeliveryDate | String     | Not populated by this endpoint                                          |
+| expectedDeliveryDate  | String     | ISO date string (e.g. `2026-06-07`), from live Shiprocket AWB tracking (`edd`) |
+
+Since the returned JSON matches the [PUT 8.2](#82-update-shipping-by-order-number) request body shape, it can be copied — after filling in `warehouseId` and any other fields you want to persist — and sent directly as the PUT request body for the same order number.
+
+#### Error Responses
+
+| Status | Condition                                                     |
+|--------|----------------------------------------------------------------|
+| 400    | orderNumber is null/empty                                      |
+| 404    | No shipment found on Shiprocket for the given order number     |
+| 500    | Internal server error                                           |
+
+#### cURL Example
+
+```bash
+curl -X GET "http://localhost:8080/api/shipment/order/ORD-20260601-001/shiprocket-payload" \
+  -H "accept: application/json"
+```
+
+---
+
+## 9. Retrigger Shipping Process
+
+Manually re-run the Shiprocket shipping process (find best courier → generate AWB → request pickup → generate label → track shipment) for an order whose shipment(s) previously failed or need manual intervention (e.g. status `MANUAL_PROCESSING_REQUIRED`, or a shipment stuck without an AWB/label). Used by the admin UI as a one-click retry action.
+
+If a Shiprocket order was already created for a shipment (`shipOrderId` present), the retrigger resumes processing from the courier-selection step onwards instead of creating a duplicate Shiprocket order.
+
+Safe to call multiple times:
+- A short cooldown period (`RETRIGGER_SHIPPING_COOLDOWN_MINUTES`) is enforced per shipment based on the last logged attempt, to avoid accidental rapid re-triggering.
+- Any shipment that is already fully processed (AWB assigned, pickup scheduled, label generated, tracking URL captured) is skipped rather than reprocessed/duplicated.
+
+```
+POST /api/order/{orderNumber}/retrigger-shipping
+```
+
+### Path Parameters
+
+| Parameter   | Type   | Required | Description             |
+|-------------|--------|----------|--------------------------|
+| orderNumber | String | Yes      | e.g. `ORD-20260601-001` |
+
+### Behaviour
+
+All active **FORWARD** shipments under the order (excluding `CANCELLED`/`DELIVERED`) are considered. For each one:
+
+| Result `action` | Meaning                                                                                     |
+|------------------|----------------------------------------------------------------------------------------------|
+| `RETRIGGERED`    | The Shiprocket flow was re-run and the shipment ended up fully processed, or in the expected `MANUAL_PROCESSING_REQUIRED` stop-state. |
+| `SKIPPED`        | Not retriggered — already fully processed, or still within the cooldown window since the last attempt. |
+| `FAILED`         | The retrigger ran but the shipment still isn't fully processed afterward, or an unexpected exception was thrown while retriggering. `failedStep` and `failureReason` are populated to explain why. |
+
+When a shipment ends in `FAILED`, the service looks up the most recent `FAILED` row in `shiprocket_order_log` for that shipment to determine:
+- `failedStep` — the Shiprocket step that failed, e.g. `GENERATE_AWB`, `REQUEST_PICKUP`, `GENERATE_LABEL`. If the retrigger call itself threw an unexpected exception (rather than an internal step failure), `failedStep` is reported as `RETRIGGER`.
+- `failureReason` — the actual error message captured for that step (`shiprocket_order_log.error_message`), or the (root-cause) exception message if the failure came from an unhandled exception.
+
+### Response – 200 OK (retrigger succeeded for at least one shipment)
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Retriggered shipping process for 1 of 1 shipment(s) under orderNumber=ORD-20260601-001",
+  "orderId": 55,
+  "orderNumber": "ORD-20260601-001",
+  "results": [
+    {
+      "shipmentId": 101,
+      "trackingNumber": "TRK-ORD-20260601-001_1",
+      "previousStatus": "MANUAL_PROCESSING_REQUIRED",
+      "currentStatus": "PICKUP_SCHEDULED",
+      "action": "RETRIGGERED",
+      "message": "Resumed processing for existing Shiprocket order_id=9900001",
+      "failedStep": null,
+      "failureReason": null
+    }
+  ]
+}
+```
+
+### Response – 200 OK (nothing to do, already processed)
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "All 1 shipment(s) under orderNumber=ORD-20260601-001 are already fully processed; nothing to retrigger",
+  "orderId": 55,
+  "orderNumber": "ORD-20260601-001",
+  "results": [
+    {
+      "shipmentId": 101,
+      "trackingNumber": "TRK-ORD-20260601-001_1",
+      "previousStatus": "IN_TRANSIT",
+      "currentStatus": "IN_TRANSIT",
+      "action": "SKIPPED",
+      "message": "Shipment is already fully processed (AWB=AWBXYZ123, pickup scheduled, label & tracking generated); retrigger is not needed",
+      "failedStep": null,
+      "failureReason": null
+    }
+  ]
+}
+```
+
+### Response – 400 Bad Request (nothing could be retriggered / all failed)
+
+```json
+{
+  "responseStatus": "FAILURE",
+  "responseMessage": "No shipment could be retriggered for orderNumber=ORD-20260601-001. Reason(s): shipmentId=101 [GENERATE_AWB]: No serviceable courier found for pickup pincode 600001 and delivery pincode 400001",
+  "orderId": 55,
+  "orderNumber": "ORD-20260601-001",
+  "results": [
+    {
+      "shipmentId": 101,
+      "trackingNumber": "TRK-ORD-20260601-001_1",
+      "previousStatus": "MANUAL_PROCESSING_REQUIRED",
+      "currentStatus": "MANUAL_PROCESSING_REQUIRED",
+      "action": "FAILED",
+      "message": "Retrigger attempt did not complete successfully at step 'GENERATE_AWB'. Reason: No serviceable courier found for pickup pincode 600001 and delivery pincode 400001",
+      "failedStep": "GENERATE_AWB",
+      "failureReason": "No serviceable courier found for pickup pincode 600001 and delivery pincode 400001"
+    }
+  ]
+}
+```
+
+When the top-level request itself fails (not tied to a specific shipment — e.g. order not found, unexpected exception before/around the per-shipment loop), `responseMessage` includes the (root-cause) exception message directly and `results` is empty.
+
+### Response Fields
+
+| Field                     | Type    | Description                                                                 |
+|---------------------------|---------|-------------------------------------------------------------------------------|
+| responseStatus            | String  | `SUCCESS` or `FAILURE`                                                        |
+| responseMessage           | String  | Human-readable summary. On failure, aggregates all per-shipment failure reasons in the form `shipmentId=X [STEP]: reason; shipmentId=Y [STEP]: reason`. |
+| orderId                   | Long    | Internal order ID                                                              |
+| orderNumber               | String  | Echoed order number                                                           |
+| results                   | Array   | One entry per active FORWARD shipment considered                              |
+| results[].shipmentId      | Long    | Internal shipment ID                                                          |
+| results[].trackingNumber  | String  | Internal tracking number                                                      |
+| results[].previousStatus  | String  | Shipment status before the retrigger attempt                                  |
+| results[].currentStatus   | String  | Shipment status after the retrigger attempt (may be unchanged)                |
+| results[].action          | String  | `RETRIGGERED`, `SKIPPED`, or `FAILED`                                          |
+| results[].message         | String  | Human-readable outcome/reason for this shipment                               |
+| results[].failedStep      | String  | Populated only when `action=FAILED` — the Shiprocket step that failed (e.g. `GENERATE_AWB`, `REQUEST_PICKUP`, `GENERATE_LABEL`), or `RETRIGGER` for an unexpected exception. `null` otherwise. |
+| results[].failureReason   | String  | Populated only when `action=FAILED` — the detailed error message for the failed step or exception. `null` otherwise. |
+
+### Error Responses
+
+| Status | Condition                                                                 |
+|--------|-----------------------------------------------------------------------------|
+| 400    | orderNumber is null/blank                                                    |
+| 400    | No order found for orderNumber                                              |
+| 400    | No active FORWARD shipment found to retrigger (none exist, or all CANCELLED/DELIVERED) |
+| 400    | No shipment under the order could be retriggered (see `responseMessage` for aggregated reasons) |
+| 500    | Unexpected internal server error (`responseMessage` includes the root-cause exception message) |
+
+### cURL Example
+
+```bash
+curl -X POST "http://localhost:8080/api/order/ORD-20260601-001/retrigger-shipping" \
+  -H "accept: application/json"
+```
 
 ---
 
@@ -1072,6 +1322,12 @@ curl -X GET "http://localhost:8080/api/shipment/order/ORD-20260601-001" \
   -H "accept: application/json"
 ```
 
+### Fetch live Shiprocket PUT payload for an order
+```bash
+curl -X GET "http://localhost:8080/api/shipment/order/ORD-20260601-001/shiprocket-payload" \
+  -H "accept: application/json"
+```
+
 ### Create a new shipping record
 ```bash
 curl -X POST "http://localhost:8080/api/shipment/order/ORD-20260601-001" \
@@ -1113,4 +1369,11 @@ curl -X POST "http://localhost:8080/api/shipment/generate-awb" \
   -H "Content-Type: application/json" \
   -d '{"shipmentId": 12345, "courierId": 7}'
 ```
+
+---
+
+## Changelog
+
+- **2026-08-14** — `POST /api/order/{orderNumber}/retrigger-shipping` per-shipment results now include `failedStep` and `failureReason` when `action=FAILED`, surfacing the actual Shiprocket step and error message (from `shiprocket_order_log`, or the underlying exception) instead of a generic failure status. The top-level `responseMessage` now aggregates all individual failure reasons when nothing could be retriggered, and the 500 error handler also reports the root-cause message. See [Section 9](#9-retrigger-shipping-process).
+- **2026-08-14** — `PUT`/`POST /api/shipment/order/{orderNumber}` now auto-record the current `shipmentStatus` as a tracking-history entry (idempotent, no duplicates) when `historyStatus` isn't explicitly supplied, and automatically sync the parent order's `orderStatus` to match the new shipment status (with `DELIVERED` mapping preserved). See [8.2](#tracking-history--order-status-sync-behaviour).
 

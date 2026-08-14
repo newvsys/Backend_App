@@ -37,4 +37,7 @@ public class ProductAttributeEO {
 	@Column(name = "attribute_value", length = 500, nullable = false)
 	private String attributeValue;
 
+	@Column(name = "display_order")
+	private Integer displayOrder;
+
 }

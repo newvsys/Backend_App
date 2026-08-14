@@ -19,4 +19,6 @@ public class ProductAttributeDTO {
 
 	private String attributeValue;
 
+	private Integer displayOrder;
+
 }

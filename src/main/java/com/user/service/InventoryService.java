@@ -8,10 +8,12 @@ import com.user.dto.InventoryUpdateDatesDTO;
 import com.user.dto.InventoryUpdateDatesResponseDTO;
 import com.user.dto.LoadInventoryRequestDTO;
 import com.user.dto.LoadInventoryResponseDTO;
+import com.user.dto.OutOfStockResponseDTO;
 import com.user.dto.RemoveInventoryRequestDTO;
 import com.user.dto.RemoveInventoryResponseDTO;
 import com.user.dto.RestoreInventoryRequestDTO;
 import com.user.dto.RestoreInventoryResponseDTO;
+import com.user.dto.StockReportResponseDTO;
 
 public interface InventoryService {
 
@@ -87,5 +89,35 @@ public interface InventoryService {
 	 * all null to refresh every inventory record.
 	 */
 	InventoryRefreshResponseDTO refreshInventoryCounts(InventoryRefreshRequestDTO request);
+
+	/**
+	 * Generate/view the current stock report — joins inventory with product variant,
+	 * product, category, and warehouse. All filters are optional (pass {@code null} to
+	 * skip). {@code status} defaults to {@code "A"} (active inventory records only) when
+	 * not supplied by the controller.
+	 * @param warehouseId filter by warehouse ID (optional)
+	 * @param categoryId filter by product category ID (optional)
+	 * @param productId filter by product ID (optional)
+	 * @param productVarId filter by product variant ID (optional)
+	 * @param status filter by inventory status, e.g. "A" (optional)
+	 * @param availableQty filter by available quantity (optional). Accepts a plain
+	 * number for an exact match (e.g. {@code "10"}), or a comparison expression using
+	 * {@code >}, {@code <}, {@code >=}, {@code <=}, or {@code =} as a prefix (e.g.
+	 * {@code ">10"}, {@code "<5"}, {@code ">=10"}, {@code "<=5"}). A product variant
+	 * with no inventory record at all is treated as {@code availableQty = 0}.
+	 */
+	StockReportResponseDTO getCurrentStockReport(Long warehouseId, Integer categoryId, Integer productId,
+			Integer productVarId, String status, String availableQty);
+
+	/**
+	 * Generate/view the "Out of Stock" report — every active product variant that has NO
+	 * inventory record with {@code availableQty > 0} in any warehouse (either no
+	 * inventory record exists at all, or every existing record is depleted). All filters
+	 * are optional (pass {@code null} to skip).
+	 * @param categoryId filter by product category ID (optional)
+	 * @param productId filter by product ID (optional)
+	 * @param productVarId filter by product variant ID (optional)
+	 */
+	OutOfStockResponseDTO getOutOfStockReport(Integer categoryId, Integer productId, Integer productVarId);
 
 }

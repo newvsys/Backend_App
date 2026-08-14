@@ -108,43 +108,67 @@ public class ShiprocketService {
 
 	// ✅ Check Courier Serviceability / Rate (full params)
 	public Map checkServiceAvailability(ServiceabilityRequestDTO req) {
-		StringBuilder url = new StringBuilder(baseUrl).append("/courier/serviceability/?");
+		if (req == null) {
+			throw new IllegalArgumentException("checkServiceAvailability: request body must not be null");
+		}
+		if (req.getDeliveryPostcode() == null) {
+			throw new IllegalArgumentException("checkServiceAvailability: deliveryPostcode is required");
+		}
 
 		// Required params
 		String pickupPostcode = (req.getPickupPostcode() != null) ? req.getPickupPostcode().toString()
 				: getWarehousePostalCode(req.getWarehouseName());
-		url.append("pickup_postcode=").append(pickupPostcode);
-		url.append("&delivery_postcode=").append(req.getDeliveryPostcode());
+		if (pickupPostcode == null || pickupPostcode.isBlank()) {
+			throw new IllegalStateException(
+					"checkServiceAvailability: unable to resolve a pickup postcode (no pickupPostcode supplied and warehouse '"
+							+ req.getWarehouseName() + "' has none configured)");
+		}
+
+		org.springframework.web.util.UriComponentsBuilder uriBuilder = org.springframework.web.util.UriComponentsBuilder
+			.fromHttpUrl(baseUrl + "/courier/serviceability/")
+			.queryParam("pickup_postcode", pickupPostcode)
+			.queryParam("delivery_postcode", req.getDeliveryPostcode());
 
 		// Conditional / optional params
 		if (req.getCod() != null)
-			url.append("&cod=").append(req.getCod());
+			uriBuilder.queryParam("cod", req.getCod());
 		if (req.getWeight() != null)
-			url.append("&weight=").append(req.getWeight());
+			uriBuilder.queryParam("weight", req.getWeight());
 		if (req.getOrderId() != null)
-			url.append("&order_id=").append(req.getOrderId());
+			uriBuilder.queryParam("order_id", req.getOrderId());
 		if (req.getLength() != null)
-			url.append("&length=").append(req.getLength());
+			uriBuilder.queryParam("length", req.getLength());
 		if (req.getBreadth() != null)
-			url.append("&breadth=").append(req.getBreadth());
+			uriBuilder.queryParam("breadth", req.getBreadth());
 		if (req.getHeight() != null)
-			url.append("&height=").append(req.getHeight());
+			uriBuilder.queryParam("height", req.getHeight());
 		if (req.getDeclaredValue() != null)
-			url.append("&declared_value=").append(req.getDeclaredValue());
+			uriBuilder.queryParam("declared_value", req.getDeclaredValue());
 		if (req.getMode() != null)
-			url.append("&mode=").append(req.getMode());
+			uriBuilder.queryParam("mode", req.getMode());
 		if (req.getIsReturn() != null)
-			url.append("&is_return=").append(req.getIsReturn());
+			uriBuilder.queryParam("is_return", req.getIsReturn());
 		if (req.getCouriersType() != null)
-			url.append("&couriers_type=").append(req.getCouriersType());
+			uriBuilder.queryParam("couriers_type", req.getCouriersType());
 		if (req.getOnlyLocal() != null)
-			url.append("&only_local=").append(req.getOnlyLocal());
+			uriBuilder.queryParam("only_local", req.getOnlyLocal());
 		if (req.getQcCheck() != null)
-			url.append("&qc_check=").append(req.getQcCheck());
+			uriBuilder.queryParam("qc_check", req.getQcCheck());
 
+		String url = uriBuilder.toUriString();
 		HttpEntity<Void> request = new HttpEntity<>(getAuthHeaders());
-		ResponseEntity<Map> response = restTemplate.exchange(url.toString(), HttpMethod.GET, request, Map.class);
-		return response.getBody();
+		logger.info("checkServiceAvailability: GET {}", url);
+		try {
+			ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, request, Map.class);
+			logger.info("checkServiceAvailability: response status={}", response.getStatusCode());
+			return response.getBody();
+		}
+		catch (org.springframework.web.client.RestClientException e) {
+			logger.error(
+					"checkServiceAvailability: Shiprocket API call failed for pickup={} delivery={}: {}",
+					pickupPostcode, req.getDeliveryPostcode(), e.getMessage(), e);
+			throw e;
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -369,6 +393,32 @@ public class ShiprocketService {
 		String url = baseUrl + "/courier/track/awb/" + awbCode;
 		HttpEntity<Void> request = new HttpEntity<>(getAuthHeaders());
 		ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, request, Map.class);
+		return response.getBody();
+	}
+
+	// ✅ Get Order Details (GET /orders/show/{id}) — used to refresh shipment/courier/AWB
+	// data live from Shiprocket for a previously created order.
+	public Map getOrderDetails(Integer shiprocketOrderId) {
+		String url = baseUrl + "/orders/show/" + shiprocketOrderId;
+		HttpEntity<Void> request = new HttpEntity<>(getAuthHeaders());
+		logger.info("getOrderDetails: GET {}", url);
+		ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, request, Map.class);
+		logger.info("getOrderDetails: response status={}", response.getStatusCode());
+		return response.getBody();
+	}
+
+	// ✅ Search Orders by internal/channel order id (GET /orders?search=<channelOrderId>)
+	// Used to resolve the Shiprocket order (and shipment/AWB/courier) purely from the
+	// live Shiprocket API — no locally-persisted shipment record is required or used.
+	// The internal order number IS the channel_order_id sent to Shiprocket at
+	// order-creation time, so searching by it lets us find the corresponding Shiprocket
+	// order without needing our own DB.
+	public Map searchOrdersByChannelOrderId(String channelOrderId) {
+		String url = baseUrl + "/orders?per_page=10&search=" + channelOrderId;
+		HttpEntity<Void> request = new HttpEntity<>(getAuthHeaders());
+		logger.info("searchOrdersByChannelOrderId: GET {}", url);
+		ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.GET, request, Map.class);
+		logger.info("searchOrdersByChannelOrderId: response status={}", response.getStatusCode());
 		return response.getBody();
 	}
 

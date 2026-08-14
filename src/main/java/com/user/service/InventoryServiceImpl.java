@@ -11,10 +11,14 @@ import com.user.dto.InventoryUpdateDatesDTO;
 import com.user.dto.InventoryUpdateDatesResponseDTO;
 import com.user.dto.LoadInventoryRequestDTO;
 import com.user.dto.LoadInventoryResponseDTO;
+import com.user.dto.OutOfStockItemDTO;
+import com.user.dto.OutOfStockResponseDTO;
 import com.user.dto.RemoveInventoryRequestDTO;
 import com.user.dto.RemoveInventoryResponseDTO;
 import com.user.dto.RestoreInventoryRequestDTO;
 import com.user.dto.RestoreInventoryResponseDTO;
+import com.user.dto.StockReportItemDTO;
+import com.user.dto.StockReportResponseDTO;
 import com.user.model.InventoryDetailsEO;
 import com.user.model.InventoryEO;
 import com.user.model.InventoryTransactionEO;
@@ -689,6 +693,253 @@ public class InventoryServiceImpl implements InventoryService {
 			response.setMessage("Failed to refresh inventory counts: " + e.getMessage());
 		}
 
+		return response;
+	}
+
+	@Override
+	@Transactional(readOnly = true)
+	public StockReportResponseDTO getCurrentStockReport(Long warehouseId, Integer categoryId, Integer productId,
+			Integer productVarId, String status, String availableQty) {
+		logger.info(
+				"Generating current stock report — warehouseId={}, categoryId={}, productId={}, productVarId={}, status={}, availableQty={}",
+				warehouseId, categoryId, productId, productVarId, status, availableQty);
+		StockReportResponseDTO response = new StockReportResponseDTO();
+		try {
+			AvailableQtyFilter qtyFilter;
+			try {
+				qtyFilter = AvailableQtyFilter.parse(availableQty);
+			}
+			catch (IllegalArgumentException e) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage(e.getMessage());
+				return response;
+			}
+
+			List<Object[]> rows = inventoryRepository.findStockReport(warehouseId, categoryId, productId,
+					productVarId, status, qtyFilter.eq, qtyFilter.gt, qtyFilter.gte, qtyFilter.lt, qtyFilter.lte,
+					qtyFilter.includeZeroStock);
+
+			List<StockReportItemDTO> reportItems = new ArrayList<>();
+			long totalAvailableQty = 0L;
+			long totalStockQty = 0L;
+
+			for (Object[] row : rows) {
+				ProductVariantEO variant = (ProductVariantEO) row[0];
+				// No inventory record exists for this variant — treat as availableQty = 0.
+				InventoryEO inv = (InventoryEO) row[1];
+				WarehouseEO warehouse = inv != null ? inv.getWarehouse() : null;
+
+				Integer availableQtyValue = (inv != null && inv.getAvailableQty() != null) ? inv.getAvailableQty() : 0;
+				Integer totalQty = (inv != null && inv.getTotalQty() != null) ? inv.getTotalQty() : 0;
+				Integer reorderLevel = (inv != null && inv.getReorderLevel() != null) ? inv.getReorderLevel() : 0;
+
+				String stockStatus;
+				if (availableQtyValue <= 0) {
+					stockStatus = "OUT_OF_STOCK";
+				}
+				else if (availableQtyValue <= reorderLevel) {
+					stockStatus = "LOW_STOCK";
+				}
+				else {
+					stockStatus = "IN_STOCK";
+				}
+
+				StockReportItemDTO item = StockReportItemDTO.builder()
+					.categoryId(variant != null && variant.getProduct() != null && variant.getProduct().getCategory() != null
+							? variant.getProduct().getCategory().getId() : null)
+					.categoryName(variant != null && variant.getProduct() != null && variant.getProduct().getCategory() != null
+							? variant.getProduct().getCategory().getName() : null)
+					.productId(variant != null && variant.getProduct() != null ? variant.getProduct().getId() : null)
+					.productName(variant != null && variant.getProduct() != null ? variant.getProduct().getName() : null)
+					.productSlug(variant != null && variant.getProduct() != null ? variant.getProduct().getSlug() : null)
+					.productStatus(variant != null && variant.getProduct() != null ? variant.getProduct().getStatus() : null)
+					.variantId(variant != null ? variant.getId() : null)
+					.skuCode(variant != null ? variant.getSkuCode() : null)
+					.packSize(variant != null ? variant.getPackSize() : null)
+					.uom(variant != null ? variant.getUom() : null)
+					.mrp(variant != null ? variant.getMrp() : null)
+					.sellingPrice(variant != null ? variant.getSellingPrice() : null)
+					.currency(variant != null ? variant.getCurrency() : null)
+					.variantStatus(variant != null ? variant.getStatus() : null)
+					.warehouseId(warehouse != null ? warehouse.getWarehouseId() : null)
+					.warehouseCode(warehouse != null ? warehouse.getWarehouseCode() : null)
+					.warehouseName(warehouse != null ? warehouse.getWarehouseName() : null)
+					.warehouseCity(warehouse != null ? warehouse.getCity() : null)
+					.inventoryId(inv != null ? inv.getId() : null)
+					.totalQty(totalQty)
+					.availableQty(availableQtyValue)
+					.reservedQty(inv != null ? inv.getReservedQty() : null)
+					.quantityReserved(inv != null ? inv.getQuantityReserved() : null)
+					.reorderLevel(inv != null ? inv.getReorderLevel() : null)
+					.safetyStock(inv != null ? inv.getSafetyStock() : null)
+					.inventoryStatus(inv != null ? inv.getStatus() : null)
+					.stockStatus(stockStatus)
+					.build();
+
+				reportItems.add(item);
+				totalAvailableQty += availableQtyValue;
+				totalStockQty += totalQty;
+			}
+
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage("Current stock report generated successfully.");
+			response.setTotalRecords(reportItems.size());
+			response.setTotalAvailableQty(totalAvailableQty);
+			response.setTotalStockQty(totalStockQty);
+			response.setReportItems(reportItems);
+			logger.info("Current stock report generated — {} record(s), totalAvailableQty={}, totalStockQty={}",
+					reportItems.size(), totalAvailableQty, totalStockQty);
+		}
+		catch (Exception e) {
+			logger.error("Error generating current stock report: {}", e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Failed to generate current stock report: " + e.getMessage());
+		}
+		return response;
+	}
+
+	/**
+	 * Parses the {@code availableQty} filter expression used by
+	 * {@link #getCurrentStockReport}. Accepts a plain integer for an exact match (e.g.
+	 * {@code "10"}), or a comparison expression prefixed with {@code >}, {@code <},
+	 * {@code >=}, {@code <=}, or {@code =} (e.g. {@code ">10"}, {@code "<=5"}). Also
+	 * pre-computes whether {@code 0} satisfies the parsed condition — used to decide
+	 * whether product variants with NO inventory record at all (treated as
+	 * {@code availableQty = 0}) should be included in the report.
+	 */
+	private static final class AvailableQtyFilter {
+
+		private static final java.util.regex.Pattern PATTERN = java.util.regex.Pattern
+			.compile("^\\s*(>=|<=|>|<|=)?\\s*(-?\\d+)\\s*$");
+
+		private final Integer eq;
+
+		private final Integer gt;
+
+		private final Integer gte;
+
+		private final Integer lt;
+
+		private final Integer lte;
+
+		private final boolean includeZeroStock;
+
+		private AvailableQtyFilter(Integer eq, Integer gt, Integer gte, Integer lt, Integer lte,
+				boolean includeZeroStock) {
+			this.eq = eq;
+			this.gt = gt;
+			this.gte = gte;
+			this.lt = lt;
+			this.lte = lte;
+			this.includeZeroStock = includeZeroStock;
+		}
+
+		static AvailableQtyFilter parse(String raw) {
+			if (raw == null || raw.isBlank()) {
+				return new AvailableQtyFilter(null, null, null, null, null, false);
+			}
+
+			java.util.regex.Matcher matcher = PATTERN.matcher(raw.trim());
+			if (!matcher.matches()) {
+				throw new IllegalArgumentException("Invalid availableQty filter: '" + raw
+						+ "'. Expected a number (e.g. \"10\") or a comparison expression (e.g. \">10\", \"<5\", \">=10\", \"<=5\").");
+			}
+
+			String operator = matcher.group(1);
+			int value = Integer.parseInt(matcher.group(2));
+
+			if (operator == null || operator.equals("=")) {
+				return new AvailableQtyFilter(value, null, null, null, null, value == 0);
+			}
+			switch (operator) {
+				case ">":
+					return new AvailableQtyFilter(null, value, null, null, null, 0 > value);
+				case ">=":
+					return new AvailableQtyFilter(null, null, value, null, null, 0 >= value);
+				case "<":
+					return new AvailableQtyFilter(null, null, null, value, null, 0 < value);
+				case "<=":
+					return new AvailableQtyFilter(null, null, null, null, value, 0 <= value);
+				default:
+					// Unreachable given the regex, but keep the compiler happy.
+					throw new IllegalArgumentException("Invalid availableQty filter operator: " + operator);
+			}
+		}
+
+	}
+
+	@Override
+	@Transactional(readOnly = true)
+	public OutOfStockResponseDTO getOutOfStockReport(Integer categoryId, Integer productId, Integer productVarId) {
+		logger.info("Generating out-of-stock report — categoryId={}, productId={}, productVarId={}", categoryId,
+				productId, productVarId);
+		OutOfStockResponseDTO response = new OutOfStockResponseDTO();
+		try {
+			List<ProductVariantEO> variants = productVariantRepository.findOutOfStockVariants(categoryId, productId,
+					productVarId);
+
+			// Batch-fetch every existing inventory record (across all warehouses) for
+			// these variants so we can report the actual totalAvailableQty / whether an
+			// inventory record exists at all — without hitting the DB per variant.
+			List<Long> variantIds = variants.stream()
+				.map(v -> v.getId() != null ? v.getId().longValue() : null)
+				.filter(id -> id != null)
+				.collect(Collectors.toList());
+
+			List<InventoryEO> existingInventories = variantIds.isEmpty() ? new ArrayList<>()
+					: inventoryRepository.findAllByProductVariantIdIn(variantIds);
+
+			java.util.Map<Integer, Long> availableQtyByVariant = new java.util.HashMap<>();
+			for (InventoryEO inv : existingInventories) {
+				Integer variantId = inv.getProductVariant() != null ? inv.getProductVariant().getId() : null;
+				if (variantId == null) {
+					continue;
+				}
+				long qty = inv.getAvailableQty() != null ? inv.getAvailableQty() : 0;
+				availableQtyByVariant.merge(variantId, qty, Long::sum);
+			}
+
+			List<OutOfStockItemDTO> items = new ArrayList<>();
+			for (ProductVariantEO variant : variants) {
+				boolean hasInventoryRecord = availableQtyByVariant.containsKey(variant.getId());
+				long totalAvailableQty = availableQtyByVariant.getOrDefault(variant.getId(), 0L);
+
+				OutOfStockItemDTO item = OutOfStockItemDTO.builder()
+					.categoryId(variant.getProduct() != null && variant.getProduct().getCategory() != null
+							? variant.getProduct().getCategory().getId() : null)
+					.categoryName(variant.getProduct() != null && variant.getProduct().getCategory() != null
+							? variant.getProduct().getCategory().getName() : null)
+					.productId(variant.getProduct() != null ? variant.getProduct().getId() : null)
+					.productName(variant.getProduct() != null ? variant.getProduct().getName() : null)
+					.productSlug(variant.getProduct() != null ? variant.getProduct().getSlug() : null)
+					.productStatus(variant.getProduct() != null ? variant.getProduct().getStatus() : null)
+					.variantId(variant.getId())
+					.skuCode(variant.getSkuCode())
+					.packSize(variant.getPackSize())
+					.uom(variant.getUom())
+					.mrp(variant.getMrp())
+					.sellingPrice(variant.getSellingPrice())
+					.currency(variant.getCurrency())
+					.variantStatus(variant.getStatus())
+					.hasInventoryRecord(hasInventoryRecord)
+					.totalAvailableQty(totalAvailableQty)
+					.stockStatus("OUT_OF_STOCK")
+					.build();
+
+				items.add(item);
+			}
+
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage("Out-of-stock report generated successfully.");
+			response.setTotalRecords(items.size());
+			response.setItems(items);
+			logger.info("Out-of-stock report generated — {} record(s)", items.size());
+		}
+		catch (Exception e) {
+			logger.error("Error generating out-of-stock report: {}", e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Failed to generate out-of-stock report: " + e.getMessage());
+		}
 		return response;
 	}
 

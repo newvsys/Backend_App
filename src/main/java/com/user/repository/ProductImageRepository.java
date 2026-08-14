@@ -11,6 +11,9 @@ public interface ProductImageRepository extends JpaRepository<ProductImageEO, Lo
 
 	List<ProductImageEO> findByProductVar(ProductVariantEO productVariant);
 
+	/** Same as {@link #findByProductVar(ProductVariantEO)} but pre-sorted by {@code displayOrder} ascending. */
+	List<ProductImageEO> findByProductVarOrderByDisplayOrderAsc(ProductVariantEO productVariant);
+
 	/**
 	 * Batch lookup — eliminates N+1 queries when loading images for multiple variants at
 	 * once.
