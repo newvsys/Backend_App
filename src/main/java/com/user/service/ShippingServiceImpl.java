@@ -2382,6 +2382,35 @@ public class ShippingServiceImpl implements ShippingService {
 						trimmedOrderNumber, ex.getMessage());
 			}
 
+			// ── Fallback: resolve via the local DB if the live Shiprocket search ──
+			// didn't find a match (e.g. Shiprocket's `search` query doesn't index the
+			// channel_order_id reliably/immediately). Our own ShippingEO row already
+			// stores the Shiprocket order/shipment IDs assigned when the order was
+			// first created, so use those to continue fetching live data instead of
+			// failing outright when the order clearly exists in our system.
+			ShippingEO localShipment = null;
+			if (shiprocketOrderId == null) {
+				OrderEO localOrder = orderRepository.findByOrderNumber(trimmedOrderNumber).orElse(null);
+				if (localOrder != null) {
+					List<ShippingEO> localShipments = shippingRepository.findByOrder(localOrder);
+					if (localShipments != null && !localShipments.isEmpty()) {
+						// Prefer a shipment that actually has a Shiprocket order id, and
+						// among those, the most recently created/updated one.
+						localShipment = localShipments.stream()
+							.filter(s -> s.getShipOrderId() != null)
+							.max(Comparator.comparing(s -> s.getUpdatedAt() != null ? s.getUpdatedAt()
+									: LocalDateTime.MIN))
+							.orElse(null);
+						if (localShipment != null) {
+							shiprocketOrderId = localShipment.getShipOrderId();
+							logger.info(
+									"getShiprocketPutPayloadByOrderNumber: live Shiprocket search found no match for orderNumber={}, falling back to locally-stored shiprocketOrderId={}",
+									trimmedOrderNumber, shiprocketOrderId);
+						}
+					}
+				}
+			}
+
 			if (shiprocketOrderId == null) {
 				response.setResponseStatus(Constants.FAILURE_STATUS);
 				response.setResponseMessage("No shipment found on Shiprocket for order number: " + trimmedOrderNumber);
@@ -2391,6 +2420,32 @@ public class ShippingServiceImpl implements ShippingService {
 			response.setShiprocketOrderId(shiprocketOrderId);
 			if (matchedOrder != null) {
 				populateFromShiprocketOrderSummary(response, matchedOrder);
+			}
+			else if (localShipment != null) {
+				// Seed baseline fields from the local DB record so the response is still
+				// fully populated even if some of the subsequent live-refresh calls fail.
+				response.setWarehouseId(
+						localShipment.getWarehouse() != null ? localShipment.getWarehouse().getWarehouseId() : null);
+				response.setShiprocketShipmentId(localShipment.getShipShipmentId());
+				response.setAwbCode(localShipment.getAwb());
+				response.setCourierName(localShipment.getCourierName());
+				response.setCourierCompanyId(localShipment.getCourierCompanyId());
+				response.setShipmentStatus(localShipment.getShipmentStatus());
+				response.setShipmentType(localShipment.getType());
+				response.setTrackingNumber(localShipment.getTrackingNumber());
+				response.setLength(localShipment.getLength());
+				response.setBreadth(localShipment.getBreadth());
+				response.setHeight(localShipment.getHeight());
+				response.setWeight(localShipment.getWeight());
+				response.setShippingPrice(localShipment.getShippingPrice());
+				response.setLabelUrl(localShipment.getLabelUrl());
+				response.setTrackUrl(localShipment.getTrackUrl());
+				if (localShipment.getEstimatedDeliveryDate() != null) {
+					response.setEstimatedDeliveryDate(localShipment.getEstimatedDeliveryDate().toString());
+				}
+				if (localShipment.getExpectedDeliveryDate() != null) {
+					response.setExpectedDeliveryDate(localShipment.getExpectedDeliveryDate().toString());
+				}
 			}
 
 			// ── Refresh order/shipment level info live from Shiprocket (order/show) ──
