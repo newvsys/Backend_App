@@ -1060,7 +1060,7 @@ Fetches the **live** shipment data directly from the real Shiprocket API for the
 
 Typical usage: call this GET, review/adjust the returned JSON, then send it as the body of the PUT call for the same order number.
 
-> **Note:** This endpoint does **not** read from the local shipping DB at all. The Shiprocket order is located purely via the live Shiprocket "search orders" API (matching on `channel_order_id`, i.e. the internal order number that was sent to Shiprocket at order-creation time). All fields are then populated/refreshed from the live Shiprocket "order details" and "track AWB" APIs. If the live AWB/courier calls fail, the last known values from the order search are used as a fallback.
+> **Note:** The Shiprocket order is located purely via the live Shiprocket "search orders" API (matching on `channel_order_id`, i.e. the internal order number that was sent to Shiprocket at order-creation time). Courier/AWB/status/label/tracking fields are then populated/refreshed from the live Shiprocket "order details", "generate label" (idempotent — returns the existing label instead of creating a new one) and "track AWB" APIs. If any live Shiprocket call fails or a field still isn't populated afterwards, the last known value from the local shipping record for this order (if one exists) is used as a fallback.
 
 ```
 GET /api/shipment/order/{orderNumber}/shiprocket-payload
@@ -1105,20 +1105,21 @@ GET /api/shipment/order/{orderNumber}/shiprocket-payload
 |-----------------------|------------|--------------------------------------------------------------------------|
 | responseStatus        | String     | `SUCCESS` or `FAILURE`                                                  |
 | responseMessage       | String     | Human-readable result or error                                          |
-| warehouseId           | Long       | Not populated by this endpoint (local DB is not consulted); include manually if needed for the PUT body |
+| warehouseId           | Long       | Not populated by live Shiprocket calls; filled in from the local shipment record for this order, if one exists |
 | shiprocketOrderId     | Integer    | Shiprocket `order_id`, resolved via live Shiprocket order search        |
 | shiprocketShipmentId  | Integer    | Shiprocket `shipment_id`, from live Shiprocket order details            |
 | awbCode               | String     | AWB code, from live Shiprocket order details                           |
 | courierName           | String     | Courier partner name, refreshed from live AWB tracking (falls back to order details / search result) |
-| courierCompanyId      | Integer    | Not currently populated by this endpoint                                |
+| courierCompanyId      | Integer    | Not returned by the live Shiprocket calls used here; filled in from the local shipment record for this order, if one exists |
 | shipmentStatus        | String     | Shipment status, refreshed from live AWB tracking (falls back to order details / search result) |
-| shipmentType          | String     | Not populated by this endpoint                                          |
-| trackingNumber        | String     | Not populated by this endpoint                                          |
-| length / breadth / height / weight | Double | Not populated by this endpoint                              |
-| shippingPrice         | BigDecimal | Not populated by this endpoint                                          |
-| labelUrl / trackUrl   | String     | Not populated by this endpoint                                          |
-| estimatedDeliveryDate | String     | Not populated by this endpoint                                          |
-| expectedDeliveryDate  | String     | ISO date string (e.g. `2026-06-07`), from live Shiprocket AWB tracking (`edd`) |
+| shipmentType          | String     | Not returned by live Shiprocket calls; filled in from the local shipment record, if available |
+| trackingNumber        | String     | Not returned by live Shiprocket calls; filled in from the local shipment record, if available |
+| length / breadth / height / weight | Double | Not returned by live Shiprocket calls; filled in from the local shipment record, if available |
+| shippingPrice         | BigDecimal | Not returned by live Shiprocket calls; filled in from the local shipment record, if available |
+| labelUrl              | String     | Refreshed live from Shiprocket's `courier/generate/label` call (idempotent — returns the existing label instead of creating a duplicate if one already exists). Falls back to the local shipment record for this order if the live call fails or returns nothing |
+| trackUrl              | String     | Refreshed live from Shiprocket AWB tracking (`track_url`). Falls back to the local shipment record for this order if the live call fails or returns nothing |
+| estimatedDeliveryDate | String     | Not returned by live Shiprocket calls; filled in from the local shipment record, if available |
+| expectedDeliveryDate  | String     | ISO date string (e.g. `2026-06-07`), from live Shiprocket AWB tracking (`edd`), else from the local shipment record |
 
 Since the returned JSON matches the [PUT 8.2](#82-update-shipping-by-order-number) request body shape, it can be copied — after filling in `warehouseId` and any other fields you want to persist — and sent directly as the PUT request body for the same order number.
 

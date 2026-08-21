@@ -886,12 +886,26 @@ public class OrderServiceImpl implements OrderService {
 			ship.setShipmentStatus(Constants.SHIPMENT_STATUS_CANCELLED);
 			shippingRepository.save(ship);
 
-			ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
-			shipmentTrackingHistoryEO.setShipment(ship);
-			shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_STATUS_CANCELLED);
-			shipmentTrackingHistoryEO.setRemarks("Order Cancelled ");
-			shipmentTrackingHistoryEO.setUpdatedAt(LocalDateTime.now());
-			shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+			// ── Idempotency guard ───────────────────────────────────────────
+			// If a Shiprocket webhook already recorded a CANCELLED entry for this
+			// shipment (e.g. it arrived just before this in-app cancel completed),
+			// don't insert a second one — the Track Order popup should only ever
+			// show CANCELLED once.
+			boolean cancelledHistoryAlreadyExists = shipmentTrackingHistoryRepository
+				.existsByShipmentAndStatusIgnoreCase(ship, Constants.SHIPMENT_STATUS_CANCELLED);
+			if (!cancelledHistoryAlreadyExists) {
+				ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
+				shipmentTrackingHistoryEO.setShipment(ship);
+				shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_STATUS_CANCELLED);
+				shipmentTrackingHistoryEO.setRemarks("Order Cancelled ");
+				shipmentTrackingHistoryEO.setUpdatedAt(LocalDateTime.now());
+				shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+			}
+			else {
+				logger.info(
+						"cancelOrder: ShipmentTrackingHistoryEO already has a CANCELLED record for shipmentId={}. Skipping duplicate insert.",
+						ship.getShipmentId());
+			}
 
 			// ── Invoke Shiprocket Cancel Order API ──────────────────────────
 			try {

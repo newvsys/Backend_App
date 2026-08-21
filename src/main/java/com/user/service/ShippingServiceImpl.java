@@ -2238,6 +2238,7 @@ public class ShippingServiceImpl implements ShippingService {
 
 			boolean historyCreated = saveTrackingHistoryIfRequested(saved, request);
 			syncOrderStatusWithShipment(saved);
+			syncCourierSelectionLogSelection(saved);
 			logShiprocketOrderLog(saved, "MANUAL_UPDATE", request.getNotes());
 
 			buildManualUpdateResponse(response, saved, historyCreated, "MANUAL_UPDATE");
@@ -2305,6 +2306,7 @@ public class ShippingServiceImpl implements ShippingService {
 
 			boolean historyCreated = saveTrackingHistoryIfRequested(saved, request);
 			syncOrderStatusWithShipment(saved);
+			syncCourierSelectionLogSelection(saved);
 			logShiprocketOrderLog(saved, "MANUAL_CREATE", request.getNotes());
 
 			buildManualUpdateResponse(response, saved, historyCreated, "MANUAL_CREATE");
@@ -2419,6 +2421,21 @@ public class ShippingServiceImpl implements ShippingService {
 							if (shipment.get("status") != null) {
 								response.setShipmentStatus(shipment.get("status").toString());
 							}
+							Object ccIdObj = shipment.get("courier_company_id");
+							if (ccIdObj == null)
+								ccIdObj = shipment.get("courier_id");
+							Integer ccId = toInteger(ccIdObj);
+							if (ccId != null) {
+								response.setCourierCompanyId(ccId);
+							}
+							// Shiprocket's order/show shipment object sometimes carries the
+							// estimated delivery date directly — grab it here as an initial
+							// value; it will be refreshed/overridden below from the live
+							// track/awb API if that call succeeds and returns a value.
+							Object estDeliveryObj = shipment.get("estimated_delivery_date");
+							if (estDeliveryObj != null && !estDeliveryObj.toString().trim().isEmpty()) {
+								response.setEstimatedDeliveryDate(estDeliveryObj.toString().trim());
+							}
 						}
 					}
 				}
@@ -2426,6 +2443,27 @@ public class ShippingServiceImpl implements ShippingService {
 					logger.warn(
 							"getShiprocketPutPayloadByOrderNumber: could not fetch live order details from Shiprocket for orderNumber={}, shiprocketOrderId={} — {}",
 							orderNumber, shiprocketOrderId, ex.getMessage());
+				}
+			}
+
+			// ── Refresh label URL live from Shiprocket (courier/generate/label) ──
+			// Shiprocket's generate-label call is idempotent: if a label already exists
+			// for the shipment it simply returns the existing label_url instead of
+			// creating a duplicate, so it's safe to call here to get the latest URL.
+			if (response.getShiprocketShipmentId() != null) {
+				try {
+					Map labelResp = shiprocketService
+
+						.generateLabel(List.of(response.getShiprocketShipmentId().toString()));
+					String liveLabelUrl = extractLabelUrl(labelResp);
+					if (liveLabelUrl != null && !liveLabelUrl.trim().isEmpty()) {
+						response.setLabelUrl(liveLabelUrl.trim());
+					}
+				}
+				catch (Exception ex) {
+					logger.warn(
+							"getShiprocketPutPayloadByOrderNumber: could not fetch live label URL from Shiprocket for orderNumber={}, shiprocketShipmentId={} — {}",
+							orderNumber, response.getShiprocketShipmentId(), ex.getMessage());
 				}
 			}
 
@@ -2439,12 +2477,53 @@ public class ShippingServiceImpl implements ShippingService {
 						if (trackingInfo.get("courier_name") != null) {
 							response.setCourierName(trackingInfo.get("courier_name").toString());
 						}
-						if (trackingInfo.get("edd") != null
+						// etd (top-level) → expectedDeliveryDate, matching the mapping used
+						// elsewhere in this file (see processShiprocketOrderEvent step
+						// TRACK_SHIPMENT). Falls back to a top-level "edd" key in case
+						// Shiprocket returns a differently-shaped response.
+						if (trackingInfo.get("etd") != null
+								&& !trackingInfo.get("etd").toString().trim().isEmpty()) {
+							response.setExpectedDeliveryDate(trackingInfo.get("etd").toString().trim());
+						}
+						else if (trackingInfo.get("edd") != null
 								&& !trackingInfo.get("edd").toString().trim().isEmpty()) {
 							response.setExpectedDeliveryDate(trackingInfo.get("edd").toString().trim());
 						}
 						if (trackingInfo.get("shipment_status") != null) {
 							response.setShipmentStatus(trackingInfo.get("shipment_status").toString());
+						}
+						if (trackingInfo.get("track_url") != null
+								&& !trackingInfo.get("track_url").toString().trim().isEmpty()) {
+							response.setTrackUrl(trackingInfo.get("track_url").toString().trim());
+						}
+
+						// courier_company_id AND the estimated delivery date both live inside
+						// shipment_track[0] per Shiprocket's track/awb response shape
+						// (top-level courier_company_id is a fallback for other response
+						// variants).
+						Integer liveCcId = null;
+						Object shipmentTrackObj = trackingInfo.get("shipment_track");
+						if (shipmentTrackObj instanceof List && !((List) shipmentTrackObj).isEmpty()) {
+							Object firstTrack = ((List) shipmentTrackObj).get(0);
+							if (firstTrack instanceof Map) {
+								Map firstTrackMap = (Map) firstTrack;
+								liveCcId = toInteger(firstTrackMap.get("courier_company_id"));
+								if (liveCcId == null && firstTrackMap.get("courier_name") != null
+										&& response.getCourierName() == null) {
+									response.setCourierName(firstTrackMap.get("courier_name").toString());
+								}
+								// edd (inside shipment_track[0]) → estimatedDeliveryDate
+								Object eddObj = firstTrackMap.get("edd");
+								if (eddObj != null && !eddObj.toString().trim().isEmpty()) {
+									response.setEstimatedDeliveryDate(eddObj.toString().trim());
+								}
+							}
+						}
+						if (liveCcId == null) {
+							liveCcId = toInteger(trackingInfo.get("courier_company_id"));
+						}
+						if (liveCcId != null) {
+							response.setCourierCompanyId(liveCcId);
 						}
 					}
 				}
@@ -2883,6 +2962,79 @@ public class ShippingServiceImpl implements ShippingService {
 			LocalDateTime d = parseDateFlexible(req.getDeliveredDate().trim());
 			if (d != null)
 				eo.setDeliveredDate(d);
+		}
+	}
+
+	/**
+	 * Keeps the {@code courier_selection_log} rows for a shipment in sync with the
+	 * shipment's <b>current</b> {@code courierCompanyId} after a manual create/update
+	 * via {@link #updateShippingByOrderNumber} or {@link #createShippingByOrderNumber}.
+	 * <p>
+	 * Without this, the "Courier Options" list shown in the admin Shipments popup keeps
+	 * flagging whichever courier was selected at the time of the original AWB
+	 * assignment as "Selected" — even after an admin manually changes the shipment's
+	 * courier via the PUT endpoint — because {@link #applyShippingOrderRequest} only
+	 * updates the {@code shipping} table, never the {@code courier_selection_log}
+	 * table.
+	 * <p>
+	 * This marks the row matching the shipment's current courierCompanyId as selected
+	 * (refreshing its AWB/shipping price too) and un-marks every other row for the same
+	 * shipment so at most one candidate is ever flagged as selected. If the current
+	 * courier isn't among the logged candidates at all (e.g. a manual/non-integrated
+	 * courier not returned by Shiprocket's recommend-courier API), a new log row is
+	 * inserted so it still shows up — correctly marked as selected — in the UI.
+	 */
+	private void syncCourierSelectionLogSelection(ShippingEO saved) {
+		if (saved == null || saved.getShipmentId() == null || saved.getCourierCompanyId() == null) {
+			return;
+		}
+		try {
+			Integer currentCourierCompanyId = saved.getCourierCompanyId();
+			List<CourierSelectionLogEO> entries = courierSelectionLogRepository
+				.findByShipmentIdOrderByRankAsc(saved.getShipmentId());
+
+			boolean matched = false;
+			for (CourierSelectionLogEO entry : entries) {
+				boolean isCurrent = currentCourierCompanyId.equals(entry.getCourierCompanyId());
+				if (isCurrent) {
+					matched = true;
+					entry.setIsSelected(true);
+					if (saved.getAwb() != null && !saved.getAwb().trim().isEmpty()) {
+						entry.setAwbCode(saved.getAwb().trim());
+					}
+					if (saved.getShippingPrice() != null) {
+						entry.setShippingPrice(saved.getShippingPrice());
+					}
+				}
+				else if (Boolean.TRUE.equals(entry.getIsSelected())) {
+					entry.setIsSelected(false);
+				}
+				else {
+					continue;
+				}
+				courierSelectionLogRepository.save(entry);
+			}
+
+			if (!matched) {
+				CourierSelectionLogEO newEntry = CourierSelectionLogEO.builder()
+					.orderId(saved.getOrder() != null && saved.getOrder().getOrderId() != null
+							? saved.getOrder().getOrderId().longValue() : null)
+					.orderNumber(saved.getOrder() != null ? saved.getOrder().getOrderNumber() : null)
+					.shipmentId(saved.getShipmentId())
+					.shipShipmentId(saved.getShipShipmentId())
+					.courierCompanyId(currentCourierCompanyId)
+					.courierName(saved.getCourierName())
+					.rank(entries.size() + 1)
+					.isSelected(true)
+					.awbCode(saved.getAwb())
+					.shippingPrice(saved.getShippingPrice())
+					.build();
+				courierSelectionLogRepository.save(newEntry);
+			}
+		}
+		catch (Exception e) {
+			logger.warn("syncCourierSelectionLogSelection: could not sync courier_selection_log for shipmentId={}: {}",
+					saved.getShipmentId(), e.getMessage());
 		}
 	}
 

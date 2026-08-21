@@ -5,6 +5,7 @@ import com.user.model.ShippingEO;
 import com.user.repository.ShippingRepository;
 import com.user.service.ShippingService;
 import com.user.service.ShiprocketService;
+import com.user.utility.Constants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -243,17 +244,26 @@ public class ShiprocketController {
 			}
 		}
 
-		// ── 4. Build the internal update request and delegate ────────────────
+		// ── 4. Normalize the status text, then build the update request ──────
+		// Shiprocket sends free-text status labels (e.g. "Cancelled", "Canceled",
+		// "Cancellation Requested", "Order Cancelled") which don't always match our
+		// internal canonical constant exactly. Normalizing here ensures the
+		// idempotency guard in ShippingService#shipmentStatusUpdate (which compares
+		// against the status already recorded when the customer/admin cancelled the
+		// order in-app) reliably detects the duplicate and skips creating a second
+		// "CANCELLED" tracking-history row.
+		String normalizedStatus = normalizeStatus(payload.getCurrentStatus());
+
 		ShipStatusUpdateRequestDTO updateRequest = ShipStatusUpdateRequestDTO.builder()
 			.trackingNumber(internalTrackingNumber)
-			.status(payload.getCurrentStatus())
+			.status(normalizedStatus)
 			.location(location)
 			.remarks(payload.getCurrentStatus())
 			.eventTime(eventTime)
 			.build();
 
-		logger.info("Delegating webhook status update: trackingNumber={}, status={}, location={}",
-				internalTrackingNumber, payload.getCurrentStatus(), location);
+		logger.info("Delegating webhook status update: trackingNumber={}, status={} (raw='{}'), location={}",
+				internalTrackingNumber, normalizedStatus, payload.getCurrentStatus(), location);
 
 		response = shippingService.shipmentStatusUpdate(updateRequest);
 
@@ -261,4 +271,25 @@ public class ShiprocketController {
 		return ResponseEntity.ok(response);
 	}
 
+	/**
+	 * Normalizes a free-text Shiprocket status label to our internal canonical
+	 * status constant where applicable. Currently only handles cancellation-related
+	 * labels (e.g. "Cancelled", "Canceled", "Cancellation Requested", "Order
+	 * Cancelled") by mapping them to {@link Constants#SHIPMENT_STATUS_CANCELLED} so
+	 * that duplicate-detection against in-app-created history rows works reliably
+	 * regardless of Shiprocket's exact wording/spelling. All other statuses are
+	 * passed through unchanged.
+	 */
+	private String normalizeStatus(String rawStatus) {
+		if (rawStatus == null || rawStatus.isBlank()) {
+			return rawStatus;
+		}
+		String trimmed = rawStatus.trim();
+		if (trimmed.toLowerCase().contains("cancel")) {
+			return Constants.SHIPMENT_STATUS_CANCELLED;
+		}
+		return trimmed;
+	}
+
 }
+
