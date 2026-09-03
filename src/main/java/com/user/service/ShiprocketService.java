@@ -183,6 +183,88 @@ public class ShiprocketService {
 
 		List<Long> variantIds = req.getProductVariantIds();
 
+		// ── Optimisation 3: Cache Shiprocket API results by pickup postcode ──
+		// Since the delivery postcode is constant for the whole request, any two variants
+		// served from the same warehouse postal code only need ONE external API call.
+		// value = courierCount; -1 signals a cached exception result.
+		Map<String, Integer> shiprocketResultCache = new HashMap<>();
+
+		// ─────────────────────────────────────────────────────────────────
+		// Single-warehouse mode: NO need to iterate variantIds at all for the
+		// actual serviceability logic — every variant shares the exact same
+		// default-warehouse pincode, so the Shiprocket check is done exactly
+		// ONCE here, then the same result is simply copied onto each
+		// requested variantId when building the response below.
+		// ─────────────────────────────────────────────────────────────────
+		if (!Constants.IS_MULTI_WAREHOUSE_CONFIGURED) {
+			WarehouseEO defaultWarehouse = getDefaultWarehouse();
+
+			VariantServiceabilityResponseDTO.WarehouseDetail warehouseDetail;
+			boolean serviceable;
+
+			if (defaultWarehouse == null || defaultWarehouse.getPostalCode() == null
+					|| defaultWarehouse.getPostalCode().isBlank()) {
+				logger.warn(
+						"checkVariantServiceability: multi-warehouse not configured and default warehouse (or its postal code) not found");
+				serviceable = false;
+				warehouseDetail = VariantServiceabilityResponseDTO.WarehouseDetail.builder()
+					.serviceable(false)
+					.reason("Multi-warehouse is not configured and default warehouse is not configured either")
+					.build();
+			}
+			else {
+				String pickupPostcode = defaultWarehouse.getPostalCode();
+				int courierCount = resolveCourierCount(pickupPostcode, req.getDeliveryPostcode(),
+						shiprocketResultCache);
+				String reason = null;
+				if (courierCount < 0) {
+					serviceable = false;
+					courierCount = 0;
+					reason = "Shiprocket API error while checking default warehouse pincode";
+				}
+				else {
+					serviceable = courierCount > 0;
+					if (!serviceable)
+						reason = "No courier companies available for this route";
+				}
+
+				warehouseDetail = VariantServiceabilityResponseDTO.WarehouseDetail.builder()
+					.warehouseId(defaultWarehouse.getWarehouseId())
+					.warehouseName(defaultWarehouse.getWarehouseName())
+					.warehousePostalCode(pickupPostcode)
+					.serviceable(serviceable)
+					.availableCourierCount(courierCount)
+					.usingDefaultWarehouse(true)
+					.reason(reason)
+					.build();
+			}
+
+			List<VariantServiceabilityResponseDTO.VariantDetail> variantDetails = new ArrayList<>();
+			for (Long variantId : variantIds) {
+				variantDetails.add(VariantServiceabilityResponseDTO.VariantDetail.builder()
+					.productVariantId(variantId)
+					.serviceable(serviceable)
+					.warehouses(List.of(warehouseDetail))
+					.build());
+			}
+
+			String message = serviceable ? "Delivery is available from all warehouses to the requested postcode"
+					: "Delivery is not available from one or more warehouses to the requested postcode";
+
+			return VariantServiceabilityResponseDTO.builder()
+				.serviceable(serviceable)
+				.deliveryPostcode(req.getDeliveryPostcode())
+				.message(message)
+				.variants(variantDetails)
+				.build();
+		}
+
+		// ── Optimisation 2: Load the default warehouse once before the loop ──
+		// Previously getDefaultWarehouse() was called on every problematic inventory
+		// record,
+		// potentially hitting the DB dozens of times for a multi-variant request.
+		WarehouseEO cachedDefaultWarehouse = getDefaultWarehouse();
+
 		// ── Optimisation 1: Batch-load ALL inventory for all variants in ONE query ──
 		// Replaces the previous per-variant findAllByProductVariant_Id() call inside the
 		// loop
@@ -192,25 +274,10 @@ public class ShiprocketService {
 		Map<Long, List<InventoryEO>> inventoryByVariantId = allInventory.stream()
 			.collect(Collectors.groupingBy(i -> i.getProductVariant().getId().longValue()));
 
-		// ── Optimisation 2: Load the default warehouse once before the loop ──
-		// Previously getDefaultWarehouse() was called on every problematic inventory
-		// record,
-		// potentially hitting the DB dozens of times for a multi-variant request.
-		WarehouseEO cachedDefaultWarehouse = getDefaultWarehouse();
-
-		// ── Optimisation 3: Cache Shiprocket API results by pickup postcode ──
-		// Since the delivery postcode is constant for the whole request, any two variants
-		// served from the same warehouse postal code only need ONE external API call.
-		// value = courierCount; -1 signals a cached exception result.
-		Map<String, Integer> shiprocketResultCache = new HashMap<>();
-
 		List<VariantServiceabilityResponseDTO.VariantDetail> variantDetails = new ArrayList<>();
 		boolean overallServiceable = true;
 
 		for (Long variantId : variantIds) {
-
-			// ── 1. Resolve inventory for this variant (from the pre-loaded map) ──
-			List<InventoryEO> inventoryList = inventoryByVariantId.getOrDefault(variantId, Collections.emptyList());
 
 			List<VariantServiceabilityResponseDTO.WarehouseDetail> warehouseDetails = new ArrayList<>();
 			boolean variantServiceable = true;
@@ -218,43 +285,49 @@ public class ShiprocketService {
 			// Build the list of (warehouse, usingDefault) pairs to check
 			List<Object[]> warehousesToCheck = new ArrayList<>();
 
-			if (inventoryList.isEmpty()) {
-				logger.warn(
-						"checkVariantServiceability: no inventory found for variantId={}, falling back to default warehouse",
-						variantId);
-				if (cachedDefaultWarehouse != null) {
-					warehousesToCheck.add(new Object[] { cachedDefaultWarehouse, Boolean.TRUE });
-				}
-				else {
-					logger.warn("checkVariantServiceability: default warehouse not found either, variantId={}",
+			{
+				// ── 1. Resolve inventory for this variant (from the pre-loaded map) ──
+				List<InventoryEO> inventoryList = inventoryByVariantId.getOrDefault(variantId,
+						Collections.emptyList());
+
+				if (inventoryList.isEmpty()) {
+					logger.warn(
+							"checkVariantServiceability: no inventory found for variantId={}, falling back to default warehouse",
 							variantId);
-					variantServiceable = false;
-					overallServiceable = false;
-					warehouseDetails.add(VariantServiceabilityResponseDTO.WarehouseDetail.builder()
-						.serviceable(false)
-						.reason("No inventory found and default warehouse is not configured")
-						.build());
-				}
-			}
-			else {
-				for (InventoryEO inv : inventoryList) {
-					WarehouseEO wh = inv.getWarehouse();
-					if (wh == null) {
-						logger.warn(
-								"checkVariantServiceability: inventory id={} has no warehouse, falling back to default",
-								inv.getId());
-						if (cachedDefaultWarehouse != null) {
-							warehousesToCheck.add(new Object[] { cachedDefaultWarehouse, Boolean.TRUE });
-						}
-						else {
-							warehouseDetails.add(VariantServiceabilityResponseDTO.WarehouseDetail.builder()
-								.serviceable(false)
-								.reason("Warehouse not linked to inventory record and default warehouse is not configured")
-								.build());
-						}
+					if (cachedDefaultWarehouse != null) {
+						warehousesToCheck.add(new Object[] { cachedDefaultWarehouse, Boolean.TRUE });
 					}
 					else {
-						warehousesToCheck.add(new Object[] { wh, Boolean.FALSE });
+						logger.warn("checkVariantServiceability: default warehouse not found either, variantId={}",
+								variantId);
+						variantServiceable = false;
+						overallServiceable = false;
+						warehouseDetails.add(VariantServiceabilityResponseDTO.WarehouseDetail.builder()
+							.serviceable(false)
+							.reason("No inventory found and default warehouse is not configured")
+							.build());
+					}
+				}
+				else {
+					for (InventoryEO inv : inventoryList) {
+						WarehouseEO wh = inv.getWarehouse();
+						if (wh == null) {
+							logger.warn(
+									"checkVariantServiceability: inventory id={} has no warehouse, falling back to default",
+									inv.getId());
+							if (cachedDefaultWarehouse != null) {
+								warehousesToCheck.add(new Object[] { cachedDefaultWarehouse, Boolean.TRUE });
+							}
+							else {
+								warehouseDetails.add(VariantServiceabilityResponseDTO.WarehouseDetail.builder()
+									.serviceable(false)
+									.reason("Warehouse not linked to inventory record and default warehouse is not configured")
+									.build());
+							}
+						}
+						else {
+							warehousesToCheck.add(new Object[] { wh, Boolean.FALSE });
+						}
 					}
 				}
 			}
@@ -297,54 +370,18 @@ public class ShiprocketService {
 				int courierCount;
 				String reason = null;
 
-				Integer cachedCount = shiprocketResultCache.get(pickupPostcode);
-				if (cachedCount != null) {
-					// Cache hit — reuse result without a new external API call
-					if (cachedCount < 0) {
-						pairServiceable = false;
-						courierCount = 0;
-						reason = "Shiprocket API error (result cached from previous call)";
-					}
-					else {
-						courierCount = cachedCount;
-						pairServiceable = courierCount > 0;
-						if (!pairServiceable)
-							reason = "No courier companies available for this route";
-					}
+				int resolvedCount = resolveCourierCount(pickupPostcode, req.getDeliveryPostcode(),
+						shiprocketResultCache);
+				if (resolvedCount < 0) {
+					pairServiceable = false;
+					courierCount = 0;
+					reason = "Shiprocket API error while checking warehouse pincode";
 				}
 				else {
-					// Cache miss — call Shiprocket and store the result
-					courierCount = 0;
-					try {
-						String apiUrl = baseUrl + "/courier/serviceability/?pickup_postcode=" + pickupPostcode
-								+ "&delivery_postcode=" + req.getDeliveryPostcode() + "&weight=1&cod=0";
-
-						HttpEntity<Void> httpReq = new HttpEntity<>(getAuthHeaders());
-						ResponseEntity<Map> apiResp = restTemplate.exchange(apiUrl, HttpMethod.GET, httpReq, Map.class);
-
-						Map body = apiResp.getBody();
-						if (body != null) {
-							Object dataObj = body.get("data");
-							if (dataObj instanceof Map) {
-								Object couriersObj = ((Map) dataObj).get("available_courier_companies");
-								if (couriersObj instanceof List) {
-									courierCount = ((List<?>) couriersObj).size();
-								}
-							}
-						}
-						shiprocketResultCache.put(pickupPostcode, courierCount);
-						pairServiceable = courierCount > 0;
-						if (!pairServiceable)
-							reason = "No courier companies available for this route";
-					}
-					catch (Exception e) {
-						logger.error("checkVariantServiceability: Shiprocket API error for pickup={} delivery={}: {}",
-								pickupPostcode, req.getDeliveryPostcode(), e.getMessage());
-						shiprocketResultCache.put(pickupPostcode, -1); // cache the error
-																		// to skip retries
-						pairServiceable = false;
-						reason = "Shiprocket API error: " + e.getMessage();
-					}
+					courierCount = resolvedCount;
+					pairServiceable = courierCount > 0;
+					if (!pairServiceable)
+						reason = "No courier companies available for this route";
 				}
 
 				if (!pairServiceable) {
@@ -386,6 +423,49 @@ public class ShiprocketService {
 		return warehouseRepository
 			.findByWarehouseNameIgnoreCaseAndStatus(Constants.DEFAULT_WAREHOUSE_NAME, Constants.STATUS_ACTIVE)
 			.orElse(null);
+	}
+
+	/**
+	 * Calls Shiprocket's courier/serviceability API for the given pickup/delivery
+	 * postcode pair (default weight=1, cod=0) and returns the number of available
+	 * courier companies. Results (including errors, cached as -1) are memoised in the
+	 * supplied {@code cache} keyed by pickup postcode, since delivery postcode is
+	 * constant for a given {@code checkVariantServiceability} request.
+	 * @return courier count (0 or more), or -1 if the Shiprocket call failed
+	 */
+	private int resolveCourierCount(String pickupPostcode, String deliveryPostcode, Map<String, Integer> cache) {
+		Integer cached = cache.get(pickupPostcode);
+		if (cached != null) {
+			return cached;
+		}
+		int courierCount = 0;
+		try {
+			String apiUrl = baseUrl + "/courier/serviceability/?pickup_postcode=" + pickupPostcode
+					+ "&delivery_postcode=" + deliveryPostcode + "&weight=1&cod=0";
+
+			HttpEntity<Void> httpReq = new HttpEntity<>(getAuthHeaders());
+			ResponseEntity<Map> apiResp = restTemplate.exchange(apiUrl, HttpMethod.GET, httpReq, Map.class);
+
+			Map body = apiResp.getBody();
+			if (body != null) {
+				Object dataObj = body.get("data");
+				if (dataObj instanceof Map) {
+					Object couriersObj = ((Map) dataObj).get("available_courier_companies");
+					if (couriersObj instanceof List) {
+						courierCount = ((List<?>) couriersObj).size();
+					}
+				}
+			}
+			cache.put(pickupPostcode, courierCount);
+			return courierCount;
+		}
+		catch (Exception e) {
+			logger.error("resolveCourierCount: Shiprocket API error for pickup={} delivery={}: {}", pickupPostcode,
+					deliveryPostcode, e.getMessage());
+			cache.put(pickupPostcode, -1); // cache the error to skip retries within this
+											// request
+			return -1;
+		}
 	}
 
 	// ✅ Track Shipment

@@ -339,6 +339,17 @@ public class Constants {
 	 */
 	public static final String DEFAULT_WAREHOUSE_NAME = "warehouse";
 
+	/**
+	 * Flag indicating whether multi-warehouse fulfilment is configured/enabled for this
+	 * deployment. When {@code true}, serviceability checks (e.g.
+	 * {@code checkVariantServiceability}) resolve and check EVERY warehouse linked to a
+	 * variant's inventory. When {@code false}, the system is running in a single
+	 * (default) warehouse setup, so serviceability checks simply use the default
+	 * warehouse's pincode directly, skipping the per-inventory-record warehouse
+	 * resolution/iteration entirely.
+	 */
+	public static final boolean IS_MULTI_WAREHOUSE_CONFIGURED = false;
+
 	// MSG91 Email
 	public static final String MSG91_EMAIL_DOMAIN = "mail.kuchimittai.com";
 

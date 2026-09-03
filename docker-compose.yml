@@ -74,6 +74,7 @@ services:
       db:
         condition: service_healthy
     environment:
+      TZ: Asia/Kolkata
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/onlineshop
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: onlineshopping
