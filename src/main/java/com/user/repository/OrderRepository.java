@@ -4,6 +4,8 @@ import com.user.model.OrderEO;
 import com.user.model.CustomerEO;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.util.List;
 import java.util.Optional;
@@ -15,5 +17,10 @@ public interface OrderRepository extends JpaRepository<OrderEO, Long>, JpaSpecif
 	List<OrderEO> findByCustomer(CustomerEO customer);
 
 	List<OrderEO> findByCustomerAndOrderNumber(CustomerEO customer, String orderNumber);
+
+	@Query("SELECT o FROM OrderEO o WHERE o.customer = :customer AND UPPER(o.orderNumber) = UPPER(:orderNumber)")
+	List<OrderEO> findByCustomerAndOrderNumberIgnoreCase(@Param("customer") CustomerEO customer, @Param("orderNumber") String orderNumber);
+
+	List<OrderEO> findByOrderStatus(String orderStatus);
 
 }

@@ -115,6 +115,58 @@ public class ShippingController {
 		}
 	}
 
+	/**
+	 * POST /api/shipment/create
+	 *
+	 * <p>
+	 * Manually triggers shipment creation for the given order, mirroring the internal
+	 * flow normally invoked automatically after payment confirmation
+	 * ({@code ShippingServiceImpl.processCreateShipmentEvent}). Builds shipment(s) per
+	 * warehouse for the order's items and kicks off Shiprocket order creation.
+	 *
+	 * <p>
+	 * Request body: { "orderId": 123 } — "eventType" is optional and defaults to the
+	 * SHIPPED event type used internally.
+	 */
+	@PostMapping("/shipment/create")
+	public ResponseEntity<ShippingResponseDTO> createShipment(@RequestBody ShippingRequestDTO request) {
+		logger.info("Received createShipment request: orderId={}", request != null ? request.getOrderId() : null);
+		if (request == null || request.getOrderId() == null) {
+			ShippingResponseDTO response = ShippingResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("orderId must not be null")
+				.build();
+			return ResponseEntity.badRequest().body(response);
+		}
+		if ((request.getCartonNo() == null || request.getCartonNo().trim().isEmpty())
+				&& request.getRequestCreateCartonDTO() == null) {
+			ShippingResponseDTO response = ShippingResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("Either cartonNo or Required value for create carton is required.")
+				.orderId(request.getOrderId())
+				.build();
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+
+			ShippingResponseDTO response = shippingService.processCreateShipmentEvent(request);
+			if (response != null && Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("createShipment: error triggering shipment creation for orderId={}: {}",
+					request.getOrderId(), e.getMessage(), e);
+			ShippingResponseDTO response = ShippingResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("An error occurred while triggering shipment creation. Please try again later.")
+				.orderId(request.getOrderId())
+				.build();
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
 	// ──────────────────────────────────────────────────────────────────────────
 	// Carton CRUD APIs
 	// ──────────────────────────────────────────────────────────────────────────
@@ -563,6 +615,224 @@ public class ShippingController {
 			response.setResponseStatus(Constants.FAILURE_STATUS);
 			response.setResponseMessage(
 					"An error occurred while fetching the Shiprocket shipment payload. Please try again later.");
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
+	/**
+	 * GET /api/shipping/{shipmentId}
+	 *
+	 * Fetch full shipping details for a specific shipment ID, including all fields
+	 * and tracking history.
+	 */
+	@GetMapping("/shipping/{shipmentId}")
+	public ResponseEntity<ShippingDetailResponseDTO> getShippingByShipmentId(
+			@PathVariable("shipmentId") Long shipmentId) {
+		logger.info("getShippingByShipmentId called for shipmentId={}", shipmentId);
+		ShippingDetailResponseDTO response = new ShippingDetailResponseDTO();
+		if (shipmentId == null) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Shipment ID must not be null.");
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+			response = shippingService.getShippingByShipmentId(shipmentId);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.status(404).body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("getShippingByShipmentId: error for shipmentId={} — {}", shipmentId, e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while fetching shipping details. Please try again later.");
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
+	/**
+	 * POST /api/shipping
+	 *
+	 * Create a new shipping record with all fields. Used to manually save/create
+	 * shipping details for an order.
+	 *
+	 * Request body: ShippingOrderRequestDTO with all optional fields
+	 */
+	@PostMapping("/shipping")
+	public ResponseEntity<ManualShiprocketUpdateResponseDTO> saveShipping(
+			@RequestBody ShippingOrderRequestDTO request) {
+		logger.info("saveShipping called");
+		ManualShiprocketUpdateResponseDTO response = new ManualShiprocketUpdateResponseDTO();
+		if (request == null) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Request body must not be null");
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+			response = shippingService.saveShipping(request);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.status(201).body(response);
+		}
+		catch (Exception e) {
+			logger.error("saveShipping: error — {}", e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while saving shipping record. Please try again later.");
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Confirmed / Ready to Ship orders with a failed Shiprocket step
+	// ──────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * GET /api/orders/failed-shiprocket-steps
+	 *
+	 * <p>
+	 * Returns every order whose status is "Confirmed" or "Ready to Ship" (Order With
+	 * Shipping) AND which has a shipment problem — either the linked shipment has at
+	 * least one of the following Shiprocket step statuses equal to FAILURE:
+	 * shiprocketOrderStatus, generateAwbStatus, requestPickupStatus,
+	 * generateLabelStatus, trackShipmentStatus, estimateStatus — OR the order does not
+	 * have any shipment record yet.
+	 *
+	 * <p>
+	 * Orders with status "Confirmed" are fetched first, followed by orders with status
+	 * "Ready to Ship"; for each order its respective shipment is then looked up
+	 * separately.
+	 *
+	 * <p>
+	 * Each entry in the response groups the parent Order details and the corresponding
+	 * ShippingEO (shipment) details into two separate nested objects (
+	 * {@code orderDetails} and {@code shippingDetails}, the latter {@code null} when no
+	 * shipment exists yet), plus a {@code failedSteps} list identifying exactly which
+	 * step(s) failed (or {@code ["no_shipment"]}) — useful for the admin UI to surface
+	 * shipments stuck in the Shiprocket automation pipeline, or orders that never even
+	 * got a shipment created, so they can be manually retriggered/fixed.
+	 */
+	@GetMapping("/orders/failed-shiprocket-steps")
+	public ResponseEntity<FailedShiprocketOrdersResponseDTO> getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep() {
+		logger.info("Received getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep request");
+		FailedShiprocketOrdersResponseDTO response;
+		try {
+			response = shippingService.getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep();
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.status(500).body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("Error occurred while fetching failed Shiprocket step orders: {}", e.getMessage(), e);
+			FailedShiprocketOrdersResponseDTO errorResponse = FailedShiprocketOrdersResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("An error occurred while fetching failed Shiprocket step orders. Please try again later.")
+				.build();
+			return ResponseEntity.status(500).body(errorResponse);
+		}
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Order ID-based Shipping APIs
+	// ──────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * GET /api/order/{orderId}/shipping
+	 *
+	 * <p>
+	 * Fetch all shipping records for a given order ID.
+	 */
+	@GetMapping("/order/{orderId}/shipping")
+	public ResponseEntity<ShippingEntityResponseDTO> getShippingsByOrderId(@PathVariable("orderId") Long orderId) {
+		logger.info("getShippingsByOrderId called for orderId={}", orderId);
+		ShippingEntityResponseDTO response = new ShippingEntityResponseDTO();
+		if (orderId == null || orderId <= 0) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Order ID must be a valid positive number");
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+			response = shippingService.getShippingsByOrderId(orderId);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				// Check if it's a "not found" or other error
+				if (response.getResponseMessage().contains("not found")) {
+					return ResponseEntity.status(404).body(response);
+				}
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (Exception e) {
+			logger.error("Error in getShippingsByOrderId for orderId={}: {}", orderId, e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while fetching shipping records. Please try again later.");
+			return ResponseEntity.status(500).body(response);
+		}
+	}
+
+	/**
+	 * POST /api/order/{orderId}/shipping
+	 *
+	 * <p>
+	 * Create or update a shipping record for a given order ID.
+	 * If a shipping record already exists for the order, it will be updated.
+	 * Otherwise, a new record will be created.
+	 * 
+	 * <p>
+	 * If tracking number is not provided in the request, it will be automatically
+	 * generated in the format: TRK_{orderNumber}_{sequenceNumber}, where
+	 * sequenceNumber is based on the total count of all shipment records
+	 * (including cancelled ones) for this order.
+	 * 
+	 * <p>
+	 * Order Status Handling:
+	 * The API compares the existing order status in the Orders table with the
+	 * orderStatus value provided in the request payload. If they differ:
+	 * <ul>
+	 * <li>The order status is updated in the orders table</li>
+	 * <li>A new record is created in shipment_tracking_history with:
+	 *     <ul>
+	 *     <li>status: The new order status from the input</li>
+	 *     <li>location: The shipping type (FORWARD or RETURN_PICKUP)</li>
+	 *     <li>remarks: Description of the status change</li>
+	 *     </ul>
+	 * </li>
+	 * </ul>
+	 *
+	 * Request body: CreateShippingRequestDTO with all shipping details including optional orderStatus.
+	 */
+	@PostMapping("/order/{orderId}/shipping")
+	public ResponseEntity<ShippingEntityResponseDTO> createShippingForOrder(
+			@PathVariable("orderId") Long orderId,
+			@RequestBody CreateShippingRequestDTO request) {
+		logger.info("createShippingForOrder called for orderId={}", orderId);
+		ShippingEntityResponseDTO response = new ShippingEntityResponseDTO();
+		if (orderId == null || orderId <= 0) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Order ID must be a valid positive number");
+			return ResponseEntity.badRequest().body(response);
+		}
+		if (request == null) {
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("Request body must not be null");
+			return ResponseEntity.badRequest().body(response);
+		}
+		try {
+			response = shippingService.createShippingForOrder(orderId, request);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				// Check if it's a "not found" or validation error
+				if (response.getResponseMessage().contains("not found")) {
+					return ResponseEntity.status(404).body(response);
+				}
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.status(201).body(response);
+		}
+		catch (Exception e) {
+			logger.error("Error in createShippingForOrder for orderId={}: {}", orderId, e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while creating/updating shipping record. Please try again later.");
 			return ResponseEntity.status(500).body(response);
 		}
 	}

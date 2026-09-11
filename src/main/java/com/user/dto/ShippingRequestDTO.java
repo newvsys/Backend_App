@@ -1,23 +1,23 @@
-package com.user.communication.event;
-
-import com.user.dto.RequestCreateCartonDTO;
+package com.user.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+/**
+ * Request payload for manually triggering shipment creation for an order via
+ * {@code POST /api/shipment/create}. Mirrors {@link com.user.communication.event.OrderEvent}
+ * which is normally published internally (e.g. after payment confirmation) to trigger
+ * {@code ShippingServiceImpl.processCreateShipmentEvent}.
+ */
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class ShiprocketOrderEvent {
-
-	private Long shipmentId;
+public class ShippingRequestDTO {
 
 	private Long orderId;
-
-	private Long warehouseId;
 
 	/** Optional. Carton number/identifier to use for this shipment, if known upfront. */
 	private String cartonNo;
@@ -29,3 +29,4 @@ public class ShiprocketOrderEvent {
 	private Integer bestCourierId;
 
 }
+

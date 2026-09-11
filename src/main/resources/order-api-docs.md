@@ -438,6 +438,14 @@ Returns orders with their linked shipments and full shipment tracking history. U
       "customerPhone": "9876543210",
       "shippingAddress": { /* OrderAddressDTO */ },
       "billingAddress": { /* OrderAddressDTO */ },
+      "payment": {
+        "paymentMethod": "RAZORPAY",
+        "paymentProvider": "razorpay",
+        "transactionId": "pay_ABC123XYZ",
+        "amount": 220.00,
+        "paymentStatus": "PAID",
+        "paymentTime": "2026-06-08T15:46:00"
+      },
       "shipments": [
         {
           "shipmentId": 301,
@@ -486,11 +494,60 @@ Returns orders with their linked shipments and full shipment tracking history. U
             }
           ]
         }
-      ]
+      ],
+      "shiprocketOrderPayload": {
+        "orderId": "ORD-20240608-00123",
+        "orderDate": "8-6-2026",
+        "pickupLocation": "Main Warehouse",
+        "channelId": "1234567",
+        "billingCustomerName": "Ravi",
+        "billingLastName": "Kumar",
+        "billingAddress": "221B, MG Road",
+        "billingCity": "Bangalore",
+        "billingPincode": "560001",
+        "billingState": "Karnataka",
+        "billingCountry": "India",
+        "billingEmail": "ravi@example.com",
+        "billingPhone": "9876543210",
+        "shippingIsBilling": true,
+        "paymentMethod": "Prepaid",
+        "subTotal": 200.00,
+        "length": 10.0,
+        "breadth": 8.0,
+        "height": 5.0,
+        "weight": 0.5,
+        "selectedCartonName": "Medium Box",
+        "cartonSelectionError": null,
+        "orderItems": [
+          {
+            "name": "Classic T-Shirt - Red / M",
+            "sku": "TSHIRT-RED-M",
+            "units": 2,
+            "sellingPrice": 100.00,
+            "discount": 0.0,
+            "tax": 0,
+            "hsn": "610910"
+          }
+        ],
+        "alreadyCreatedOnShiprocket": true
+      }
     }
   ]
 }
 ```
+
+#### `payment` Object Fields
+
+| Field             | Type     | Description                                                                      |
+|-------------------|----------|-----------------------------------------------------------------------------------|
+| `paymentMethod`   | string   | Payment method used (e.g. `RAZORPAY`, `COD`)                                     |
+| `paymentProvider` | string   | Payment gateway/provider name                                                     |
+| `transactionId`   | string   | Provider transaction/payment ID                                                  |
+| `amount`          | decimal  | Amount paid                                                                       |
+| `paymentStatus`   | string   | Status of the payment (e.g. `PAID`, `PENDING`, `FAILED`)                          |
+| `paymentTime`     | datetime | Timestamp when the payment was completed. `null` if not yet paid                 |
+
+`payment` is `null` if no payment record exists for the order.
 
 #### Shipment Fields
 
@@ -499,6 +556,47 @@ Returns orders with their linked shipments and full shipment tracking history. U
 | `shipmentType`           | string   | `FORWARD` (delivery) or `RETURN_PICKUP` (reverse logistics)           |
 | `courierCandidates`      | array    | All couriers evaluated during serviceability check, ranked by priority |
 | `shipmentHistory`        | array    | Full tracking events in chronological order                            |
+
+#### `shiprocketOrderPayload` Object
+
+Ready-to-use payload containing everything needed to create a **new** Shiprocket order for this order via `POST /api/shipping/create-order`, built from the order's current data (billing/order info, line items, auto-selected carton dimensions/weight). Mirrors the same request-building logic used internally when a shipment is first created (`ShippingServiceImpl.processCreateShipmentEvent`). It is `null` if the payload could not be built (e.g. an unexpected error while assembling it).
+
+| Field                            | Type    | Description                                                                                                                       |
+|-----------------------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `orderId`                        | string  | Our `orderNumber`, sent as Shiprocket's `order_id`                                                                                 |
+| `orderDate`                      | string  | Order date formatted `d-M-yyyy`, as required by Shiprocket                                                                         |
+| `pickupLocation`                 | string  | Warehouse pickup location nickname registered on Shiprocket (taken from an existing shipment, if any)                             |
+| `channelId`                      | string  | Shiprocket channel ID associated with the pickup warehouse                                                                         |
+| `billingCustomerName`            | string  | Billing first name                                                                                                                  |
+| `billingLastName`                | string  | Billing last name                                                                                                                   |
+| `billingAddress`                 | string  | Billing address line                                                                                                                 |
+| `billingCity`                    | string  | Billing city                                                                                                                          |
+| `billingPincode`                 | string  | Billing pincode                                                                                                                       |
+| `billingState`                   | string  | Billing state                                                                                                                         |
+| `billingCountry`                 | string  | Billing country                                                                                                                       |
+| `billingEmail`                   | string  | Billing email                                                                                                                         |
+| `billingPhone`                   | string  | Billing phone                                                                                                                         |
+| `shippingIsBilling`              | boolean | Whether the shipping address is the same as the billing address                                                                     |
+| `paymentMethod`                  | string  | `"Prepaid"` or `"COD"`, derived from the order's payment status                                                                     |
+| `subTotal`                       | decimal | Order subtotal                                                                                                                        |
+| `length` / `breadth` / `height`  | decimal | Selected carton's outer dimensions (cm). `null` if carton selection failed                                                          |
+| `weight`                         | decimal | Total shipment weight (kg). `null` if carton selection failed                                                                       |
+| `selectedCartonName`             | string  | Name of the carton auto-selected to pack this order, if one was found                                                               |
+| `cartonSelectionError`           | string  | Populated only if carton auto-selection failed (e.g. no carton fits all items); dimensions/weight will be `null` in that case       |
+| `orderItems`                     | array   | Line items for the Shiprocket order (see below)                                                                                     |
+| `alreadyCreatedOnShiprocket`     | boolean | `true` if a Shiprocket order has already been created for one of this order's shipments — warn the admin before re-creating to avoid duplicates |
+
+##### `orderItems[]` Fields
+
+| Field          | Type    | Description                    |
+|----------------|---------|---------------------------------|
+| `name`         | string  | Product/variant display name    |
+| `sku`          | string  | Variant SKU                     |
+| `units`        | integer | Quantity ordered                |
+| `sellingPrice` | decimal | Unit selling price              |
+| `discount`     | decimal | Discount applied per unit       |
+| `tax`          | integer | Tax percentage                  |
+| `hsn`          | string  | HSN code                        |
 
 ---
 

@@ -40,7 +40,17 @@ public class ShippingEO {
 	@JoinColumn(name = "warehouse_id")
 	private WarehouseEO warehouse;
 
-	@Column(name = "tracking_number")
+	/**
+	 * Reference to the {@link CartonEO} used to pack this shipment. Populated
+	 * once a carton has been selected/created during Shiprocket order
+	 * processing (see ShippingServiceImpl#selectCartonForShipment /
+	 * #finalizeShiprocketOrderRequest).
+	 */
+	@ManyToOne(fetch = FetchType.EAGER)
+	@JoinColumn(name = "carton_no")
+	private CartonEO carton;
+
+	@Column(name = "tracking_number", unique = true, nullable = false)
 	private String trackingNumber;
 
 	@Column(name = "courier_name")
@@ -111,6 +121,30 @@ public class ShippingEO {
 
 	@Column(name = "shipping_price", precision = 10, scale = 2)
 	private BigDecimal shippingPrice;
+
+	/** Outcome (SUCCESS / FAILED / SKIPPED) of the Shiprocket CREATE_ORDER step. */
+	@Column(name = "shiprocket_order_status", length = 50)
+	private String shiprocketOrderStatus;
+
+	/** Outcome (SUCCESS / FAILED / SKIPPED) of the Shiprocket GENERATE_AWB step. */
+	@Column(name = "generate_awb_status", length = 50)
+	private String generateAwbStatus;
+
+	/** Outcome (SUCCESS / FAILED / SKIPPED) of the Shiprocket REQUEST_PICKUP step. */
+	@Column(name = "request_pickup_status", length = 50)
+	private String requestPickupStatus;
+
+	/** Outcome (SUCCESS / FAILED / SKIPPED) of the Shiprocket GENERATE_LABEL step. */
+	@Column(name = "generate_label_status", length = 50)
+	private String generateLabelStatus;
+
+	/** Outcome (SUCCESS / FAILED / SKIPPED) of the Shiprocket TRACK_SHIPMENT step. */
+	@Column(name = "track_shipment_status", length = 50)
+	private String trackShipmentStatus;
+
+	/** Outcome (SUCCESS / FAILED / NOT_AVAILABLE) of resolving estimated/expected delivery date. */
+	@Column(name = "estimate_status", length = 50)
+	private String estimateStatus;
 
 	@PrePersist
 	protected void onCreate() {

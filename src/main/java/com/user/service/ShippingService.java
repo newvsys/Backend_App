@@ -1,14 +1,14 @@
 package com.user.service;
 
-import com.user.communication.event.OrderEvent;
 import com.user.communication.event.ShiprocketOrderEvent;
 import com.user.dto.*;
+import com.user.model.OrderEO;
 
 public interface ShippingService {
 
-	void processCreateShipmentEvent(OrderEvent shippingDTO);
+	ShippingResponseDTO processCreateShipmentEvent(ShippingRequestDTO shippingDTO);
 
-	void processShiprocketOrderEvent(ShiprocketOrderEvent event);
+	ShiprocketOrderEventResponseDTO processShiprocketOrderEvent(ShiprocketOrderEvent event);
 
 	ShipTrackHistoryResponseDTO getShippingHistory(ShipTrackHistoryRequestDTO requestDTO);
 
@@ -91,5 +91,60 @@ public interface ShippingService {
 	 * @param orderNumber the customer-facing order number (OrderEO.orderNumber)
 	 */
 	RetriggerShippingResponseDTO retriggerShippingProcess(String orderNumber);
+
+	/**
+	 * GET — Fetch all orders whose status is "Confirmed" or "Ready to Ship" (Order With
+	 * Shipping) AND whose linked shipment has at least one Shiprocket step status equal
+	 * to FAILURE, across: shiprocket_order_status, generate_awb_status,
+	 * request_pickup_status, generate_label_status, track_shipment_status,
+	 * estimate_status. Each result combines the parent Order details with the
+	 * corresponding ShippingEO (shipment) details, plus the list of steps that failed.
+	 */
+	FailedShiprocketOrdersResponseDTO getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep();
+
+	/**
+	 * GET — Fetch the list of available courier services (excluding blocklisted
+	 * couriers) for the given internal order id. Pickup postcode, delivery
+	 * postcode, and shipment weight/dimensions are resolved from the order's
+	 * existing shipment (if any) and shipping address, mirroring the internal
+	 * serviceability lookup used by {@code executeFindBestCourierStep} during
+	 * automated Shiprocket processing.
+	 * @param orderId internal order id (OrderEO.orderId)
+	 */
+	AvailableCourierServicesResponseDTO getAvailableCourierServicesByOrderId(Long orderId);
+
+	/**
+	 * GET — Fetch shipping details by shipment ID. Returns the complete shipping
+	 * record with all fields and tracking history.
+	 */
+	ShippingDetailResponseDTO getShippingByShipmentId(Long shipmentId);
+
+	/**
+	 * POST — Create a new shipping record directly with all fields. Used to manually
+	 * save shipping details when creating from shipment ID.
+	 */
+	ManualShiprocketUpdateResponseDTO saveShipping(ShippingOrderRequestDTO request);
+
+	// ── Order ID-based shipment management APIs ──────────────────────────────
+
+	/**
+	 * GET — Fetch all shipping records for a given order ID.
+	 * Called by: GET /api/order/{orderId}/shipping
+	 */
+	ShippingEntityResponseDTO getShippingsByOrderId(Long orderId);
+
+	/**
+	 * POST — Create a new shipping record for the given order ID with all fields.
+	 * Called by: POST /api/order/{orderId}/shipping
+	 */
+	ShippingEntityResponseDTO createShippingForOrder(Long orderId, CreateShippingRequestDTO request);
+
+	/**
+	 * Create an initial shipment record after successful payment confirmation.
+	 * Creates a ShippingEO with PENDING status and a corresponding ShipmentTrackingHistoryEO
+	 * with status "Order Confirmed" and warehouse location.
+	 * This is a best-effort operation that won't fail the payment process if it encounters errors.
+	 */
+	void createInitialShipmentAfterPayment(OrderEO order);
 
 }

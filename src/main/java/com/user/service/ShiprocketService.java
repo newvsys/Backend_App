@@ -742,6 +742,99 @@ public class ShiprocketService {
 	}
 
 	/**
+	 * Returns the list of available courier services for the given pickup/delivery
+	 * pair, EXCLUDING any courier whose courier_company_id is present in
+	 * {@link Constants#BLOCKLISTED_COURIER_COMPANY_IDS}. Each entry contains the
+	 * courier id, name, price, delivery estimate, rating, and COD availability.
+	 * @param req serviceability request parameters (deliveryPostcode required)
+	 * @return list of {@link com.user.dto.CourierServiceDTO}, ordered as returned by
+	 * Shiprocket (may be empty, never null)
+	 */
+	public List<com.user.dto.CourierServiceDTO> getAvailableCourierServicesExcludingBlocklisted(
+			ServiceabilityRequestDTO req) {
+		List<com.user.dto.CourierServiceDTO> result = new ArrayList<>();
+		Map serviceabilityResponse = checkServiceAvailability(req);
+		if (serviceabilityResponse == null) {
+			logger.warn("getAvailableCourierServicesExcludingBlocklisted: null response from serviceability API");
+			return result;
+		}
+
+		Object dataObj = serviceabilityResponse.get("data");
+		if (!(dataObj instanceof Map)) {
+			logger.warn("getAvailableCourierServicesExcludingBlocklisted: 'data' missing or not a Map");
+			return result;
+		}
+		Object couriersObj = ((Map) dataObj).get("available_courier_companies");
+		if (!(couriersObj instanceof List)) {
+			logger.warn("getAvailableCourierServicesExcludingBlocklisted: 'available_courier_companies' missing");
+			return result;
+		}
+
+		List<Map> couriers = (List<Map>) couriersObj;
+		for (Map courier : couriers) {
+			Object idObj = courier.get("courier_company_id");
+			if (idObj == null)
+				idObj = courier.get("id");
+			Integer courierId = idObj instanceof Number ? ((Number) idObj).intValue() : null;
+
+			if (courierId != null && Constants.BLOCKLISTED_COURIER_COMPANY_IDS.contains(courierId)) {
+				logger.debug("getAvailableCourierServicesExcludingBlocklisted: skipping blocklisted courierId={}",
+						courierId);
+				continue;
+			}
+
+			double rate = extractDouble(courier, "rate");
+			if (rate <= 0)
+				rate = extractDouble(courier, "freight_charge");
+
+			Object codObj = courier.get("cod");
+			Boolean codAvailable = null;
+			if (codObj instanceof Number)
+				codAvailable = ((Number) codObj).intValue() == 1;
+			else if (codObj instanceof String)
+				codAvailable = "1".equals(codObj) || Boolean.parseBoolean((String) codObj);
+
+			Object airObj = courier.get("air_max_weight");
+			Boolean isAir = null;
+			Object modeObj = courier.get("is_surface");
+			Boolean isSurface = null;
+			if (modeObj instanceof Boolean) {
+				isSurface = (Boolean) modeObj;
+				isAir = !isSurface;
+			}
+			else if (modeObj instanceof Number) {
+				isSurface = ((Number) modeObj).intValue() == 1;
+				isAir = !isSurface;
+			}
+
+			Object etdObj = courier.get("etd");
+			Object ratingObj = courier.get("rating");
+
+			com.user.dto.CourierServiceDTO dto = com.user.dto.CourierServiceDTO.builder()
+				.courierId(courierId)
+				.courierName(courier.get("courier_name") instanceof String ? (String) courier.get("courier_name")
+						: null)
+				.price(rate)
+				.codCharges(extractDouble(courier, "cod_charges"))
+				.otherCharges(extractDouble(courier, "other_charges"))
+				.estimatedDeliveryDays(extractDouble(courier, "estimated_delivery_days"))
+				.estimatedDeliveryDate(etdObj instanceof String ? (String) etdObj : null)
+				.rating(ratingObj instanceof Number ? ((Number) ratingObj).doubleValue() : null)
+				.codAvailable(codAvailable)
+				.isAir(isAir)
+				.isSurface(isSurface)
+				.build();
+
+			result.add(dto);
+		}
+
+		logger.info(
+				"getAvailableCourierServicesExcludingBlocklisted: returning {} courier(s) after excluding blocklisted",
+				result.size());
+		return result;
+	}
+
+	/**
 	 * Transfers (reassigns) a Shiprocket shipment to a different courier. Shiprocket API:
 	 * POST /courier/reassign
 	 * @param shipmentId Shiprocket shipment_id

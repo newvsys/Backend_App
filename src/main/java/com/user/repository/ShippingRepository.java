@@ -15,6 +15,9 @@ public interface ShippingRepository extends JpaRepository<ShippingEO, Long> {
 
 	ShippingEO findByTrackingNumber(String trackingNumber);
 
+	@Query("SELECT s FROM ShippingEO s WHERE s.trackingNumber = :trackingNumber AND s.shipmentStatus != 'CANCELLED'")
+	ShippingEO findByTrackingNumberNonCancelled(@Param("trackingNumber") String trackingNumber);
+
 	List<ShippingEO> findByShipmentStatus(String shipmentStatus);
 
 	Optional<ShippingEO> findByShipShipmentId(Integer shipShipmentId);
@@ -27,5 +30,17 @@ public interface ShippingRepository extends JpaRepository<ShippingEO, Long> {
 	@Query("SELECT s FROM ShippingEO s JOIN s.order o WHERE (:status IS NULL OR s.shipmentStatus = :status) AND (:orderNumber IS NULL OR o.orderNumber = :orderNumber) ORDER BY s.createdAt DESC")
 	List<ShippingEO> findAllByOptionalStatusAndOrderNumber(@Param("status") String status,
 			@Param("orderNumber") String orderNumber);
+
+	@Query("SELECT s FROM ShippingEO s WHERE s.order.orderId = :orderId AND s.shipmentStatus != 'CANCELLED' ORDER BY s.createdAt DESC")
+	List<ShippingEO> findByOrderId(@Param("orderId") Long orderId);
+
+	@Query(value = "SELECT s.* FROM shipping s WHERE s.order_id = :orderId AND s.shipment_status != 'CANCELLED' ORDER BY s.created_at DESC LIMIT 1", nativeQuery = true)
+	Optional<ShippingEO> findFirstByOrderId(@Param("orderId") Long orderId);
+
+	@Query("SELECT s FROM ShippingEO s WHERE s.order.orderId = :orderId ORDER BY s.createdAt DESC")
+	List<ShippingEO> findAllByOrderId(@Param("orderId") Long orderId);
+
+	@Query("SELECT COUNT(s) FROM ShippingEO s WHERE s.order.orderId = :orderId")
+	long countByOrderId(@Param("orderId") Long orderId);
 
 }

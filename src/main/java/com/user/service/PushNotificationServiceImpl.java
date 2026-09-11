@@ -130,6 +130,40 @@ public class PushNotificationServiceImpl implements PushNotificationService {
 	}
 
 	@Override
+	public void notifyAdminsProcessShipping(OrderEO order) {
+		if (order == null) {
+			return;
+		}
+		if (!isFirebaseReady()) {
+			logger.debug(
+					"Firebase not initialized/enabled. Skipping order-confirmed push notification for order={}",
+					order.getOrderNumber());
+			return;
+		}
+
+		List<DeviceTokenEO> tokens = deviceTokenRepository.findByRoleAndActiveTrue(Constants.ROLE_ADMIN);
+		if (tokens.isEmpty()) {
+			logger.debug(
+					"No active admin device tokens found. Skipping order-confirmed push notification for order={}",
+					order.getOrderNumber());
+			return;
+		}
+
+		String title = "Order Confirmed - Process Shipping";
+		String body = String.format("Payment received for order #%s. Please process shipping.",
+				order.getOrderNumber());
+
+		Map<String, String> data = new HashMap<>();
+		data.put("type", Constants.ORDER_EVENT_TYPE_CONFIRMED);
+		data.put("orderNumber", order.getOrderNumber() != null ? order.getOrderNumber() : "");
+		data.put("orderId", order.getOrderId() != null ? String.valueOf(order.getOrderId()) : "");
+
+		for (DeviceTokenEO deviceToken : tokens) {
+			sendToToken(deviceToken, title, body, data);
+		}
+	}
+
+	@Override
 	public void notifyAdminsNewCarton(CartonEO carton) {
 		if (carton == null) {
 			return;
@@ -159,6 +193,41 @@ public class PushNotificationServiceImpl implements PushNotificationService {
 		data.put("breadth", String.valueOf(carton.getBreadth()));
 		data.put("height", String.valueOf(carton.getHeight()));
 		data.put("maxWeight", String.valueOf(carton.getMaxWeight()));
+
+		for (DeviceTokenEO deviceToken : tokens) {
+			sendToToken(deviceToken, title, body, data);
+		}
+	}
+
+	/**
+	 * Sends a "no carton fits this order" push notification to all registered
+	 * admin devices when {@code CartonSelectionService} could not find any active
+	 * carton large/strong enough for an order. Automatic carton creation is
+	 * disabled, so a suitable carton must be added manually via the admin carton
+	 * API before the shipment can proceed.
+	 */
+	@Override
+	public void notifyAdminsNoCartonFit(double requiredVolumeCm3, double requiredWeightKg) {
+		if (!isFirebaseReady()) {
+			logger.debug("Firebase not initialized/enabled. Skipping no-carton-fit push notification.");
+			return;
+		}
+
+		List<DeviceTokenEO> tokens = deviceTokenRepository.findByRoleAndActiveTrue(Constants.ROLE_ADMIN);
+		if (tokens.isEmpty()) {
+			logger.debug("No active admin device tokens found. Skipping no-carton-fit push notification.");
+			return;
+		}
+
+		String title = "No Carton Available";
+		String body = String.format(
+				"No existing carton fits this order (needs ~%.2f cm³, %.2f kg). Please add a suitable carton via the admin carton API.",
+				requiredVolumeCm3, requiredWeightKg);
+
+		Map<String, String> data = new HashMap<>();
+		data.put("type", Constants.CARTON_EVENT_TYPE_NOT_FOUND);
+		data.put("requiredVolumeCm3", String.valueOf(requiredVolumeCm3));
+		data.put("requiredWeightKg", String.valueOf(requiredWeightKg));
 
 		for (DeviceTokenEO deviceToken : tokens) {
 			sendToToken(deviceToken, title, body, data);

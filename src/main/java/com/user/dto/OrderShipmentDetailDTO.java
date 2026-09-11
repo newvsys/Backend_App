@@ -49,7 +49,17 @@ public class OrderShipmentDetailDTO {
 
 	private OrderAddressDTO billingAddress;
 
+	/** Payment details (method, provider, transaction id, amount, status, time). */
+	private PaymentInfoDTO payment;
+
 	/** All shipments linked to this order. One order can have multiple shipments. */
 	private List<ShipmentInfoDTO> shipments;
+
+	/**
+	 * Ready-to-use payload with all fields required to create a NEW Shiprocket order
+	 * for this order (billing details, order items, dimensions/weight, payment
+	 * method, etc.) — built from the order's current data.
+	 */
+	private ShiprocketOrderPayloadDTO shiprocketOrderPayload;
 
 }

@@ -2,7 +2,7 @@
 
 **Base URL:** `http://localhost:8080/api`  
 **Controller:** `ShippingController`  
-**Last Updated:** 2026-08-14
+**Last Updated:** 2026-09-09
 
 ---
 
@@ -11,6 +11,7 @@
 1. [Shipping History](#1-shipping-history)
 2. [List All Shipments](#2-list-all-shipments)
 3. [Update Shipment Status](#3-update-shipment-status)
+3a. [Create Shipment (Manual Trigger)](#3a-create-shipment-manual-trigger)
 4. [Carton Management](#4-carton-management)
    - 4.1 [Get All Cartons](#41-get-all-cartons)
    - 4.2 [Get Carton by ID](#42-get-carton-by-id)
@@ -30,7 +31,11 @@
    - 8.2 [Update Shipping by Order Number](#82-update-shipping-by-order-number)
    - 8.3 [Create Shipping by Order Number](#83-create-shipping-by-order-number)
    - 8.4 [Get Live Shiprocket PUT Payload by Order Number](#84-get-live-shiprocket-put-payload-by-order-number)
-9. [Retrigger Shipping Process](#9-retrigger-shipping-process)
+9. [Order ID Based Shipment Management](#9-order-id-based-shipment-management)
+   - 9.1 [Get Shipping Records by Order ID](#91-get-shipping-records-by-order-id)
+   - 9.2 [Create Shipping Record by Order ID](#92-create-shipping-record-by-order-id)
+10. [Retrigger Shipping Process](#10-retrigger-shipping-process)
+11. [Failed Shiprocket Step Orders](#11-failed-shiprocket-step-orders)
 
 ---
 
@@ -175,6 +180,83 @@ POST /api/shipment-status-update
 |--------|----------------------------------------|
 | 400    | trackingNumber or status is null/empty |
 | 500    | Internal server error                  |
+
+---
+
+## 3a. Create Shipment (Manual Trigger)
+
+Manually triggers shipment creation for a confirmed order, mirroring the internal flow that is normally invoked automatically after payment confirmation (`processCreateShipmentEvent`). Builds one shipment per warehouse for the order's items (grouped by warehouse) and kicks off the Shiprocket order-creation pipeline (create order → select best courier → generate AWB → request pickup → generate label → track shipment) for each.
+
+```
+POST /api/shipment/create
+```
+
+### Request Body
+
+Either `cartonNo` (an existing carton) **or** `requestCreateCartonDTO` (details to create a new carton on the fly) must be supplied.
+
+```json
+{
+  "orderId": 55,
+  "cartonNo": "1",
+  "requestCreateCartonDTO": null,
+  "bestCourierId": 7
+}
+```
+
+| Field                   | Type                | Required | Description                                                              |
+|-------------------------|---------------------|----------|---------------------------------------------------------------------------|
+| orderId                 | Long                | Yes      | Internal order ID (PK)                                                    |
+| cartonNo                | String              | Conditional | ID of an existing carton to use. Required if `requestCreateCartonDTO` is not supplied |
+| requestCreateCartonDTO  | RequestCreateCartonDTO | Conditional | Details to create a brand-new carton. Required if `cartonNo` is not supplied |
+| bestCourierId           | Integer             | No       | Preferred courier company ID to use instead of auto-selecting the best courier |
+
+**`requestCreateCartonDTO` fields** (same shape as [4.3 Create Carton](#43-create-carton) request body):
+
+| Field       | Type   | Description                  |
+|-------------|--------|-------------------------------|
+| name        | String | Carton name/label             |
+| length      | Double | Length in cm                  |
+| breadth     | Double | Breadth in cm                 |
+| height      | Double | Height in cm                  |
+| maxWeight   | Double | Max payload weight            |
+| emptyWeight | Double | Empty carton weight           |
+| who         | String | Creator identifier            |
+
+### Behaviour
+
+- Validates `orderId` and fetches the order; fails if the order does not exist.
+- **Idempotent:** if a non-cancelled FORWARD shipment already exists for the order and all Shiprocket pipeline steps (`shiprocket_order_status`, `generate_awb_status`, `request_pickup_status`, `generate_label_status`, `track_shipment_status`) are already `SUCCESS`, no duplicate shipment is created and a `FAILURE` response is returned.
+- If a FORWARD shipment exists but the pipeline is incomplete/failed, the existing shipment's Shiprocket processing is resumed instead of creating new shipment/shipment-item records.
+- Otherwise, the order's items are grouped by warehouse and one `ShippingEO` (+ `ShipmentItemEO` rows + an initial `CREATED` tracking-history entry) is created per warehouse, after which the Shiprocket order-creation flow is triggered for each.
+
+### Response – 200 OK
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Shipment(s) created and Shiprocket processing triggered successfully.",
+  "orderId": 55,
+  "shipmentIds": [101]
+}
+```
+
+### Error Responses
+
+| Status | Condition                                                                 |
+|--------|-----------------------------------------------------------------------------|
+| 400    | `orderId` is null                                                            |
+| 400    | Neither `cartonNo` nor `requestCreateCartonDTO` is supplied                  |
+| 400    | Order not found, no warehouse-mapped items found, or shipment already fully processed (`responseStatus: FAILURE` in body) |
+| 500    | Internal server error                                                       |
+
+### cURL Example
+
+```bash
+curl -X POST "http://localhost:8080/api/shipment/create" \
+  -H "Content-Type: application/json" \
+  -d '{"orderId": 55, "cartonNo": "1"}'
+```
 
 ---
 
@@ -1140,7 +1222,262 @@ curl -X GET "http://localhost:8080/api/shipment/order/ORD-20260601-001/shiprocke
 
 ---
 
-## 9. Retrigger Shipping Process
+## 9. Order ID Based Shipment Management
+
+APIs for fetching and creating shipping records using Order ID (not Order Number). These endpoints provide a simpler alternative to order-number based APIs for direct Order ID lookups.
+
+### 9.1 Get Shipping Records by Order ID
+
+Fetch all shipping records associated with a given Order ID.
+
+```
+GET /api/order/{orderId}/shipping
+```
+
+#### Path Parameters
+
+| Parameter | Type | Required | Description               |
+|-----------|------|----------|---------------------------|
+| orderId   | Long | Yes      | Internal order ID (e.g. 55) |
+
+#### Response – 200 OK
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Shipping records fetched successfully. Total: 1",
+  "data": [
+    {
+      "shipmentId": 101,
+      "orderId": 55,
+      "orderNumber": "ORD-20260601-001",
+      "cartonId": 2,
+      "cartonNo": "BOX-L",
+      "trackingNumber": "TRK-ORD-20260601-001_1",
+      "courierName": "Delhivery",
+      "type": "FORWARD",
+      "shipmentStatus": "PICKUP_SCHEDULED",
+      "shippedDate": null,
+      "deliveredDate": null,
+      "length": 20.0,
+      "breadth": 15.0,
+      "height": 10.0,
+      "weight": 1.2,
+      "awb": "AWBXYZ123",
+      "labelUrl": "https://shiprocket.co/label/AWBXYZ123.pdf",
+      "shipOrderId": 9900001,
+      "shipShipmentId": 8800001,
+      "pickupId": 9876,
+      "pickupScheduledDate": "2026-06-03T09:00:00",
+      "pickupToken": "TKN-987",
+      "courierCompanyId": 7,
+      "estimatedDeliveryDate": "2026-06-08T00:00:00",
+      "expectedDeliveryDate": "2026-06-07T00:00:00",
+      "trackUrl": "https://shiprocket.co/track/AWBXYZ123",
+      "shippingPrice": 48.50,
+      "shiprocketOrderStatus": "SUCCESS",
+      "generateAwbStatus": "SUCCESS",
+      "requestPickupStatus": "SUCCESS",
+      "generateLabelStatus": "SUCCESS",
+      "trackShipmentStatus": "SUCCESS",
+      "estimateStatus": "SUCCESS",
+      "warehouseId": 1,
+      "createdAt": "2026-06-01T08:30:00",
+      "updatedAt": "2026-06-04T14:00:00"
+    }
+  ],
+  "count": 1
+}
+```
+
+#### Response Fields
+
+| Field          | Type      | Description                                                      |
+|----------------|-----------|------------------------------------------------------------------|
+| responseStatus | String    | `SUCCESS` or `FAILURE`                                            |
+| responseMessage| String    | Human-readable result or error                                    |
+| data           | Array     | List of shipping records for the order                            |
+| data[].* | — | All ShippingEO fields (see above)                                 |
+| count          | Integer   | Number of shipping records returned                               |
+
+#### Error Responses
+
+| Status | Condition                                   |
+|--------|---------------------------------------------|
+| 400    | orderId is null or not a positive number    |
+| 404    | Order not found with the given orderId      |
+| 500    | Internal server error                       |
+
+#### cURL Example
+
+```bash
+curl -X GET "http://localhost:8080/api/order/55/shipping" \
+  -H "accept: application/json"
+```
+
+---
+
+### 9.2 Create Shipping Record by Order ID
+
+Create a new shipping record for a given Order ID with all fields.
+
+```
+POST /api/order/{orderId}/shipping
+```
+
+#### Path Parameters
+
+| Parameter | Type | Required | Description               |
+|-----------|------|----------|---------------------------|
+| orderId   | Long | Yes      | Internal order ID (e.g. 55) |
+
+#### Request Body
+
+All fields are optional except `cartonId` and `type`.
+
+```json
+{
+  "cartonId": 2,
+  "trackingNumber": "TRK-ORD-20260601-001_1",
+  "courierName": "Delhivery",
+  "type": "FORWARD",
+  "shipmentStatus": "CREATED",
+  "shippedDate": null,
+  "deliveredDate": null,
+  "length": 20.0,
+  "breadth": 15.0,
+  "height": 10.0,
+  "weight": 1.2,
+  "awb": "AWBXYZ123",
+  "labelUrl": "https://shiprocket.co/label/AWBXYZ123.pdf",
+  "shipOrderId": 9900001,
+  "shipShipmentId": 8800001,
+  "pickupId": 9876,
+  "pickupScheduledDate": "2026-06-03T09:00:00",
+  "pickupToken": "TKN-987",
+  "courierCompanyId": 7,
+  "estimatedDeliveryDate": "2026-06-08T00:00:00",
+  "expectedDeliveryDate": "2026-06-07T00:00:00",
+  "trackUrl": "https://shiprocket.co/track/AWBXYZ123",
+  "shippingPrice": 48.50,
+  "shiprocketOrderStatus": "SUCCESS",
+  "generateAwbStatus": "SUCCESS",
+  "requestPickupStatus": "SUCCESS",
+  "generateLabelStatus": "SUCCESS",
+  "trackShipmentStatus": "SUCCESS",
+  "estimateStatus": "SUCCESS",
+  "warehouseId": 1
+}
+```
+
+#### Request Fields
+
+| Field                  | Type       | Required | Description                                     |
+|------------------------|------------|----------|-------------------------------------------------|
+| cartonId               | Long       | **Yes**  | ID of the CartonEO to use for this shipment     |
+| type                   | String     | **Yes**  | `FORWARD` or `RETURN_PICKUP`                    |
+| trackingNumber         | String     | No       | Internal tracking number                        |
+| courierName            | String     | No       | Courier name                                    |
+| shipmentStatus         | String     | No       | Initial shipment status (e.g. `CREATED`)        |
+| shippedDate            | DateTime   | No       | Date when shipped (ISO format)                  |
+| deliveredDate          | DateTime   | No       | Date when delivered (ISO format)                |
+| length                 | Double     | No       | Parcel length (cm)                              |
+| breadth                | Double     | No       | Parcel breadth (cm)                             |
+| height                 | Double     | No       | Parcel height (cm)                              |
+| weight                 | Double     | No       | Parcel weight (kg)                              |
+| awb                    | String     | No       | AWB code                                        |
+| labelUrl               | String     | No       | Label PDF URL                                   |
+| shipOrderId            | Integer    | No       | Shiprocket order ID                             |
+| shipShipmentId         | Integer    | No       | Shiprocket shipment ID                          |
+| pickupId               | Long       | No       | Shiprocket pickup ID                            |
+| pickupScheduledDate    | DateTime   | No       | Scheduled pickup date (ISO format)              |
+| pickupToken            | String     | No       | Pickup token from Shiprocket                    |
+| courierCompanyId       | Integer    | No       | Courier company ID                              |
+| estimatedDeliveryDate  | DateTime   | No       | Estimated delivery date (ISO format)            |
+| expectedDeliveryDate   | DateTime   | No       | Expected delivery date (ISO format)             |
+| trackUrl               | String     | No       | Public tracking URL                             |
+| shippingPrice          | BigDecimal | No       | Shipping cost (INR)                             |
+| shiprocketOrderStatus  | String     | No       | Shiprocket order creation status                |
+| generateAwbStatus      | String     | No       | AWB generation status                           |
+| requestPickupStatus    | String     | No       | Pickup request status                           |
+| generateLabelStatus    | String     | No       | Label generation status                         |
+| trackShipmentStatus    | String     | No       | Tracking status                                 |
+| estimateStatus         | String     | No       | Delivery estimate status                        |
+| warehouseId            | Long       | No       | Warehouse ID (optional reference)               |
+
+#### Response – 201 Created
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Shipping record created successfully",
+  "shipping": {
+    "shipmentId": 102,
+    "orderId": 55,
+    "orderNumber": "ORD-20260601-001",
+    "cartonId": 2,
+    "cartonNo": "BOX-L",
+    "trackingNumber": "TRK-ORD-20260601-001_1",
+    "courierName": "Delhivery",
+    "type": "FORWARD",
+    "shipmentStatus": "CREATED",
+    "length": 20.0,
+    "breadth": 15.0,
+    "height": 10.0,
+    "weight": 1.2,
+    "awb": "AWBXYZ123",
+    "labelUrl": "https://shiprocket.co/label/AWBXYZ123.pdf",
+    "shipOrderId": 9900001,
+    "shipShipmentId": 8800001,
+    "pickupId": 9876,
+    "pickupScheduledDate": "2026-06-03T09:00:00",
+    "pickupToken": "TKN-987",
+    "courierCompanyId": 7,
+    "estimatedDeliveryDate": "2026-06-08T00:00:00",
+    "expectedDeliveryDate": "2026-06-07T00:00:00",
+    "trackUrl": null,
+    "shippingPrice": 48.50,
+    "shiprocketOrderStatus": "SUCCESS",
+    "generateAwbStatus": "SUCCESS",
+    "requestPickupStatus": "SUCCESS",
+    "generateLabelStatus": "SUCCESS",
+    "trackShipmentStatus": "SUCCESS",
+    "estimateStatus": "SUCCESS",
+    "warehouseId": 1,
+    "createdAt": "2026-09-10T14:30:45",
+    "updatedAt": "2026-09-10T14:30:45"
+  }
+}
+```
+
+#### Error Responses
+
+| Status | Condition                                          |
+|--------|---------------------------------------------------|
+| 400    | orderId is null/invalid, or cartonId is missing  |
+| 404    | Order not found, or Carton not found             |
+| 500    | Internal server error                             |
+
+#### cURL Example
+
+```bash
+curl -X POST "http://localhost:8080/api/order/55/shipping" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cartonId": 2,
+    "type": "FORWARD",
+    "courierName": "Delhivery",
+    "shipmentStatus": "CREATED",
+    "length": 20.0,
+    "breadth": 15.0,
+    "height": 10.0,
+    "weight": 1.2
+  }'
+```
+
+---
+
+## 10. Retrigger Shipping Process
 
 Manually re-run the Shiprocket shipping process (find best courier → generate AWB → request pickup → generate label → track shipment) for an order whose shipment(s) previously failed or need manual intervention (e.g. status `MANUAL_PROCESSING_REQUIRED`, or a shipment stuck without an AWB/label). Used by the admin UI as a one-click retry action.
 
@@ -1282,6 +1619,226 @@ curl -X POST "http://localhost:8080/api/order/ORD-20260601-001/retrigger-shippin
 
 ---
 
+## 10. Failed Shiprocket Step Orders
+
+Returns every order whose status is `Confirmed` or `Ready to Ship` **and** which has a problem with its shipment — either:
+
+- the linked shipment has at least one Shiprocket pipeline step with status `FAILURE`, **or**
+- the order does not have a shipment record at all yet (`shippingDetails` will be `null` and `failedSteps` will contain `"no_shipment"`).
+
+Useful for the admin UI to surface shipments stuck in the Shiprocket automation pipeline so they can be manually retriggered ([Section 9](#9-retrigger-shipping-process)) or fixed via [manual override](#7-manual-shiprocket-override) — as well as orders that never even got a shipment created.
+
+The following step fields are checked: `shiprocketOrderStatus`, `generateAwbStatus`, `requestPickupStatus`, `generateLabelStatus`, `trackShipmentStatus`, `estimateStatus`.
+
+**Fetch logic:** orders with status `Confirmed` are fetched first, followed by orders with status `Ready to Ship`; for each order, its most relevant shipment (an active, non-cancelled `FORWARD` shipment if one exists, otherwise the first shipment record, otherwise `null`) is looked up and combined with the order into a single result entry.
+
+```
+GET /api/orders/failed-shiprocket-steps
+```
+
+### Response – 200 OK
+
+Each entry in `orders` groups the order and shipment details into two separate nested objects, `orderDetails` and `shippingDetails`, plus a `failedSteps` list.
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Fetched 2 Confirmed/Ready to Ship order(s) with at least one failed Shiprocket step or no shipment.",
+  "totalCount": 2,
+  "orders": [
+    {
+      "orderDetails": {
+        "orderId": 55,
+        "orderNumber": "ORD-20260601-001",
+        "orderStatus": "Confirmed",
+        "paymentStatus": "PAID",
+        "totalAmount": 1499.00,
+        "orderCreatedAt": "2026-06-01T11:55:00",
+        "customerName": "John Doe",
+        "customerEmail": "john.doe@example.com",
+        "customerMobile": "9876543210"
+      },
+       "shippingDetails": {
+         "shipmentId": 101,
+         "trackingNumber": "TRK-ORD-20260601-001_1",
+         "shipmentType": "FORWARD",
+         "shipmentStatus": "MANUAL_PROCESSING_REQUIRED",
+         "awb": null,
+         "courierName": null,
+         "courierCompanyId": null,
+         "shippingPrice": null,
+         "shippedDate": null,
+         "deliveredDate": null,
+         "shipmentCreatedAt": "2026-06-01T12:00:00",
+         "shipmentUpdatedAt": "2026-06-01T12:05:00",
+         "cartonId": 3,
+         "length": 20.0,
+         "breadth": 15.0,
+         "height": 10.0,
+         "weight": 1.2,
+         "labelUrl": null,
+         "shipOrderId": 987654,
+         "shipShipmentId": 123456,
+         "pickupId": null,
+         "pickupToken": null,
+         "estimatedDeliveryDate": null,
+         "expectedDeliveryDate": null,
+         "trackUrl": null,
+         "shiprocketOrderStatus": "SUCCESS",
+         "generateAwbStatus": "FAILURE",
+         "requestPickupStatus": null,
+         "generateLabelStatus": null,
+         "trackShipmentStatus": null,
+         "estimateStatus": "SUCCESS",
+         "shiprocketOrderStatuslog": [
+           {
+             "id": 1,
+             "status": "SUCCESS",
+             "errorMessage": null,
+             "shiprocketResponse": "{\"order_id\": 987654, \"shipment_id\": 123456}",
+             "createdAt": "2026-06-01T12:05:00",
+             "updatedAt": "2026-06-01T12:05:00"
+           }
+         ],
+         "generateAwbStatuslog": [
+           {
+             "id": 2,
+             "status": "FAILURE",
+             "errorMessage": "No serviceable courier found for the given pincode",
+             "shiprocketResponse": "{\"error\": \"no_courier\"}",
+             "createdAt": "2026-06-01T12:10:00",
+             "updatedAt": "2026-06-01T12:10:00"
+           }
+         ],
+         "requestPickupStatuslog": [],
+         "generateLabelStatuslog": [],
+         "trackShipmentStatuslog": [],
+          "estimateStatuslog": [
+            {
+              "id": 3,
+              "status": "SUCCESS",
+              "errorMessage": null,
+              "shiprocketResponse": "{\"estimated_delivery_date\": \"2026-06-08\"}",
+              "createdAt": "2026-06-01T12:03:00",
+              "updatedAt": "2026-06-01T12:03:00"
+            }
+          ],
+          "shipmentlogs": [
+            {
+              "id": 5,
+              "shipmentId": 101,
+              "orderId": 55,
+              "warehouseId": 1,
+              "step": "CREATE_ORDER",
+              "status": "SUCCESS",
+              "shiprocketOrderId": 987654,
+              "shiprocketShipmentId": 123456,
+              "awbCode": null,
+              "labelUrl": null,
+              "errorMessage": null,
+              "createdAt": "2026-06-01T12:05:00",
+              "updatedAt": "2026-06-01T12:05:00"
+            },
+            {
+              "id": 6,
+              "shipmentId": 101,
+              "orderId": 55,
+              "warehouseId": 1,
+              "step": "GENERATE_AWB",
+              "status": "ATTEMPT_FAILED",
+              "shiprocketOrderId": 987654,
+              "shiprocketShipmentId": 123456,
+              "awbCode": null,
+              "labelUrl": null,
+              "errorMessage": "No serviceable courier found for the given pincode",
+              "createdAt": "2026-06-01T12:10:00",
+              "updatedAt": "2026-06-01T12:10:00"
+            },
+            {
+              "id": 7,
+              "shipmentId": 101,
+              "orderId": 55,
+              "warehouseId": 1,
+              "step": "ESTIMATE_STATUS",
+              "status": "SUCCESS",
+              "shiprocketOrderId": 987654,
+              "shiprocketShipmentId": 123456,
+              "awbCode": null,
+              "labelUrl": null,
+              "errorMessage": null,
+              "createdAt": "2026-06-01T12:03:00",
+              "updatedAt": "2026-06-01T12:03:00"
+            }
+          ]
+        },
+      "failedSteps": ["generate_awb_status"]
+    },
+    {
+      "orderDetails": {
+        "orderId": 58,
+        "orderNumber": "ORD-20260605-004",
+        "orderStatus": "Ready to Ship",
+        "paymentStatus": "PAID",
+        "totalAmount": 799.00,
+        "orderCreatedAt": "2026-06-05T09:30:00",
+        "customerName": "Jane Smith",
+        "customerEmail": "jane.smith@example.com",
+        "customerMobile": "9876500000"
+      },
+      "shippingDetails": null,
+      "failedSteps": ["no_shipment"]
+    }
+  ]
+}
+```
+
+### Response Fields
+
+| Field                                     | Type    | Description                                                              |
+|--------------------------------------------|---------|----------------------------------------------------------------------------|
+| responseStatus                             | String  | `SUCCESS` or `FAILURE`                                                    |
+| responseMessage                            | String  | Human-readable result or error                                            |
+| totalCount                                 | int     | Number of orders returned                                                 |
+| orders                                     | Array   | One entry per Confirmed/Ready-to-Ship order that has a failed step or no shipment |
+| orders[].orderDetails                      | Object  | Parent order details (see below)                                          |
+| orders[].orderDetails.orderId / orderNumber / orderStatus / paymentStatus / totalAmount / orderCreatedAt | — | Core order fields |
+| orders[].orderDetails.customerName / customerEmail / customerMobile | String | Customer contact details for the order |
+| orders[].shippingDetails                   | Object or `null` | The order's shipment details, or `null` if the order has no shipment record yet |
+| orders[].shippingDetails.shipmentId / trackingNumber / shipmentType / shipmentStatus | — | Linked shipment identifiers/status |
+| orders[].shippingDetails.awb / courierName / courierCompanyId / shippingPrice | — | Courier/AWB details, if assigned |
+| orders[].shippingDetails.shippedDate / deliveredDate / shipmentCreatedAt / shipmentUpdatedAt | — | Shipment timestamps |
+| orders[].shippingDetails.cartonId                | Long or `null` | Id of the `CartonEO` used to pack this shipment, if a carton has been selected |
+| orders[].shippingDetails.length / breadth / height / weight | Double | Shipment package dimensions (cm) and weight (kg) used for the Shiprocket order |
+| orders[].shippingDetails.labelUrl                | String or `null` | URL of the generated shipping label, once available |
+| orders[].shippingDetails.shipOrderId / shipShipmentId | Integer or `null` | Shiprocket's own order id / shipment id (as returned by their CREATE_ORDER step) |
+| orders[].shippingDetails.pickupId / pickupToken  | Long / String or `null` | Shiprocket pickup identifiers, once a pickup has been requested |
+| orders[].shippingDetails.estimatedDeliveryDate / expectedDeliveryDate | DateTime or `null` | Estimated/expected delivery dates resolved from Shiprocket (AWB generation or tracking) |
+| orders[].shippingDetails.trackUrl                | String or `null` | Shiprocket tracking URL, once available |
+| orders[].shippingDetails.shiprocketOrderStatus / generateAwbStatus / requestPickupStatus / generateLabelStatus / trackShipmentStatus / estimateStatus | String | Per-step outcome: `SUCCESS`, `FAILURE`, or `null` if not yet attempted |
+| orders[].shippingDetails.shiprocketOrderStatuslog | List of status history objects | Complete audit trail of Shiprocket order creation step attempts (status, error message, response payload, timestamps). May be empty if the step was never executed. Each object contains: `id`, `status`, `errorMessage`, `shiprocketResponse`, `createdAt`, `updatedAt` |
+| orders[].shippingDetails.generateAwbStatuslog | List of status history objects | Complete audit trail of AWB generation step attempts; same structure as above |
+| orders[].shippingDetails.requestPickupStatuslog | List of status history objects | Complete audit trail of pickup request step attempts; same structure as above |
+| orders[].shippingDetails.generateLabelStatuslog | List of status history objects | Complete audit trail of shipping label generation step attempts; same structure as above |
+| orders[].shippingDetails.trackShipmentStatuslog | List of status history objects | Complete audit trail of shipment tracking resolution step attempts; same structure as above |
+| orders[].shippingDetails.estimateStatuslog | List of status history objects | Complete audit trail of estimated delivery date resolution step attempts; same structure as above |
+| orders[].shippingDetails.shipmentlogs | List of shipment log objects | Complete audit trail of all Shiprocket automation steps for the shipment from `shiprocket_order_log` table. Each object contains: `id`, `shipmentId`, `orderId`, `warehouseId`, `step`, `status`, `shiprocketOrderId`, `shiprocketShipmentId`, `awbCode`, `labelUrl`, `errorMessage`, `createdAt`, `updatedAt`. Records all steps executed (CREATE_ORDER, GENERATE_AWB, REQUEST_PICKUP, GENERATE_LABEL, TRACK_SHIPMENT, ESTIMATE_STATUS, etc.) with their outcomes and any error messages. |
+| orders[].failedSteps                       | List<String> | Names of the step(s) whose status equals `FAILURE`, or `["no_shipment"]` if the order has no shipment record at all |
+
+### Error Responses
+
+| Status | Condition              |
+|--------|------------------------|
+| 500    | Internal server error  |
+
+### cURL Example
+
+```bash
+curl -X GET "http://localhost:8080/api/orders/failed-shiprocket-steps" \
+  -H "accept: application/json"
+```
+
+---
+
 ## Shipment Status Values
 
 | Status                       | Description                                   |
@@ -1294,6 +1851,7 @@ curl -X POST "http://localhost:8080/api/order/ORD-20260601-001/retrigger-shippin
 | `RETURN_REQUESTED`           | Customer has raised a return request          |
 | `RETURN_PICKUP_INITIATED`    | Courier pickup for return has been initiated  |
 | `RECEIVED`                   | Returned package received at warehouse        |
+| `MANUAL_PROCESSING_REQUIRED` | Automated Shiprocket pipeline failed at some step and requires manual intervention (see [Section 9](#9-retrigger-shipping-process) and [Section 10](#10-failed-shiprocket-step-orders)) |
 
 ---
 
@@ -1375,6 +1933,12 @@ curl -X POST "http://localhost:8080/api/shipment/generate-awb" \
 
 ## Changelog
 
-- **2026-08-14** — `POST /api/order/{orderNumber}/retrigger-shipping` per-shipment results now include `failedStep` and `failureReason` when `action=FAILED`, surfacing the actual Shiprocket step and error message (from `shiprocket_order_log`, or the underlying exception) instead of a generic failure status. The top-level `responseMessage` now aggregates all individual failure reasons when nothing could be retriggered, and the 500 error handler also reports the root-cause message. See [Section 9](#9-retrigger-shipping-process).
+- **2026-09-10** — Added new Order ID-based shipment management APIs (Section 9): `GET /api/order/{orderId}/shipping` to fetch all shipping records for an order by ID, and `POST /api/order/{orderId}/shipping` to create a new shipping record for an order with all fields. These endpoints provide a streamlined alternative to order-number based APIs for direct order ID lookups. Request body uses `CreateShippingRequestDTO` with validation on required fields (`cartonId`, `type`). Response includes full `ShippingDetailDTO` with all ShippingEO fields plus derived fields (`orderNumber`, `cartonNo`). Supports easy integration for shipping subsystems lacking order number context.
+- **2026-09-09** — `GET /api/orders/failed-shiprocket-steps` `shippingDetails` now includes an additional `shipmentlogs` field: a `List` of complete audit trail records from `shiprocket_order_log` table for the shipment, ordered chronologically by `createdAt`. Each log entry captures all Shiprocket automation steps (CREATE_ORDER, GENERATE_AWB, REQUEST_PICKUP, GENERATE_LABEL, TRACK_SHIPMENT, ESTIMATE_STATUS, etc.) with their step outcome (`SUCCESS`, `FAILURE`, `ATTEMPT_FAILED`, etc.), associated Shiprocket IDs, AWB code, label URL, and any error messages. Enables admins to see a unified, chronological view of all Shiprocket automation attempts and their results without making separate queries, critical for debugging complex shipment failures. See [Section 11](#11-failed-shiprocket-step-orders).
+- **2026-09-09** — `GET /api/orders/failed-shiprocket-steps` `shippingDetails` now includes 6 new list fields with complete status history/audit logs for each Shiprocket automation step: `shiprocketOrderStatuslog`, `generateAwbStatuslog`, `requestPickupStatuslog`, `generateLabelStatuslog`, `trackShipmentStatuslog`, and `estimateStatuslog`. Each log is a `List` of status history objects (containing `id`, `status`, `remarks`, `createdAt`) and may be empty if that step was never executed for the shipment. Enables admins to see the full execution history of each step without making separate API calls, critical for debugging stuck shipments. See [Section 11](#11-failed-shiprocket-step-orders).
+- **2026-09-09** — `GET /api/orders/failed-shiprocket-steps` `shippingDetails` now also includes `cartonId` (the `CartonEO` used to pack the shipment), `length`, `breadth`, `height`, `weight`, `labelUrl`, `shipOrderId`, `shipShipmentId`, `pickupId`, `pickupToken`, `estimatedDeliveryDate`, `expectedDeliveryDate`, and `trackUrl`. See [Section 11](#11-failed-shiprocket-step-orders).
+- **2026-09-08** — `GET /api/orders/failed-shiprocket-steps` restructured: (1) fetching now looks up `Confirmed` orders first, then `Ready to Ship` orders, then resolves each order's shipment separately (instead of a single combined join query); (2) orders that have **no shipment record at all** are now included in the results (`shippingDetails: null`, `failedSteps: ["no_shipment"]`), not just orders with a failed Shiprocket step; (3) each entry in `orders[]` is now split into two nested objects, `orderDetails` and `shippingDetails`, instead of one flat object. See [Section 11](#11-failed-shiprocket-step-orders).
+- **2026-09-08** — Documented two previously-undocumented endpoints: `POST /api/shipment/create` (manual shipment creation trigger, see [Section 3a](#3a-create-shipment-manual-trigger)) and `GET /api/orders/failed-shiprocket-steps` (list Confirmed/Ready-to-Ship orders with a failed Shiprocket pipeline step, see [Section 11](#11-failed-shiprocket-step-orders)). Added `MANUAL_PROCESSING_REQUIRED` to the Shipment Status Values table.
+- **2026-08-14** — `POST /api/order/{orderNumber}/retrigger-shipping` per-shipment results now include `failedStep` and `failureReason` when `action=FAILED`, surfacing the actual Shiprocket step and error message (from `shiprocket_order_log`, or the underlying exception) instead of a generic failure status. The top-level `responseMessage` now aggregates all individual failure reasons when nothing could be retriggered, and the 500 error handler also reports the root-cause message. See [Section 10](#10-retrigger-shipping-process).
 - **2026-08-14** — `PUT`/`POST /api/shipment/order/{orderNumber}` now auto-record the current `shipmentStatus` as a tracking-history entry (idempotent, no duplicates) when `historyStatus` isn't explicitly supplied, and automatically sync the parent order's `orderStatus` to match the new shipment status (with `DELIVERED` mapping preserved). See [8.2](#tracking-history--order-status-sync-behaviour).
 

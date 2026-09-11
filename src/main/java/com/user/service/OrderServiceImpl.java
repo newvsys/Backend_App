@@ -4,6 +4,7 @@ import com.razorpay.Order;
 import com.razorpay.RazorpayClient;
 import com.razorpay.Refund;
 import com.user.communication.event.Event;
+import com.user.communication.event.EmailDetails;
 import com.user.communication.event.OrderEvent;
 import com.user.communication.event.RefundInitiatedEvent;
 import com.user.communication.service.NotificationService;
@@ -38,6 +39,7 @@ import jakarta.persistence.criteria.Predicate;
 import jakarta.persistence.criteria.Root;
 import jakarta.persistence.criteria.Subquery;
 import org.springframework.data.jpa.domain.Specification;
+import org.springframework.transaction.annotation.Transactional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -84,6 +86,9 @@ public class OrderServiceImpl implements OrderService {
 
 	@Autowired
 	private PushNotificationService pushNotificationService;
+
+	@Value("${admin.notification.email:}")
+	private String adminNotificationEmail;
 
 	@Autowired
 	@Lazy
@@ -162,9 +167,22 @@ public class OrderServiceImpl implements OrderService {
 	private CourierSelectionLogRepository courierSelectionLogRepository;
 
 	@Autowired
+	private ShipmentItemRepository shipmentItemRepository;
+
+	@Autowired
+	private ShiprocketOrderLogRepository shiprocketOrderLogRepository;
+
+	@Autowired
+	private CartonRepository cartonRepository;
+
+	@Autowired
+	private CartonSelectionService cartonSelectionService;
+
+	@Autowired
 	private DeliveryChargeRepository deliveryChargeRepository;
 
 	@Override
+	@Transactional(rollbackFor = Exception.class)
 	public OrderResponseDTO createOrder(OrderCreateDTO orderCreateDTO) {
 		OrderResponseDTO responseDTO = new OrderResponseDTO();
 		logger.info("Starting createOrder for userId={}, customerId={}, products={}", orderCreateDTO.getUserId(),
@@ -402,6 +420,7 @@ public class OrderServiceImpl implements OrderService {
 			payment.setPaymentStatus("CREATED");
 			payment.setOrder(savedOrder);
 			payment.setPaymentProviderOrderId((String) payOrder.get("id"));
+			payment.setPaymentProvider(Constants.PAYMENT_PROVIDER_RAZORPAY);
 
 			// Razorpay returns amount in paise (integer).
 			BigDecimal paidAmount = new BigDecimal(((Number) payOrder.get("amount")).longValue())
@@ -409,15 +428,29 @@ public class OrderServiceImpl implements OrderService {
 			payment.setAmount(paidAmount);
 
 			PaymentEO savedPayment = paymentRepository.save(payment);
-			// 3. Update Inventory (reduce stock for cancelled item)
+			// 3. Update Inventory (reduce stock for order items)
 			for (OrderItemEO orderItem : savedorderItems) {
 				ProductVariantEO productVariant = orderItem.getProductVar();
 				if (productVariant != null) {
 					InventoryEO inventory = inventoryRepository.findByProductVariant(productVariant);
-					inventory.setAvailableQty(inventory.getAvailableQty() - orderItem.getQuantity());
-					inventory.setTotalQty(Math.max(0,
-							(inventory.getTotalQty() != null ? inventory.getTotalQty() : 0) - orderItem.getQuantity()));
-					inventoryRepository.save(inventory);
+					if (inventory != null) {
+						// Get current quantities with safe null handling
+						int currentAvailableQty = inventory.getAvailableQty() != null ? inventory.getAvailableQty() : 0;
+						int currentTotalQty = inventory.getTotalQty() != null ? inventory.getTotalQty() : 0;
+
+						// Decrease by order quantity (floor at 0)
+						int newAvailableQty = Math.max(0, currentAvailableQty - orderItem.getQuantity());
+						int newTotalQty = Math.max(0, currentTotalQty - orderItem.getQuantity());
+
+						inventory.setAvailableQty(newAvailableQty);
+						inventory.setTotalQty(newTotalQty);
+
+						inventoryRepository.save(inventory);
+						logger.info("Inventory updated for productVariantId={}: availableQty {} -> {}, totalQty {} -> {}",
+							productVariant.getId(), currentAvailableQty, newAvailableQty, currentTotalQty, newTotalQty);
+					} else {
+						logger.warn("Inventory record not found for productVariantId={}", productVariant.getId());
+					}
 				}
 			}
 			responseDTO.setOrderNumber(savedOrder.getOrderNumber());
@@ -432,17 +465,6 @@ public class OrderServiceImpl implements OrderService {
 			responseDTO.setPaymentGatewayKey(keyId);
 			responseDTO.setMessage(Constants.ORDER_CREATED_SUCCESS);
 			responseDTO.setStatus(Constants.STATUS_SUCCESS);
-
-			// Notify admins (Admin web app) of the new order via Firebase push
-			// notification. Best-effort: never fails order creation.
-			try {
-				pushNotificationService.notifyAdminsNewOrder(savedOrder);
-			}
-			catch (Exception pushEx) {
-				logger.error("Failed to send new-order push notification for orderNumber={}: {}",
-						savedOrder.getOrderNumber(), pushEx.getMessage(), pushEx);
-			}
-
 			logger.info(
 					"Order created successfully for userId={}, customerId={}, orderNumber={}, subtotal={}, shippingFee={}, total={}",
 					orderCreateDTO.getUserId(), orderCreateDTO.getCustomerId(), order.getOrderNumber(), subtotalAmount,
@@ -450,6 +472,14 @@ public class OrderServiceImpl implements OrderService {
 
 		}
 		catch (Exception e) {
+			// Since we catch the exception here instead of letting it propagate, Spring's
+			// @Transactional would NOT roll back the transaction by default (rollback only
+			// happens when an exception exits the proxied method). Explicitly mark the
+			// current transaction as rollback-only so ALL DB writes performed above
+			// (customer/user creation, order, address, order items, payment, inventory
+			// updates) are rolled back together on any failure.
+			org.springframework.transaction.interceptor.TransactionAspectSupport.currentTransactionStatus()
+				.setRollbackOnly();
 			responseDTO.setMessage(Constants.ORDER_CREATED_FAILURE);
 			responseDTO.setStatus(Constants.FAILURE_STATUS);
 			logger.error("Error creating order for userId={}, customerId={}: {}", orderCreateDTO.getUserId(),
@@ -591,7 +621,6 @@ public class OrderServiceImpl implements OrderService {
 
 		return UserMapper.toOrderDTO(order);
 	}
-
 	@Override
 	public OrderDTO updateOrder(String orderId, OrderCreateDTO orderUpdateDTO) {
 		// 1) load order by order number (or change to findById if needed)
@@ -648,9 +677,10 @@ public class OrderServiceImpl implements OrderService {
 		List<OrderDetailsDTO> orders = new ArrayList<>();
 
 		String searchstring = orderHistoryRequestDTO.getSearch() != null
-				? orderHistoryRequestDTO.getSearch().toLowerCase() : null;
+				? orderHistoryRequestDTO.getSearch().trim() : null;
+		// Check if it's a valid order number (case-insensitive for the format check, but preserve original case)
 		String orderid = isValidOrderId(searchstring) ? searchstring : null;
-		String productname = isValidOrderId(searchstring) ? null : searchstring;
+		String productname = isValidOrderId(searchstring) ? null : (searchstring != null ? searchstring.toLowerCase() : null);
 		try {
 			UserEO existingUser = null;
 			if (orderHistoryRequestDTO.getUserId() != null) {
@@ -661,10 +691,13 @@ public class OrderServiceImpl implements OrderService {
 
 				if (customer != null) {
 					List<OrderEO> orderEOList = null;
-					if (orderid != null)
-						orderEOList = orderRepository.findByCustomerAndOrderNumber(customer, orderid);
-					else
+					if (orderid != null) {
+						// Use case-insensitive search for order number
+						orderEOList = orderRepository.findByCustomerAndOrderNumberIgnoreCase(customer, orderid);
+					}
+					else {
 						orderEOList = orderRepository.findByCustomer(customer);
+					}
 
 					for (OrderEO order : orderEOList) {
 						OrderDetailsDTO dto = new OrderDetailsDTO();
@@ -762,65 +795,167 @@ public class OrderServiceImpl implements OrderService {
 	}
 
 	@Override
-	@org.springframework.transaction.annotation.Transactional
+	@org.springframework.transaction.annotation.Transactional(rollbackFor = Exception.class)
 	public ResponseDTO updateOrderPaymentStatus(PaymentStatusUpdateDTO paymentStatusUpdateDTO) {
 		ResponseDTO responseDTO = new ResponseDTO();
 		String razorpayOrderId = paymentStatusUpdateDTO.getRazorpayOrderId();
 		String razorpayPaymentId = paymentStatusUpdateDTO.getRazorpayPaymentId();
 		String paymentStatus = paymentStatusUpdateDTO.getPaymentStatus();
+		// ── Input validation ────────────────────────────────────────────────
+		if (razorpayOrderId == null || razorpayOrderId.isBlank() || paymentStatus == null
+				|| paymentStatus.isBlank()) {
+			logger.error(
+					"updateOrderPaymentStatus: invalid input - razorpayOrderId/paymentStatus missing. razorpayOrderId={}, paymentStatus={}",
+					razorpayOrderId, paymentStatus);
+			responseDTO.setResponseStatus("failed");
+			responseDTO.setResponseMessage("razorpayOrderId and paymentStatus are required");
+			return responseDTO;
+		}
+		logger.info(
+				"updateOrderPaymentStatus: processing razorpayOrderId={}, razorpayPaymentId={}, paymentStatus={}",
+				razorpayOrderId, razorpayPaymentId, paymentStatus);
 
 		// Update payment status in payment table
 		PaymentEO payment = paymentRepository.findByPaymentProviderOrderId(razorpayOrderId);
+		if (payment == null) {
+			// No payment record exists yet for this Razorpay order (e.g. the initial
+			// insert during createOrder failed/was skipped, or this webhook arrived
+			// before that write). Instead of failing outright, look up the Razorpay
+			// order to recover the linked internal order number (stored in "notes"
+			// at creation time) and create a fresh payment record for that order.
+			try {
+				Order rzpOrder = razorpayClient.orders.fetch(razorpayOrderId);
+				JSONObject rzpNotes = rzpOrder.get("notes") != null ? (JSONObject) rzpOrder.get("notes") : null;
+				String orderNumber = rzpNotes != null ? rzpNotes.optString("order_number", null) : null;
+
+				OrderEO linkedOrder = orderNumber != null ? orderRepository.findByOrderNumber(orderNumber).orElse(null)
+						: null;
+
+				if (linkedOrder != null) {
+					BigDecimal recoveredAmount = new BigDecimal(((Number) rzpOrder.get("amount")).longValue())
+						.divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+
+					PaymentEO newPayment = new PaymentEO();
+					newPayment.setOrder(linkedOrder);
+					newPayment.setPaymentProviderOrderId(razorpayOrderId);
+					newPayment.setPaymentProvider(Constants.PAYMENT_PROVIDER_RAZORPAY);
+					newPayment.setAmount(recoveredAmount);
+					newPayment.setPaymentStatus(Constants.PAYMENT_STATUS_CREATED);
+					try {
+						payment = paymentRepository.save(newPayment);
+						logger.warn(
+								"Payment record not found for razorpayOrderId={}; created new payment record (paymentId={}) for orderNumber={}",
+								razorpayOrderId, payment.getPaymentId(), orderNumber);
+					}
+					catch (org.springframework.dao.DataIntegrityViolationException dupEx) {
+						// A concurrent request (duplicate webhook/verify retry) won the race
+						// and already inserted a payment row for this razorpayOrderId
+						// (requires the unique constraint on payment_provider_order_id).
+						// Re-fetch instead of failing.
+						logger.warn(
+								"updateOrderPaymentStatus: concurrent insert detected for razorpayOrderId={}; re-fetching existing payment record.",
+								razorpayOrderId);
+						payment = paymentRepository.findByPaymentProviderOrderId(razorpayOrderId);
+					}
+				}
+				else {
+					logger.error(
+							"Could not resolve internal order for razorpayOrderId={} (orderNumber from notes={}); unable to create payment record.",
+							razorpayOrderId, orderNumber);
+				}
+			}
+			catch (Exception fetchOrderEx) {
+				logger.error("Failed to fetch Razorpay order to recover payment record for razorpayOrderId={}: {}",
+						razorpayOrderId, fetchOrderEx.getMessage(), fetchOrderEx);
+			}
+		}
 		if (payment != null) {
+
+			// ── Idempotency guard ───────────────────────────────────────────
+			// A duplicate webhook/verify retry for a status already applied should
+			// be a no-op (avoids re-saving, re-fetching payment method and
+			// re-triggering the async capture).
+			if (paymentStatus.equalsIgnoreCase(payment.getPaymentStatus())) {
+				logger.info(
+						"updateOrderPaymentStatus: payment (paymentId={}) already in status={} for razorpayOrderId={}; skipping duplicate processing.",
+						payment.getPaymentId(), paymentStatus, razorpayOrderId);
+				responseDTO.setResponseMessage("Payment status already up to date");
+				responseDTO.setResponseStatus("success");
+				return responseDTO;
+			}
+
 			payment.setPaymentStatus(paymentStatus);
 			payment.setTransactionId(razorpayPaymentId);
+			if (payment.getPaymentProvider() == null) {
+				payment.setPaymentProvider(Constants.PAYMENT_PROVIDER_RAZORPAY);
+			}
+			payment.setPaymentTime(LocalDateTime.now());
+
+			boolean isPaid = Constants.ORDER_PAYMENT_STATUS_PAID.equalsIgnoreCase(paymentStatus);
+			boolean isFailed = Constants.ORDER_PAYMENT_STATUS_FAILED.equalsIgnoreCase(paymentStatus);
+
+			if (isPaid) {
+				// Fetch the actual instrument used (card/upi/netbanking/wallet/emi) from
+				// Razorpay so paymentMethod reflects reality instead of staying null.
+				try {
+					com.razorpay.Payment rzpPayment = razorpayClient.payments.fetch(razorpayPaymentId);
+					String rzpMethod = rzpPayment.get("method");
+					payment.setPaymentMethod(mapRazorpayMethod(rzpMethod));
+				}
+				catch (Exception fetchEx) {
+					logger.warn("Could not fetch Razorpay payment method for paymentId={}: {}", razorpayPaymentId,
+							fetchEx.getMessage());
+				}
+			}
 			paymentRepository.save(payment);
 
 			// Update order payment status (same transaction)
 			OrderEO order = payment.getOrder();
 
-			if (Constants.ORDER_PAYMENT_STATUS_PAID.equals(paymentStatus)) {
+			if (isPaid) {
 				// Payment succeeded – confirm the order
 				order.setPaymentStatus(Constants.ORDER_PAYMENT_STATUS_PAID);
 				order.setOrderStatus(Constants.ORDER_STATUS_CONFIRMED);
 				orderRepository.save(order);
 
-				// ── Async: Razorpay capture (best-effort, does not block response) ──
+				// ── Create initial shipment after payment success ──
+				// Creates a ShippingEO with "Pending"/"Created" status and a
+				// ShipmentTrackingHistoryEO with status "Order Confirmed" and
+				// location from warehouse. This is a best-effort operation.
+				shippingService.createInitialShipmentAfterPayment(order);
+
+				// ── Razorpay capture (best-effort, does not block response) ──
+				// Deferred until AFTER this transaction actually commits, so a
+				// capture never fires against Razorpay for an order/payment update
+				// that ends up rolled back.
 				final BigDecimal captureAmount = payment.getAmount();
 				final String capturePaymentId = razorpayPaymentId;
-				java.util.concurrent.CompletableFuture.runAsync(() -> {
-					try {
-						JSONObject captureRequest = new JSONObject();
-						captureRequest.put("amount", captureAmount.multiply(BigDecimal.valueOf(100)).longValue());
-						captureRequest.put("currency", "INR");
-						razorpayClient.payments.capture(capturePaymentId, captureRequest);
-						logger.info("Razorpay payment captured successfully for paymentId={}", capturePaymentId);
-					}
-					catch (Exception captureEx) {
-						// If already captured (auto-capture was on), Razorpay returns an
-						// error — safe to ignore
-						logger.warn("Razorpay capture attempt for paymentId={}: {} (may already be captured)",
-								capturePaymentId, captureEx.getMessage());
-					}
-				});
+				final PaymentEO paymentForAudit = payment;
+				scheduleRazorpayCaptureAfterCommit(captureAmount, capturePaymentId, paymentForAudit);
 
-				// ── Async: trigger shipment creation (does not block response) ──
-				OrderEvent shipmentEvent = OrderEvent.builder()
-					.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
-					.eventType(Constants.ORDER_EVENT_TYPE_SHIPPED)
-					.build();
-				if (shipmentEvent.getOrderId() != null) {
-					shippingService.processCreateShipmentEvent(shipmentEvent);
-					logger.info("Shipment creation async-triggered for orderId={}", shipmentEvent.getOrderId());
-				}
+				// ── Customer email + Admin push notification (best-effort) ──
+				// Notify the customer that their order is confirmed and alert
+				// admins to start processing the shipment. Any failure here must
+				// never break the payment-confirmation flow.
+				sendOrderConfirmedNotifications(order);
 			}
-			else {
+			else if (isFailed) {
 				// Payment failed – mark order as payment-failed so retry is still allowed
 				order.setPaymentStatus(paymentStatus);
 				order.setOrderStatus(Constants.ORDER_STATUS_PAYMENT_FAILED);
 				orderRepository.save(order);
-				logger.warn("Payment failed for orderId={}, orderStatus set to PAYMENT FAILED. No shipment event sent.",
+				logger.warn("Payment failed for orderId={}, orderStatus set to PAYMENT FAILED.",
 						order.getOrderId());
+			}
+			else {
+				// Unrecognized/unsupported status (e.g. a future Razorpay status this
+				// method doesn't explicitly model yet). Persist it on the payment for
+				// visibility but don't force the order into a hard failure state.
+				logger.warn(
+						"updateOrderPaymentStatus: received unrecognized paymentStatus='{}' for razorpayOrderId={}; payment record updated, order status left unchanged.",
+						paymentStatus, razorpayOrderId);
+				order.setPaymentStatus(paymentStatus);
+				orderRepository.save(order);
 			}
 
 			responseDTO.setResponseMessage("Payment status updated successfully");
@@ -830,9 +965,166 @@ public class OrderServiceImpl implements OrderService {
 			responseDTO.setResponseMessage("Payment not found for order: " + razorpayOrderId);
 			responseDTO.setResponseStatus("failed");
 		}
-
 		return responseDTO;
 
+	}
+
+	/**
+	 * Best-effort notifications sent once a payment succeeds and the order is
+	 * moved to CONFIRMED: an "Order Confirmed" email to the customer, and a push
+	 * notification to all registered admin devices prompting them to process
+	 * shipping. Any failure here is logged and swallowed so it never rolls back
+	 * or fails the payment-confirmation transaction.
+	 */
+	private void sendOrderConfirmedNotifications(OrderEO order) {
+		try {
+			CustomerEO customer = order.getCustomer();
+			if (customer != null && customer.getEmail() != null && !customer.getEmail().isBlank()) {
+				String customerName = customer.getFirstName();
+				String orderNumber = order.getOrderNumber();
+				String orderStatus = order.getOrderStatus();
+
+				EmailDetails emailDetails = EmailDetails.builder()
+					.orderId(orderNumber)
+					.customerName(customerName)
+					.orderStatus(orderStatus)
+					.build();
+
+				Event notificationEvent = Event.builder()
+					.email(customer.getEmail())
+					.mobile(customer.getMobileNumber())
+					.purpose(Constants.COMMUNICATION_PURPOSE_ORDER_CONFIRMATION)
+					.emailSubject("Order Confirmed - " + orderNumber)
+					.emailMessage(String.format("Hi %s, your order %s has been confirmed. Status: %s", customerName,
+							orderNumber, orderStatus))
+					.channel(Constants.COMMUNICATION_CHANNEL_EMAIL)
+					.templateId(Constants.MSG91_EMAIL_TEMPLATE_ORDER_STATUS_UPDATE)
+					.emailDetails(emailDetails)
+					.build();
+
+				notificationService.processEvent(notificationEvent);
+				logger.info("Order confirmed email sent to customer for orderNumber={}", orderNumber);
+			}
+			else {
+				logger.debug("Skipping order confirmed email for orderNumber={}: customer/email not available",
+						order.getOrderNumber());
+			}
+		}
+		catch (Exception e) {
+			logger.error("Failed to send order confirmed email for orderNumber={}: {}", order.getOrderNumber(),
+					e.getMessage(), e);
+		}
+
+		try {
+			pushNotificationService.notifyAdminsProcessShipping(order);
+		}
+		catch (Exception e) {
+			logger.error("Failed to send order confirmed push notification for orderNumber={}: {}",
+					order.getOrderNumber(), e.getMessage(), e);
+		}
+
+		// ── Admin email: prompt admin to process the shipment ──
+		try {
+			if (adminNotificationEmail != null && !adminNotificationEmail.isBlank()) {
+				String orderNumber = order.getOrderNumber();
+				String orderStatus = order.getOrderStatus();
+				String adminMessage = String.format(
+						"Order %s has been confirmed and payment received. Please process the shipment.",
+						orderNumber);
+
+				EmailDetails adminEmailDetails = EmailDetails.builder()
+					.orderId(orderNumber)
+					.customerName("Admin")
+					.orderStatus(orderStatus)
+					.message(adminMessage)
+					.build();
+
+				Event adminNotificationEvent = Event.builder()
+					.email(adminNotificationEmail)
+					.purpose(Constants.COMMUNICATION_PURPOSE_ADMIN_PROCESS_SHIPMENT)
+					.emailSubject("Action Required: Process Shipment for Order " + orderNumber)
+					.emailMessage(adminMessage)
+					.channel(Constants.COMMUNICATION_CHANNEL_EMAIL)
+					.templateId(Constants.MSG91_EMAIL_TEMPLATE_ORDER_STATUS_UPDATE)
+					.emailDetails(adminEmailDetails)
+					.build();
+
+				notificationService.processEvent(adminNotificationEvent);
+				logger.info("Order confirmed email sent to admin ({}) for orderNumber={}", adminNotificationEmail,
+						orderNumber);
+			}
+			else {
+				logger.debug(
+						"Skipping admin process-shipment email for orderNumber={}: admin.notification.email not configured",
+						order.getOrderNumber());
+			}
+		}
+		catch (Exception e) {
+			logger.error("Failed to send admin process-shipment email for orderNumber={}: {}",
+					order.getOrderNumber(), e.getMessage(), e);
+		}
+	}
+
+	/**
+	 * Schedules the Razorpay capture call to run asynchronously only after the
+	 * current transaction has committed (via {@code TransactionSynchronization#afterCommit()}),
+	 * so a rolled-back payment/order update can never still result in a capture
+	 * being fired. Falls back to firing immediately if no transaction is active
+	 * (shouldn't happen given this is only called from a {@code @Transactional}
+	 * method, but kept defensive).
+	 */
+	private void scheduleRazorpayCaptureAfterCommit(BigDecimal captureAmount, String capturePaymentId,
+			PaymentEO paymentForAudit) {
+		if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()) {
+			org.springframework.transaction.support.TransactionSynchronizationManager
+				.registerSynchronization(new org.springframework.transaction.support.TransactionSynchronization() {
+					@Override
+					public void afterCommit() {
+						captureRazorpayPaymentAsync(captureAmount, capturePaymentId, paymentForAudit);
+					}
+				});
+		}
+		else {
+			captureRazorpayPaymentAsync(captureAmount, capturePaymentId, paymentForAudit);
+		}
+	}
+
+	/**
+	 * Fires the actual Razorpay capture call on a separate thread (best-effort,
+	 * never blocks the caller) and persists the outcome on the payment record for
+	 * reconciliation/audit purposes.
+	 */
+	private void captureRazorpayPaymentAsync(BigDecimal captureAmount, String capturePaymentId,
+			PaymentEO paymentForAudit) {
+		java.util.concurrent.CompletableFuture.runAsync(() -> {
+			try {
+				JSONObject captureRequest = new JSONObject();
+				captureRequest.put("amount", captureAmount.multiply(BigDecimal.valueOf(100)).longValue());
+				captureRequest.put("currency", Constants.PAYMENT_CURRENCY);
+				razorpayClient.payments.capture(capturePaymentId, captureRequest);
+				logger.info("Razorpay payment captured successfully for paymentId={}", capturePaymentId);
+				persistCaptureAudit(paymentForAudit, Constants.CAPTURE_STATUS_CAPTURED);
+			}
+			catch (Exception captureEx) {
+				// If already captured (auto-capture was on), Razorpay returns an
+				// error — safe to ignore
+				logger.warn("Razorpay capture attempt for paymentId={}: {} (may already be captured)",
+						capturePaymentId, captureEx.getMessage());
+				persistCaptureAudit(paymentForAudit, Constants.CAPTURE_STATUS_FAILED_OR_ALREADY_CAPTURED);
+			}
+		});
+	}
+
+	private void persistCaptureAudit(PaymentEO payment, String captureStatus) {
+		try {
+			payment.setCaptureStatus(captureStatus);
+			payment.setCapturedAt(LocalDateTime.now());
+			paymentRepository.save(payment);
+		}
+		catch (Exception auditEx) {
+			logger.warn("Failed to persist capture audit status for paymentId={}: {}", payment.getPaymentId(),
+					auditEx.getMessage());
+		}
 	}
 
 	@Override
@@ -878,89 +1170,104 @@ public class OrderServiceImpl implements OrderService {
 			OrderCancelRequestEO savedorderCancelRequestEO = orderCancelRequestRepository.save(cancelRequest);
 			order.setOrderStatus(Constants.ORDER_STATUS_CANCELLED);
 
-			orderRepository.save(order);
+		orderRepository.save(order);
 
-			List<ShippingEO> shipping = shippingRepository.findByOrder(order);
+		// Fetch all shipments for this order (including cancelled ones)
+		List<ShippingEO> shippingList = shippingRepository.findByOrder(order);
 
-			ShippingEO ship = shipping.getFirst();
-			ship.setShipmentStatus(Constants.SHIPMENT_STATUS_CANCELLED);
-			shippingRepository.save(ship);
+		if (shippingList == null || shippingList.isEmpty()) {
+			logger.warn("No shipments found for order orderNumber={}, orderId={}",
+				orderCancelRequestDTO.getOrderNumber(), order.getOrderId());
+		} else {
+			// Process all shipments for this order
+			for (ShippingEO ship : shippingList) {
+				// Skip if shipment is already cancelled
+				if (Constants.SHIPMENT_STATUS_CANCELLED.equals(ship.getShipmentStatus())) {
+					logger.info("Shipment already cancelled for shipmentId={}", ship.getShipmentId());
+					continue;
+				}
 
-			// ── Idempotency guard ───────────────────────────────────────────
-			// If a Shiprocket webhook already recorded a CANCELLED entry for this
-			// shipment (e.g. it arrived just before this in-app cancel completed),
-			// don't insert a second one — the Track Order popup should only ever
-			// show CANCELLED once.
-			boolean cancelledHistoryAlreadyExists = shipmentTrackingHistoryRepository
-				.existsByShipmentAndStatusIgnoreCase(ship, Constants.SHIPMENT_STATUS_CANCELLED);
-			if (!cancelledHistoryAlreadyExists) {
-				ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
-				shipmentTrackingHistoryEO.setShipment(ship);
-				shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_STATUS_CANCELLED);
-				shipmentTrackingHistoryEO.setRemarks("Order Cancelled ");
-				shipmentTrackingHistoryEO.setUpdatedAt(LocalDateTime.now());
-				shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
-			}
-			else {
-				logger.info(
-						"cancelOrder: ShipmentTrackingHistoryEO already has a CANCELLED record for shipmentId={}. Skipping duplicate insert.",
-						ship.getShipmentId());
-			}
+				ship.setShipmentStatus(Constants.SHIPMENT_STATUS_CANCELLED);
+				shippingRepository.save(ship);
 
-			// ── Invoke Shiprocket Cancel Order API ──────────────────────────
-			try {
-				Integer shiprocketOrderId = ship.getShipOrderId();
-				if (shiprocketOrderId != null) {
-					Map shiprocketCancelResponse = shiprocketService.cancelOrder(List.of(shiprocketOrderId));
-					logger.info("Shiprocket cancelOrder response for orderNumber={}: {}",
-							orderCancelRequestDTO.getOrderNumber(), shiprocketCancelResponse);
-
-					// Parse response and update OrderCancelRequestEO
-					String srStatus = "UNKNOWN";
-					String srMessage = null;
-					if (shiprocketCancelResponse != null) {
-						Object msgObj = shiprocketCancelResponse.get("message");
-						if (msgObj instanceof String) {
-							srMessage = (String) msgObj;
-						}
-						// Shiprocket returns HTTP 200 with a "message" on success
-						// and may include "status" field (200 / 4xx)
-						Object statusObj = shiprocketCancelResponse.get("status");
-						if (statusObj instanceof Number) {
-							int statusCode = ((Number) statusObj).intValue();
-							srStatus = (statusCode >= 200 && statusCode < 300) ? "SUCCESS" : "FAILED";
-						}
-						else {
-							// If no explicit status, treat presence of message as success
-							srStatus = srMessage != null ? "SUCCESS" : "FAILED";
-						}
-					}
-					savedorderCancelRequestEO.setShiprocketCancelStatus(srStatus);
-					savedorderCancelRequestEO.setShiprocketCancelMessage(srMessage);
-					savedorderCancelRequestEO.setShiprocketCancelledAt(LocalDateTime.now());
-					orderCancelRequestRepository.save(savedorderCancelRequestEO);
-					logger.info("Shiprocket cancel status={} message={} for orderNumber={}", srStatus, srMessage,
-							orderCancelRequestDTO.getOrderNumber());
+				// ── Idempotency guard ───────────────────────────────────────────
+				// If a Shiprocket webhook already recorded a CANCELLED entry for this
+				// shipment (e.g. it arrived just before this in-app cancel completed),
+				// don't insert a second one — the Track Order popup should only ever
+				// show CANCELLED once.
+				boolean cancelledHistoryAlreadyExists = shipmentTrackingHistoryRepository
+					.existsByShipmentAndStatusIgnoreCase(ship, Constants.SHIPMENT_STATUS_CANCELLED);
+				if (!cancelledHistoryAlreadyExists) {
+					ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
+					shipmentTrackingHistoryEO.setShipment(ship);
+					shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_STATUS_CANCELLED);
+					shipmentTrackingHistoryEO.setRemarks("Order Cancelled - Reason: " + cancelReasonDescription);
+					shipmentTrackingHistoryEO.setUpdatedAt(LocalDateTime.now());
+					shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+					logger.info("Created tracking history record for shipmentId={} with status=CANCELLED", ship.getShipmentId());
 				}
 				else {
-					logger.warn("shipOrderId is null for shipmentId={}, skipping Shiprocket cancel",
+					logger.info(
+							"cancelOrder: ShipmentTrackingHistoryEO already has a CANCELLED record for shipmentId={}. Skipping duplicate insert.",
 							ship.getShipmentId());
-					savedorderCancelRequestEO.setShiprocketCancelStatus("SKIPPED");
-					savedorderCancelRequestEO.setShiprocketCancelMessage("Shiprocket order ID not available");
+				}
+
+				// ── Invoke Shiprocket Cancel Order API ──────────────────────────
+				try {
+					Integer shiprocketOrderId = ship.getShipOrderId();
+					if (shiprocketOrderId != null) {
+						Map shiprocketCancelResponse = shiprocketService.cancelOrder(List.of(shiprocketOrderId));
+						logger.info("Shiprocket cancelOrder response for orderNumber={}: {}",
+								orderCancelRequestDTO.getOrderNumber(), shiprocketCancelResponse);
+
+						// Parse response and update OrderCancelRequestEO
+						String srStatus = "UNKNOWN";
+						String srMessage = null;
+						if (shiprocketCancelResponse != null) {
+							Object msgObj = shiprocketCancelResponse.get("message");
+							if (msgObj instanceof String) {
+								srMessage = (String) msgObj;
+							}
+							// Shiprocket returns HTTP 200 with a "message" on success
+							// and may include "status" field (200 / 4xx)
+							Object statusObj = shiprocketCancelResponse.get("status");
+							if (statusObj instanceof Number) {
+								int statusCode = ((Number) statusObj).intValue();
+								srStatus = (statusCode >= 200 && statusCode < 300) ? "SUCCESS" : "FAILED";
+							}
+							else {
+								// If no explicit status, treat presence of message as success
+								srStatus = srMessage != null ? "SUCCESS" : "FAILED";
+							}
+						}
+						savedorderCancelRequestEO.setShiprocketCancelStatus(srStatus);
+						savedorderCancelRequestEO.setShiprocketCancelMessage(srMessage);
+						savedorderCancelRequestEO.setShiprocketCancelledAt(LocalDateTime.now());
+						orderCancelRequestRepository.save(savedorderCancelRequestEO);
+						logger.info("Shiprocket cancel status={} message={} for orderNumber={}", srStatus, srMessage,
+								orderCancelRequestDTO.getOrderNumber());
+					}
+					else {
+						logger.warn("shipOrderId is null for shipmentId={}, skipping Shiprocket cancel",
+								ship.getShipmentId());
+						savedorderCancelRequestEO.setShiprocketCancelStatus("SKIPPED");
+						savedorderCancelRequestEO.setShiprocketCancelMessage("Shiprocket order ID not available");
+						savedorderCancelRequestEO.setShiprocketCancelledAt(LocalDateTime.now());
+						orderCancelRequestRepository.save(savedorderCancelRequestEO);
+					}
+				}
+				catch (Exception ex) {
+					logger.error("Shiprocket cancelOrder API call failed for orderNumber={}: {}",
+							orderCancelRequestDTO.getOrderNumber(), ex.getMessage(), ex);
+					savedorderCancelRequestEO.setShiprocketCancelStatus("FAILED");
+					savedorderCancelRequestEO.setShiprocketCancelMessage(ex.getMessage());
 					savedorderCancelRequestEO.setShiprocketCancelledAt(LocalDateTime.now());
 					orderCancelRequestRepository.save(savedorderCancelRequestEO);
+					// Non-fatal — internal cancel already done, don't roll back
 				}
 			}
-			catch (Exception ex) {
-				logger.error("Shiprocket cancelOrder API call failed for orderNumber={}: {}",
-						orderCancelRequestDTO.getOrderNumber(), ex.getMessage(), ex);
-				savedorderCancelRequestEO.setShiprocketCancelStatus("FAILED");
-				savedorderCancelRequestEO.setShiprocketCancelMessage(ex.getMessage());
-				savedorderCancelRequestEO.setShiprocketCancelledAt(LocalDateTime.now());
-				orderCancelRequestRepository.save(savedorderCancelRequestEO);
-				// Non-fatal — internal cancel already done, don't roll back
-			}
 			// ────────────────────────────────────────────────────────────────
+		}
 
 			// Directly process cancel order event
 			OrderEvent event = OrderEvent.builder()
@@ -1314,9 +1621,17 @@ public class OrderServiceImpl implements OrderService {
 					trackingHistory.setStatus(Constants.SHIPMENT_STATUS_RETURN_REQUESTED);
 					trackingHistory.setRemarks("Return requested for order: " + order.getOrderNumber());
 					trackingHistory.setUpdatedAt(LocalDateTime.now());
-					shipmentTrackingHistoryRepository.save(trackingHistory);
-					logger.info("Saved ShipmentTrackingHistory for shipmentId={} with status '{}'",
-							shipment.getShipmentId(), Constants.SHIPMENT_STATUS_RETURN_REQUESTED);
+					if (!shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(shipment,
+							Constants.SHIPMENT_STATUS_RETURN_REQUESTED)) {
+						shipmentTrackingHistoryRepository.save(trackingHistory);
+						logger.info("Saved ShipmentTrackingHistory for shipmentId={} with status '{}'",
+								shipment.getShipmentId(), Constants.SHIPMENT_STATUS_RETURN_REQUESTED);
+					}
+					else {
+						logger.info(
+								"ShipmentTrackingHistory already has status '{}' for shipmentId={}. Skipping duplicate insert.",
+								Constants.SHIPMENT_STATUS_RETURN_REQUESTED, shipment.getShipmentId());
+					}
 				}
 			}
 			else {
@@ -1431,7 +1746,10 @@ public class OrderServiceImpl implements OrderService {
 			originalTrackingHistory.setStatus(Constants.SHIPMENT_STATUS_RETURN_PICKUP_INITIATED);
 			originalTrackingHistory.setRemarks("Return pickup initiated. Reverse tracking: " + reverseTrackingNumber);
 			originalTrackingHistory.setUpdatedAt(LocalDateTime.now());
-			shipmentTrackingHistoryRepository.save(originalTrackingHistory);
+			if (!shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(originalShipment,
+					Constants.SHIPMENT_STATUS_RETURN_PICKUP_INITIATED)) {
+				shipmentTrackingHistoryRepository.save(originalTrackingHistory);
+			}
 
 			logger.info("Return pickup initiation completed successfully for orderId={}", order.getOrderId());
 
@@ -1707,7 +2025,10 @@ public class OrderServiceImpl implements OrderService {
 						pickupHistory.setStatus("RETURN_PICKUP_SCHEDULED");
 						pickupHistory.setRemarks("Return pickup scheduled via Shiprocket");
 						pickupHistory.setUpdatedAt(LocalDateTime.now());
-						shipmentTrackingHistoryRepository.save(pickupHistory);
+						if (!shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(savedReturnShipment,
+								"RETURN_PICKUP_SCHEDULED")) {
+							shipmentTrackingHistoryRepository.save(pickupHistory);
+						}
 
 						logger.info("Step SHIPROCKET_RETURN_PICKUP_SCHEDULE SUCCESS for orderId={}",
 								order.getOrderId());
@@ -1750,8 +2071,8 @@ public class OrderServiceImpl implements OrderService {
 	private boolean isValidOrderId(String orderId) {
 		if (orderId == null)
 			return false;
-		// Example pattern: ORD-<digits>-<6 digits>
-		return orderId.matches("ORD-\\d{12}-\\d{6}");
+		// Example pattern: ORD-<digits>-<6 digits> (case-insensitive)
+		return orderId.toUpperCase().matches("ORD-\\d{12}-\\d{6}");
 	}
 
 	/**
@@ -2026,12 +2347,15 @@ public class OrderServiceImpl implements OrderService {
 					List<ShippingEO> shipmentList = shippingRepository.findByOrder(order);
 					if (shipmentList != null && !shipmentList.isEmpty()) {
 						ShippingEO savedShippingEO = shipmentList.get(0);
-						ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
-						shipmentTrackingHistoryEO.setShipment(savedShippingEO);
-						shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_ORDER_REFUND_PROCESSED);
-						shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_REFUND_PROCESSED_REMARK);
-						shipmentTrackingHistoryEO.setUpdatedAt(LocalDateTime.now());
-						shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+						if (!shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(savedShippingEO,
+								Constants.SHIPMENT_ORDER_REFUND_PROCESSED)) {
+							ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
+							shipmentTrackingHistoryEO.setShipment(savedShippingEO);
+							shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_ORDER_REFUND_PROCESSED);
+							shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_REFUND_PROCESSED_REMARK);
+							shipmentTrackingHistoryEO.setUpdatedAt(LocalDateTime.now());
+							shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+						}
 					}
 					logger.info("Razorpay refund SUCCESS: refundId={}, refundReference={}", refund.get("id"),
 							event.getRefundReference());
@@ -2048,8 +2372,8 @@ public class OrderServiceImpl implements OrderService {
 				refundTransaction.setFailureReason("Razorpay error: " + re.getMessage());
 			}
 			catch (Exception e) {
-				logger.error("Unexpected error during Razorpay refund for refundReference={}: {}",
-						event.getRefundReference(), e.getMessage(), e);
+				logger.error("Unexpected error during Razorpay refund for refundReference={}: {}", event.getRefundReference(),
+						e.getMessage(), e);
 				refundTransaction.setStatus(Constants.PAYMENT_REFUND_STATUS_FAILED);
 				refundTransaction.setFailureReason("Exception during refund: " + e.getMessage());
 			}
@@ -3019,8 +3343,8 @@ public class OrderServiceImpl implements OrderService {
 
 		}
 		catch (Exception e) {
-			logger.error("Error in approveReturnRequest for returnId={}: {}",
-					request != null ? request.getReturnId() : null, e.getMessage(), e);
+			logger.error("Error in approveReturnRequest for returnId={}: {}", request != null ? request.getReturnId() : null,
+					e.getMessage(), e);
 			response.setResponseStatus(Constants.FAILURE_STATUS);
 			response.setResponseMessage("Failed to process return request. Please contact support.");
 		}
@@ -3273,6 +3597,7 @@ public class OrderServiceImpl implements OrderService {
 	// ── Order + Shipment combined view ──────────────────────────────────────
 
 	@Override
+	@Transactional(readOnly = true)
 	public OrderShipmentListResponseDTO getOrdersWithShipments(OrderShipmentSearchRequestDTO request) {
 		logger.info(
 				"getOrdersWithShipments called with filters: orderStatus={}, orderNumber={}, createdFrom={}, createdTo={}, shipmentNumber={}",
@@ -3371,6 +3696,18 @@ public class OrderServiceImpl implements OrderService {
 			.map(this::buildShipmentInfo)
 			.collect(Collectors.toList());
 
+		// Payment info
+		PaymentInfoDTO paymentInfo = paymentRepository.findByOrder(order)
+			.map(p -> PaymentInfoDTO.builder()
+				.paymentMethod(p.getPaymentMethod())
+				.paymentProvider(p.getPaymentProvider())
+				.transactionId(p.getTransactionId())
+				.amount(p.getAmount())
+				.paymentStatus(p.getPaymentStatus())
+				.paymentTime(p.getPaymentTime())
+				.build())
+			.orElse(null);
+
 		return OrderShipmentDetailDTO.builder()
 			.orderId(order.getOrderId())
 			.orderNumber(order.getOrderNumber())
@@ -3388,8 +3725,160 @@ public class OrderServiceImpl implements OrderService {
 			.customerPhone(customerPhone)
 			.shippingAddress(shippingAddr)
 			.billingAddress(billingAddr)
+			.payment(paymentInfo)
 			.shipments(shipmentInfoList)
+			.shiprocketOrderPayload(buildShiprocketOrderPayload(order, addresses, shipments))
 			.build();
+	}
+
+	/**
+	 * Builds the full payload required to create a NEW order on Shiprocket for the
+	 * given order, mirroring the request constructed in
+	 * {@code ShippingServiceImpl.processCreateShipmentEvent}. Best-effort: any
+	 * failure (e.g. no carton fits) is captured in {@code cartonSelectionError}
+	 * rather than throwing, since this is a read-only preview endpoint.
+	 */
+	private ShiprocketOrderPayloadDTO buildShiprocketOrderPayload(OrderEO order, List<OrderAddressEO> addresses,
+			List<ShippingEO> shipments) {
+		try {
+			OrderAddressEO billingOrShipping = addresses.stream()
+				.filter(a -> "BILLING".equalsIgnoreCase(a.getAddressType()) || "BOTH".equalsIgnoreCase(a.getAddressType()))
+				.findFirst()
+				.orElse(addresses.stream().findFirst().orElse(null));
+
+			CustomerEO customer = order.getCustomer();
+
+			// Resolve pickup warehouse from an existing shipment, if any
+			String pickupLocation = null;
+			String channelId = null;
+			if (shipments != null) {
+				for (ShippingEO s : shipments) {
+					if (s.getWarehouse() != null) {
+						pickupLocation = s.getWarehouse().getWarehouseName();
+						channelId = s.getWarehouse().getChannelId();
+						break;
+					}
+				}
+			}
+
+			String customerName = customer != null ? customer.getFirstName() : null;
+			String customerMobile = customer != null ? customer.getMobileNumber() : null;
+			if (customerName == null || customerName.isBlank()) {
+				customerName = billingOrShipping != null ? billingOrShipping.getRecipientName() : customerMobile;
+			}
+
+			List<OrderItemEO> orderItems = orderProductRepository.findByOrder(order);
+
+			List<ShiprocketOrderItemPayloadDTO> itemPayloads = new ArrayList<>();
+			double weight = 0.0;
+			for (OrderItemEO item : orderItems) {
+				ProductVariantEO variant = item.getProductVar();
+				int qty = item.getQuantity() != null ? item.getQuantity() : 1;
+				double discount = 0.0;
+				if (variant != null && variant.getMrp() != null && variant.getSellingPrice() != null) {
+					discount = variant.getMrp().doubleValue() - variant.getSellingPrice().doubleValue();
+				}
+				if (variant != null) {
+					weight += variant.getWeight() * qty;
+				}
+				itemPayloads.add(ShiprocketOrderItemPayloadDTO.builder()
+					.name(variant != null && variant.getProduct() != null ? variant.getProduct().getName() : null)
+					.sku(variant != null ? variant.getSkuCode() : null)
+					.units(item.getQuantity())
+					.sellingPrice(item.getUnitPrice())
+					.discount(discount)
+					.tax(0)
+					.hsn("")
+					.build());
+			}
+
+			Double length = null;
+			Double breadth = null;
+			Double height = null;
+			Double totalWeight = null;
+			String selectedCartonName = null;
+			String cartonSelectionError = null;
+			try {
+				CartonEO selectedCarton = cartonSelectionService.selectCarton(orderItems);
+				length = selectedCarton.getLength();
+				breadth = selectedCarton.getBreadth();
+				height = selectedCarton.getHeight();
+				// variant weight (weight) and carton emptyWeight are both captured in
+				// GRAMS (see product-api-docs.md / shipping-api-docs.md), but Shiprocket
+				// expects kilograms — convert the combined total from grams to kg.
+				totalWeight = (selectedCarton.getEmptyWeight() + weight) / 1000.0;
+				selectedCartonName = selectedCarton.getName();
+			}
+			catch (Exception cartonEx) {
+				cartonSelectionError = cartonEx.getMessage();
+			}
+
+			boolean alreadyCreated = shipments != null
+					&& shipments.stream().anyMatch(s -> s.getShipOrderId() != null && s.getShipShipmentId() != null);
+
+			return ShiprocketOrderPayloadDTO.builder()
+				.orderId(order.getOrderNumber())
+				.orderDate(order.getCreatedAt() != null
+						? order.getCreatedAt().format(DateTimeFormatter.ofPattern("d-M-yyyy"))
+						: LocalDate.now().format(DateTimeFormatter.ofPattern("d-M-yyyy")))
+				.pickupLocation(pickupLocation != null ? pickupLocation : "warehouse")
+				.channelId(channelId != null ? channelId : Constants.DEFAULT_SHIPMENT_CHANNEL_ID)
+				.billingCustomerName(customerName)
+				.billingLastName("")
+				.billingAddress(billingOrShipping != null ? billingOrShipping.getAddressLine1() : "")
+				.billingCity(billingOrShipping != null ? billingOrShipping.getCity() : "")
+				.billingPincode(billingOrShipping != null ? billingOrShipping.getPostalCode() : "")
+				.billingState(billingOrShipping != null ? billingOrShipping.getState() : "")
+				.billingCountry(billingOrShipping != null && billingOrShipping.getCountry() != null
+						&& !billingOrShipping.getCountry().isEmpty() ? billingOrShipping.getCountry() : "India")
+				.billingEmail(customer != null ? customer.getEmail() : "")
+				.billingPhone(customerMobile)
+				.shippingIsBilling(true)
+				.paymentMethod(order.getPaymentStatus() != null && order.getPaymentStatus().equalsIgnoreCase("PAID")
+						? "Prepaid" : "COD")
+				.subTotal(order.getTotalAmount())
+				.length(length)
+				.breadth(breadth)
+				.height(height)
+				.weight(totalWeight)
+				.selectedCartonName(selectedCartonName)
+				.cartonSelectionError(cartonSelectionError)
+				.orderItems(itemPayloads)
+				.alreadyCreatedOnShiprocket(alreadyCreated)
+				.build();
+		}
+		catch (Exception e) {
+			logger.warn("Failed to build Shiprocket order payload for orderId={}: {}", order.getOrderId(),
+					e.getMessage(), e);
+			return null;
+		}
+	}
+
+	/**
+	 * Maps Razorpay's raw "method" field (card/netbanking/wallet/upi/emi) to our internal
+	 * Constants.PAYMENT_METHOD_* values. Falls back to the raw value (uppercased) if unknown,
+	 * so we never silently lose information.
+	 */
+	private String mapRazorpayMethod(String rzpMethod) {
+		if (rzpMethod == null || rzpMethod.isBlank()) {
+			return null;
+		}
+		switch (rzpMethod.trim().toLowerCase()) {
+			case "card":
+				return Constants.PAYMENT_METHOD_CARD;
+			case "netbanking":
+				return Constants.PAYMENT_METHOD_NETBANKING;
+			case "wallet":
+				return Constants.PAYMENT_METHOD_WALLET;
+			case "upi":
+				return Constants.PAYMENT_METHOD_UPI;
+			case "emi":
+				return Constants.PAYMENT_METHOD_EMI;
+			case "paylater":
+				return Constants.PAYMENT_METHOD_PAY_LATER;
+			default:
+				return rzpMethod.trim().toUpperCase();
+		}
 	}
 
 	private OrderAddressDTO mapAddress(OrderAddressEO a) {
@@ -3445,6 +3934,44 @@ public class OrderServiceImpl implements OrderService {
 			logger.warn("Failed to load courier candidates for shipmentId={}: {}", s.getShipmentId(), e.getMessage());
 		}
 
+		// Shipment items (order items packed into this shipment) from shipment_items
+		List<ShipmentItemDTO> shipmentItems = java.util.Collections.emptyList();
+		try {
+			shipmentItems = shipmentItemRepository.findByShipment(s)
+				.stream()
+				.map(this::buildShipmentItemDTO)
+				.collect(Collectors.toList());
+		}
+		catch (Exception e) {
+			logger.warn("Failed to load shipment items for shipmentId={}: {}", s.getShipmentId(), e.getMessage());
+		}
+
+		// Shiprocket integration audit trail from shiprocket_order_log
+		List<ShiprocketOrderLogDTO> shiprocketOrderLogs = java.util.Collections.emptyList();
+		try {
+			if (s.getShipmentId() != null) {
+				shiprocketOrderLogs = shiprocketOrderLogRepository.findByShipmentId(s.getShipmentId())
+					.stream()
+					.sorted(java.util.Comparator.comparing(ShiprocketOrderLogEO::getCreatedAt,
+							java.util.Comparator.nullsLast(java.util.Comparator.naturalOrder())))
+					.map(this::buildShiprocketOrderLogDTO)
+					.collect(Collectors.toList());
+			}
+		}
+		catch (Exception e) {
+			logger.warn("Failed to load shiprocket order logs for shipmentId={}: {}", s.getShipmentId(),
+					e.getMessage());
+		}
+
+		// Carton used — best-effort match on packed dimensions from the carton table
+		CartonInfoDTO cartonUsed = null;
+		try {
+			cartonUsed = findMatchingCarton(s);
+		}
+		catch (Exception e) {
+			logger.warn("Failed to resolve carton used for shipmentId={}: {}", s.getShipmentId(), e.getMessage());
+		}
+
 		return ShipmentInfoDTO.builder()
 			.shipmentId(s.getShipmentId())
 			.trackingNumber(s.getTrackingNumber())
@@ -3471,7 +3998,76 @@ public class OrderServiceImpl implements OrderService {
 			.createdAt(s.getCreatedAt())
 			.updatedAt(s.getUpdatedAt())
 			.shipmentHistory(history)
+			.shipmentItems(shipmentItems)
+			.shiprocketOrderLogs(shiprocketOrderLogs)
+			.cartonUsed(cartonUsed)
 			.build();
+	}
+
+	private ShipmentItemDTO buildShipmentItemDTO(ShipmentItemEO item) {
+		OrderItemEO orderItem = item.getOrderItem();
+		return ShipmentItemDTO.builder()
+			.shipmentItemId(item.getShipmentItemId())
+			.orderItemId(orderItem != null ? orderItem.getOrderItemId() : null)
+			.skuCode(orderItem != null ? orderItem.getSkuCode() : null)
+			.productVarName(orderItem != null ? orderItem.getProductVarName() : null)
+			.quantity(item.getQuantity())
+			.unitPrice(orderItem != null ? orderItem.getUnitPrice() : null)
+			.totalPrice(orderItem != null ? orderItem.getTotalPrice() : null)
+			.createdAt(item.getCreatedAt())
+			.build();
+	}
+
+	private ShiprocketOrderLogDTO buildShiprocketOrderLogDTO(ShiprocketOrderLogEO log) {
+		return ShiprocketOrderLogDTO.builder()
+			.id(log.getId())
+			.shipmentId(log.getShipmentId())
+			.orderId(log.getOrderId())
+			.warehouseId(log.getWarehouseId())
+			.step(log.getStep())
+			.status(log.getStatus())
+			.shiprocketOrderId(log.getShiprocketOrderId())
+			.shiprocketShipmentId(log.getShiprocketShipmentId())
+			.awbCode(log.getAwbCode())
+			.labelUrl(log.getLabelUrl())
+			.errorMessage(log.getErrorMessage())
+			.createdAt(log.getCreatedAt())
+			.updatedAt(log.getUpdatedAt())
+			.build();
+	}
+
+	/**
+	 * The {@code shipping} table does not persist a direct FK to {@code carton}, so we
+	 * best-effort match the carton used for packing by comparing the shipment's stored
+	 * dimensions (length/breadth/height) against active carton definitions.
+	 */
+	private CartonInfoDTO findMatchingCarton(ShippingEO s) {
+		if (s.getLength() == null || s.getBreadth() == null || s.getHeight() == null) {
+			return null;
+		}
+		List<CartonEO> cartons = cartonRepository.findAll();
+		return cartons.stream()
+			.filter(c -> approxEquals(c.getLength(), s.getLength()) && approxEquals(c.getBreadth(), s.getBreadth())
+					&& approxEquals(c.getHeight(), s.getHeight()))
+			.findFirst()
+			.map(c -> CartonInfoDTO.builder()
+				.id(c.getId())
+				.name(c.getName())
+				.length(c.getLength())
+				.breadth(c.getBreadth())
+				.height(c.getHeight())
+				.maxWeight(c.getMaxWeight())
+				.emptyWeight(c.getEmptyWeight())
+				.status(c.getStatus())
+				.build())
+			.orElse(null);
+	}
+
+	private boolean approxEquals(double a, Double b) {
+		if (b == null) {
+			return false;
+		}
+		return Math.abs(a - b) < 0.01;
 	}
 
 	// ── Retry Payment ────────────────────────────────────────────────────────
@@ -3554,6 +4150,7 @@ public class OrderServiceImpl implements OrderService {
 			payment.setPaymentProviderOrderId(newRazorpayOrderId);
 			payment.setPaymentStatus("CREATED");
 			payment.setAmount(razorpayAmount);
+			payment.setPaymentProvider(Constants.PAYMENT_PROVIDER_RAZORPAY);
 			paymentRepository.save(payment);
 
 			logger.info("retryPayment: new Razorpay orderId={} created for orderNumber={}", newRazorpayOrderId,

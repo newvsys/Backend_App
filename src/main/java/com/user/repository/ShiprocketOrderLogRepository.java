@@ -10,6 +10,8 @@ public interface ShiprocketOrderLogRepository extends JpaRepository<ShiprocketOr
 
 	List<ShiprocketOrderLogEO> findByShipmentId(Long shipmentId);
 
+	List<ShiprocketOrderLogEO> findByShipmentIdOrderByCreatedAtAsc(Long shipmentId);
+
 	List<ShiprocketOrderLogEO> findByOrderId(Long orderId);
 
 	Optional<ShiprocketOrderLogEO> findFirstByShipmentIdOrderByCreatedAtDesc(Long shipmentId);

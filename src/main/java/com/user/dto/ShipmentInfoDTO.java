@@ -71,4 +71,13 @@ public class ShipmentInfoDTO {
 	/** Full shipment tracking/history events ordered by time ascending. */
 	private List<ShipTrackHistoryDTO> shipmentHistory;
 
+	/** Order items packed into this shipment, from the shipment_items table. */
+	private List<ShipmentItemDTO> shipmentItems;
+
+	/** Shiprocket integration audit trail for this shipment, from shiprocket_order_log. */
+	private List<ShiprocketOrderLogDTO> shiprocketOrderLogs;
+
+	/** Carton/box used to pack this shipment (best-effort match via dimensions), from the carton table. */
+	private CartonInfoDTO cartonUsed;
+
 }

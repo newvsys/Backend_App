@@ -35,27 +35,30 @@ public class Constants {
 	public static final String ROLE_ADMIN = "admin";
 
 	// Order Payment & Status
-	public static final String ORDER_PAYMENT_STATUS_PENDING = "PENDING";
+	public static final String ORDER_PAYMENT_STATUS_PENDING = "Payment Pending";
 
-	public static final String ORDER_PAYMENT_STATUS_PAID = "PAID";
+	public static final String ORDER_PAYMENT_STATUS_PAID = "Paid";
 
-	public static final String ORDER_PAYMENT_STATUS_FAILED = "FAILED";
+	public static final String ORDER_PAYMENT_STATUS_FAILED = "Payment Failed";
 
 	public static final String ORDER_STATUS_CONFIRMED = "Confirmed";
 
-	public static final String ORDER_STATUS_PAYMENT_FAILED = "PAYMENT FAILED";
+	public static final String ORDER_STATUS_PAYMENT_FAILED = "Payment Failed";
 
 	public static final String ORDER_STATUS_DELIVERED = "Delivered";
 
-	public static final String ORDER_STATUS_CANCELLED = "CANCELLED";
+	public static final String ORDER_STATUS_CANCELLED = "Cancelled";
 
 	public static final String ORDER_STATUS_RETURNED = "Returned";
 
 	public static final String ORDER_STATUS_SHIPPED = "Out for Delivery";
 
-	// Shipment
+	public static final String ORDER_STATUS_READY_TO_SHIP = "Ready to Ship";
 
+	public static final String ORDER_STATUS_PICKUP_SCHEDULED = "Pickup scheduled";
+	// Shipment
 	public static final String SHIPMENT_STATUS_CREATED = "CREATED";
+	public static final String SHIPMENT_STATUS_INITIALIZED = "INITIALIZED";
 
 	public static final String SHIPMENT_STATUS_DELIVERED = "DELIVERED";
 
@@ -212,6 +215,8 @@ public class Constants {
 
 	public static final String COMMUNICATION_PURPOSE_REFUND = "REFUND";
 
+	public static final String COMMUNICATION_PURPOSE_ADMIN_PROCESS_SHIPMENT = "ADMIN_PROCESS_SHIPMENT";
+
 	public static final String COMMUNICATION_CHANNEL_EMAIL = "EMAIL";
 
 	public static final String COMMUNICATION_CHANNEL_SMS = "SMS";
@@ -223,6 +228,8 @@ public class Constants {
 
 	// Unified order event types
 	public static final String ORDER_EVENT_TYPE_CREATED = "ORDER_CREATED";
+
+	public static final String ORDER_EVENT_TYPE_CONFIRMED = "ORDER_CONFIRMED";
 
 	public static final String ORDER_EVENT_TYPE_CANCELLED = "ORDER_CANCELLED";
 
@@ -236,6 +243,8 @@ public class Constants {
 
 	// Carton event types
 	public static final String CARTON_EVENT_TYPE_CREATED = "CARTON_CREATED";
+
+	public static final String CARTON_EVENT_TYPE_NOT_FOUND = "CARTON_NOT_FOUND";
 
 	// Reason Types & Status
 	public static final String REASON_TYPE_CANCELLATION = "CANCELLATION";
@@ -287,7 +296,7 @@ public class Constants {
 
 	public static final String ORDER_CREATED_FAILURE = "order not submitted due to some technical error. Please try again later.";
 
-	public static final String STORE_NAME = "Kuchi Mittai";
+	public static final String STORE_NAME = "TryNat";
 
 	public static final String ORDER_DESCRIPTION = "Order Payment";
 
@@ -299,55 +308,16 @@ public class Constants {
 
 	public static final String ADDRESS_TYPE_BOTH = "BOTH";
 
-	public static final String PHONE_NO_MISSING_CUST_USER = "Phone number is required for guest checkout";
+	public static final String ADDRESS_TYPE_SHIPPING = "SHIPPING";
 
-	// Payment Methods
-	public static final String PAYMENT_METHOD_COD = "COD";
+	public static final String ADDRESS_TYPE_BILLING = "BILLING";
 
-	public static final String PAYMENT_METHOD_UPI = "UPI";
+	public static final String ADDRESS_TYPE_WAREHOUSE = "WAREHOUSE";
 
-	public static final String PAYMENT_METHOD_CARD = "CARD";
-
-	public static final String PAYMENT_METHOD_NETBANKING = "NETBANKING";
-
-	public static final String PAYMENT_METHOD_WALLET = "WALLET";
-
-	public static final String PAYMENT_METHOD_EMI = "EMI";
-
-	public static final String PAYMENT_METHOD_PAY_LATER = "PAY_LATER";
-
-	public static final String PAYMENT_REFUND_REFERENCE_MISSING = "Refund reference No is required for Process the Refund.";
-
-	public static final String PAYMENT_REFUND_STATUS_INPROGRESS = "IN_PROGRESS";
-
-	public static final String PAYMENT_REFUND_STATUS_SUCCESS = "SUCCESS";
-
-	public static final String PAYMENT_REFUND_STATUS_FAILED = "FAILED";
-
-	public static final String PAYMENT_REFUND_STATUS_APPROVED = "APPROVED";
-
-	// Return Types
-	public static final String RETURN_TYPE_RETURN = "RETURN";
-
-	public static final String RETURN_TYPE_EXCHANGE = "EXCHANGE";
-
-	// Warehouse
-	/**
-	 * Name of the default/primary warehouse used as the pickup location when no specific
-	 * warehouse name is provided (e.g. in serviceability checks). Update this value to
-	 * match the exact warehouse name stored in the database.
-	 */
 	public static final String DEFAULT_WAREHOUSE_NAME = "warehouse";
 
-	/**
-	 * Flag indicating whether multi-warehouse fulfilment is configured/enabled for this
-	 * deployment. When {@code true}, serviceability checks (e.g.
-	 * {@code checkVariantServiceability}) resolve and check EVERY warehouse linked to a
-	 * variant's inventory. When {@code false}, the system is running in a single
-	 * (default) warehouse setup, so serviceability checks simply use the default
-	 * warehouse's pincode directly, skipping the per-inventory-record warehouse
-	 * resolution/iteration entirely.
-	 */
+	public static final String DEFAULT_SHIPMENT_CHANNEL_ID = "10576563";
+
 	public static final boolean IS_MULTI_WAREHOUSE_CONFIGURED = false;
 
 	// MSG91 Email
@@ -363,5 +333,47 @@ public class Constants {
 	 * configured in the LabelConfig record.
 	 */
 	public static final String DEFAULT_LABEL_LOGO_PATH = "/public/companyLogo/CompanyLogo.png";
+
+	// Payment Provider constants
+	public static final String PAYMENT_PROVIDER_RAZORPAY = "razorpay";
+
+	// Payment Status constants
+	public static final String PAYMENT_STATUS_CREATED = "CREATED";
+
+	// Payment Refund Status constants
+	public static final String PAYMENT_REFUND_STATUS_INPROGRESS = "INPROGRESS";
+
+	public static final String PAYMENT_REFUND_STATUS_FAILED = "FAILED";
+
+	public static final String PAYMENT_REFUND_STATUS_SUCCESS = "SUCCESS";
+
+	public static final String PAYMENT_REFUND_STATUS_APPROVED = "APPROVED";
+
+	// Payment Refund Reference
+	public static final String PAYMENT_REFUND_REFERENCE_MISSING = "REFUND_REFERENCE_MISSING";
+
+	// Payment Method constants
+	public static final String PAYMENT_METHOD_CARD = "card";
+
+	public static final String PAYMENT_METHOD_NETBANKING = "netbanking";
+
+	public static final String PAYMENT_METHOD_WALLET = "wallet";
+
+	public static final String PAYMENT_METHOD_UPI = "upi";
+
+	public static final String PAYMENT_METHOD_EMI = "emi";
+
+	public static final String PAYMENT_METHOD_PAY_LATER = "pay_later";
+
+	// Capture Status constants
+	public static final String CAPTURE_STATUS_CAPTURED = "CAPTURED";
+
+	public static final String CAPTURE_STATUS_FAILED_OR_ALREADY_CAPTURED = "FAILED_OR_ALREADY_CAPTURED";
+
+	// Return Type constants
+	public static final String RETURN_TYPE_RETURN = "RETURN";
+
+	// User validation messages
+	public static final String PHONE_NO_MISSING_CUST_USER = "Phone number is missing for customer user";
 
 }

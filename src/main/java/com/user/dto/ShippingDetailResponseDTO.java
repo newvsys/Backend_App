@@ -84,6 +84,11 @@ public class ShippingDetailResponseDTO {
 
 	private String warehouseName;
 
+	// ── Carton ────────────────────────────────────────────────────────────
+	private Long cartonId;
+
+	private String cartonNo;
+
 	// ── Dates ─────────────────────────────────────────────────────────────
 	private LocalDateTime pickupScheduledDate;
 

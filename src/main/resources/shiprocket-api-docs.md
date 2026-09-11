@@ -393,7 +393,125 @@ Content-Type: application/json
 
 ---
 
-## 5. Track Shipment (Raw)
+## 5. Get Available Courier Services (Excluding Blocklisted)
+
+Returns the list of courier services available for a given order, **excluding** any courier whose `courier_company_id` is present in the internal courier blocklist (`Constants.BLOCKLISTED_COURIER_COMPANY_IDS`). Useful for letting the customer/admin explicitly pick a courier instead of relying on auto-selection, while ensuring blocked couriers are never shown.
+
+Pickup postcode, delivery postcode, weight and dimensions are **resolved internally** from the order's existing shipment (if any, preferring an active non-cancelled `FORWARD` shipment) and its shipping address — no request body is required. This mirrors the internal serviceability lookup used by the automated Shiprocket order-processing flow.
+
+### Request
+
+```
+GET /api/shipping/available-courier-services/{orderId}
+```
+
+### Path Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `orderId` | Long | Yes | Internal order id (`OrderEO.orderId`) |
+
+### Internal Resolution Logic
+
+| Value | Resolved From |
+|---|---|
+| Delivery postcode | Order's shipping address (`OrderAddressEO.postalCode`) |
+| Pickup postcode | Warehouse of the order's preferred shipment; falls back to the default warehouse (`Constants.DEFAULT_WAREHOUSE_NAME`) |
+| Weight | Existing shipment's recorded weight (`ShippingEO.weight`), floored at a minimum of `1.1` kg |
+| Length / Breadth / Height | Existing shipment's recorded dimensions, if present and greater than `0` |
+| COD | `0` (Prepaid) if the order's payment status is `PAID`, otherwise `1` (Cash on Delivery) |
+
+### Example Request
+
+```
+GET /api/shipping/available-courier-services/1024
+```
+
+### Response — `200 OK`
+
+| Field | Type | Description |
+|---|---|---|
+| `responseStatus` | String | `"SUCCESS"` or `"FAILURE"` |
+| `responseMessage` | String | Human-readable result message |
+| `totalCount` | Integer | Number of courier services returned (after excluding blocklisted couriers) |
+| `currentlyUsedCourierId` | Integer | The `courier_company_id` currently assigned to the order's shipment (`ShippingEO.courierCompanyId`), if a shipment record exists. `null` if no shipment exists yet or no courier has been assigned |
+| `courierServices` | Array | List of available courier service objects (see below) |
+
+**`courierServices[]` item:**
+
+| Field | Type | Description |
+|---|---|---|
+| `courierId` | Integer | Shiprocket `courier_company_id` |
+| `courierName` | String | Courier display name (e.g. `"Delhivery Surface"`) |
+| `price` | Double | Freight/shipping rate for this courier |
+| `codCharges` | Double | Additional COD handling charges, if applicable |
+| `otherCharges` | Double | Any other charges levied by the courier |
+| `estimatedDeliveryDays` | Double | Estimated number of days for delivery |
+| `estimatedDeliveryDate` | String | Estimated delivery date as returned by Shiprocket (raw `etd` field) |
+| `rating` | Double | Courier's overall rating (out of 5), if provided |
+| `codAvailable` | Boolean | Whether Cash-on-Delivery is available with this courier |
+| `isAir` | Boolean | Whether this is an air-shipping courier option |
+| `isSurface` | Boolean | Whether this is a surface-shipping courier option |
+
+### Example Response
+
+```json
+{
+  "responseStatus": "SUCCESS",
+  "responseMessage": "Fetched 3 available courier service(s).",
+  "totalCount": 3,
+  "currentlyUsedCourierId": 10,
+  "courierServices": [
+    {
+      "courierId": 10,
+      "courierName": "Delhivery Surface",
+      "price": 55.5,
+      "codCharges": 20.0,
+      "otherCharges": 0.0,
+      "estimatedDeliveryDays": 3.0,
+      "estimatedDeliveryDate": "Sep 12, 2026",
+      "rating": 4.2,
+      "codAvailable": true,
+      "isAir": false,
+      "isSurface": true
+    },
+    {
+      "courierId": 22,
+      "courierName": "Xpressbees Air",
+      "price": 89.0,
+      "codCharges": 25.0,
+      "otherCharges": 0.0,
+      "estimatedDeliveryDays": 1.0,
+      "estimatedDeliveryDate": "Sep 10, 2026",
+      "rating": 3.9,
+      "codAvailable": true,
+      "isAir": true,
+      "isSurface": false
+    }
+  ]
+}
+```
+
+> **Blocklist behaviour:** Any courier whose `courier_company_id` is in `Constants.BLOCKLISTED_COURIER_COMPANY_IDS` (e.g. `54`) is silently omitted from `courierServices` — it will never appear in the response even if Shiprocket returns it as serviceable.
+
+### Error Responses
+
+| Status | Condition |
+|---|---|
+| 400 | `orderId` is missing/null, order not found, no shipping address / delivery postcode found, unable to resolve a pickup postcode, or invalid postcode values (`responseStatus: FAILURE`) |
+| 502 | Shiprocket serviceability API call failed (`responseStatus: FAILURE`) |
+| 500 | Unexpected internal server error (`responseStatus: FAILURE`) |
+
+### cURL Example
+
+```bash
+curl -X GET "http://localhost:8080/api/shipping/available-courier-services/1024"
+```
+
+---
+
+
+## 6. Track Shipment (Raw)
 
 Returns live tracking data directly from the Shiprocket API for a given AWB code.
 
@@ -445,7 +563,7 @@ GET /api/shipping/track/14492489597159
 
 ---
 
-## 6. Track Shipment (Combined)
+## 7. Track Shipment (Combined)
 
 Returns a combined view of:
 - Internal shipment record from the database
@@ -551,7 +669,7 @@ GET /api/shipping/track-shipment/14492489597159
 
 ---
 
-## 7. Shiprocket Webhook
+## 8. Shiprocket Webhook
 
 Receives real-time shipment status update notifications from Shiprocket. Shiprocket calls this endpoint automatically whenever a shipment status changes (e.g. Picked Up → In Transit → Out for Delivery → Delivered).
 
@@ -687,6 +805,16 @@ Content-Type: application/json
 | `GET` | `/api/shipping/serviceability` | Quick pincode serviceability check | Frontend |
 | `POST` | `/api/shipping/serviceabilityWithAllParams` | Full serviceability + rate check with all params | Frontend |
 | `POST` | `/api/shipping/serviceability/by-variants` | Serviceability check by product variant IDs (warehouse-aware, default warehouse fallback) | Frontend |
+| `GET` | `/api/shipping/available-courier-services/{orderId}` | List available courier services for an order (pickup/delivery/weight resolved internally), excluding blocklisted couriers | Frontend / Admin |
 | `GET` | `/api/shipping/track/{awb}` | Raw live tracking from Shiprocket | Frontend / Internal |
 | `GET` | `/api/shipping/track-shipment/{awbCode}` | Combined DB + live tracking view | Frontend |
 | `POST` | `/api/shipping/webhook` | Receive status updates from Shiprocket | Shiprocket (external) |
+
+---
+
+## Changelog
+
+- **2026-09-08** — Changed `GET /api/shipping/available-courier-services/{orderId}` from a request-body-based POST to an order-id-based GET. Pickup/delivery postcode and shipment weight/dimensions are now resolved internally from the order's existing shipment and shipping address (mirroring the internal serviceability lookup used during automated Shiprocket processing), and the response now includes `currentlyUsedCourierId` — the courier currently assigned to the order's shipment, if any. See [Section 5](#5-get-available-courier-services-excluding-blocklisted).
+- **2026-09-08** — Added `POST /api/shipping/available-courier-services` — lists all Shiprocket-serviceable couriers for a given pickup/delivery pair while excluding any courier present in the internal blocklist (`Constants.BLOCKLISTED_COURIER_COMPANY_IDS`). See [Section 5](#5-get-available-courier-services-excluding-blocklisted).
+
+

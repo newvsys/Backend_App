@@ -135,6 +135,64 @@ public class ShiprocketController {
 		return ResponseEntity.ok(response);
 	}
 
+	/**
+	 * GET /api/shipping/available-courier-services/{orderId}
+	 *
+	 * <p>
+	 * Returns the list of available courier services for the given order,
+	 * EXCLUDING any courier present in {@link Constants#BLOCKLISTED_COURIER_COMPANY_IDS}.
+	 * Pickup postcode, delivery postcode and shipment weight/dimensions are
+	 * resolved internally from the order's existing shipment (if any) and its
+	 * shipping address — no request body is required. Each entry in the response
+	 * contains the courier id, name, price, estimated delivery, rating, and COD
+	 * availability — useful for letting the customer/admin pick a courier
+	 * explicitly instead of relying on auto-selection.
+	 * @param orderId internal order id (OrderEO.orderId)
+	 */
+	@GetMapping("/available-courier-services/{orderId}")
+	public ResponseEntity<AvailableCourierServicesResponseDTO> getAvailableCourierServices(
+			@PathVariable("orderId") Long orderId) {
+
+		logger.info("getAvailableCourierServices called for orderId={}", orderId);
+
+		if (orderId == null) {
+			return ResponseEntity.badRequest()
+				.body(AvailableCourierServicesResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("orderId is required")
+					.totalCount(0)
+					.build());
+		}
+
+		try {
+			AvailableCourierServicesResponseDTO response = shippingService.getAvailableCourierServicesByOrderId(orderId);
+			if (Constants.FAILURE_STATUS.equals(response.getResponseStatus())) {
+				return ResponseEntity.badRequest().body(response);
+			}
+			return ResponseEntity.ok(response);
+		}
+		catch (org.springframework.web.client.RestClientException ex) {
+			logger.error("getAvailableCourierServices: Shiprocket API error for orderId={} - {}", orderId,
+					ex.getMessage(), ex);
+			return ResponseEntity.status(org.springframework.http.HttpStatus.BAD_GATEWAY)
+				.body(AvailableCourierServicesResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("Failed to reach Shiprocket serviceability API: " + ex.getMessage())
+					.totalCount(0)
+					.build());
+		}
+		catch (Exception ex) {
+			logger.error("getAvailableCourierServices: unexpected error for orderId={} - {}", orderId,
+					ex.getMessage(), ex);
+			return ResponseEntity.status(500)
+				.body(AvailableCourierServicesResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("An error occurred while fetching available courier services.")
+					.totalCount(0)
+					.build());
+		}
+	}
+
 	// Track a shipment (raw Shiprocket live data only)
 	@GetMapping("/track/{awb}")
 	public ResponseEntity<Map> track(@PathVariable String awb) {

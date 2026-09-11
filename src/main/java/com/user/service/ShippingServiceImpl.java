@@ -3,7 +3,6 @@ package com.user.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.user.communication.event.EmailDetails;
 import com.user.communication.event.Event;
-import com.user.communication.event.OrderEvent;
 import com.user.communication.event.RefundInitiatedEvent;
 import com.user.communication.event.ShiprocketOrderEvent;
 import com.user.communication.service.NotificationService;
@@ -14,7 +13,6 @@ import com.user.repository.*;
 import com.user.utility.Constants;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
@@ -116,6 +114,24 @@ public class ShippingServiceImpl implements ShippingService {
 	@Autowired
 	private WarehouseRepository warehouseRepository;
 
+	@Autowired
+	private ShiprocketOrderStatusHistoryRepository shiprocketOrderStatusHistoryRepository;
+
+	@Autowired
+	private GenerateAwbStatusHistoryRepository generateAwbStatusHistoryRepository;
+
+	@Autowired
+	private RequestPickupStatusHistoryRepository requestPickupStatusHistoryRepository;
+
+	@Autowired
+	private GenerateLabelStatusHistoryRepository generateLabelStatusHistoryRepository;
+
+	@Autowired
+	private TrackShipmentStatusHistoryRepository trackShipmentStatusHistoryRepository;
+
+	@Autowired
+	private EstimateStatusHistoryRepository estimateStatusHistoryRepository;
+
 	private static final Logger logger = LoggerFactory.getLogger(ShippingServiceImpl.class);
 
 	/**
@@ -131,125 +147,222 @@ public class ShippingServiceImpl implements ShippingService {
 	}
 
 	@Override
-	@Async("shipmentTaskExecutor")
-	public void processCreateShipmentEvent(OrderEvent shippingDTO) {
-		if (shippingDTO == null || shippingDTO.getOrderId() == null
-				|| !Constants.ORDER_EVENT_TYPE_SHIPPED.equals(shippingDTO.getEventType())) {
-			return;
+	public ShippingResponseDTO processCreateShipmentEvent(ShippingRequestDTO shippingDTO) {
+		if (shippingDTO == null || shippingDTO.getOrderId() == null) {
+			return ShippingResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("orderId must not be null")
+				.build();
 		}
+
 		// Fetch entities by ID to avoid LazyInitializationException
-		OrderEO order = null;
+		OrderEO order = orderRepository.findById(shippingDTO.getOrderId()).orElse(null);
 
-		if (shippingDTO.getOrderId() != null) {
-			order = orderRepository.findById(shippingDTO.getOrderId()).orElse(null);
-
+		if (order == null) {
+			return ShippingResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("Order not found for orderId=" + shippingDTO.getOrderId())
+				.orderId(shippingDTO.getOrderId())
+				.build();
 		}
-		// 1. create Shipment Entity Note one shipment for one warehouse.
-		if (order != null) {
-			try {
-				// Idempotency guard: skip if a FORWARD shipment already exists for this
-				// order
-				List<ShippingEO> existingShipments = shippingRepository.findByOrder(order);
-				boolean forwardShipmentExists = existingShipments != null && existingShipments.stream()
-					.anyMatch(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType())
-							&& !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()));
-				if (forwardShipmentExists) {
-					logger.warn(
-							"processCreateShipmentEvent: active FORWARD shipment already exists for orderId={}, skipping duplicate creation",
-							order.getOrderId());
-					return;
-				}
-
-				List<OrderItemEO> orderItems = orderItemRepository.findByOrder(order);
-
-				// ── N+1 fix: batch-load all inventory records in a single query
-				// ──────────
-				List<ProductVariantEO> variants = orderItems.stream()
-					.map(OrderItemEO::getProductVar)
-					.filter(Objects::nonNull)
-					.collect(Collectors.toList());
-				Map<Integer, InventoryEO> inventoryByVariantId = inventoryRepository.findByProductVariantIn(variants)
-					.stream()
-					.filter(inv -> inv.getProductVariant() != null)
-					.collect(
-							Collectors.toMap(inv -> inv.getProductVariant().getId(), Function.identity(), (a, b) -> a));
-				// ─────────────────────────────────────────────────────────────────────────
-
-				// Group order items by warehouse ID
-				Map<Long, List<OrderItemEO>> warehouseItemMap = new LinkedHashMap<>();
-				Map<Long, WarehouseEO> warehouseById = new LinkedHashMap<>();
-				for (OrderItemEO item : orderItems) {
-					ProductVariantEO productVariantEO = item.getProductVar();
-					InventoryEO inventoryEO = null;
-					if (productVariantEO != null) {
-						inventoryEO = inventoryByVariantId.get(productVariantEO.getId());
-					}
-					if (inventoryEO != null && inventoryEO.getWarehouse() != null) {
-						WarehouseEO warehouseEO = inventoryEO.getWarehouse();
-						Long warehouseId = warehouseEO.getWarehouseId();
-						warehouseItemMap.computeIfAbsent(warehouseId, k -> new ArrayList<>()).add(item);
-						warehouseById.putIfAbsent(warehouseId, warehouseEO);
-					}
-				}
-
-				if (warehouseItemMap.isEmpty()) {
-					logger.warn(
-							"processCreateShipmentEvent: no warehouse-mapped items found for orderId={}, cannot create shipment",
-							order.getOrderId());
-					return;
-				}
-
-				// For each warehouse, create a shipment and shipment items
-				for (Map.Entry<Long, List<OrderItemEO>> entry : warehouseItemMap.entrySet()) {
-					WarehouseEO warehouseEO = warehouseById.get(entry.getKey());
-					List<OrderItemEO> itemsForWarehouse = entry.getValue();
-					ShippingEO shippingEO = new ShippingEO();
-					shippingEO.setOrder(order);
-					String orderNumber = (order.getOrderNumber() != null) ? order.getOrderNumber() : "UNKNOWN";
-					shippingEO.setTrackingNumber("TRK" + orderNumber + "_" + warehouseEO.getWarehouseId());
-					// shippingEO.setCourierName(Constants.COURIER_NAME);
-					shippingEO.setShipmentStatus(Constants.SHIPMENT_STATUS_CREATED);
-					shippingEO.setWarehouse(warehouseEO);
-					shippingEO.setType(Constants.SHIPMENT_TYPE_FORWARD);
-					ShippingEO savedShippingEO = shippingRepository.save(shippingEO);
-					ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
-					shipmentTrackingHistoryEO.setShipment(savedShippingEO);
-					shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_ORDER_STATUS_CREATED);
-					shipmentTrackingHistoryEO.setLocation(warehouseEO.getAddressLine1() + ", "
-							+ warehouseEO.getAddressLine2() + "," + warehouseEO.getCity() + ", "
-							+ warehouseEO.getState() + " - " + warehouseEO.getPostalCode());
-					shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_STATUS_CREATED_REMARK);
-					shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
-
-					// Save ShipmentItemEO records so downstream processing can fetch them
-					for (OrderItemEO item : itemsForWarehouse) {
-						ShipmentItemEO shipmentItemEO = new ShipmentItemEO();
-						shipmentItemEO.setShipment(savedShippingEO);
-						shipmentItemEO.setOrderItem(item);
-						shipmentItemEO.setQuantity(item.getQuantity());
-						shippingItemRepository.save(shipmentItemEO);
-					}
-
-					// Build event and trigger Shiprocket order creation directly (in-process)
-					ShiprocketOrderEvent shiprocketEvent = ShiprocketOrderEvent.builder()
-						.shipmentId(savedShippingEO.getShipmentId() != null
-								? savedShippingEO.getShipmentId().longValue() : null)
-						.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
-						.warehouseId(warehouseEO.getWarehouseId())
-						.build();
-					// Directly trigger Shiprocket order creation
-					this.processShiprocketOrderEvent(shiprocketEvent);
-					logger.info("Triggered Shiprocket order creation for shipmentId={}, orderId={}, warehouseId={}",
-							shiprocketEvent.getShipmentId(), shiprocketEvent.getOrderId(),
-							shiprocketEvent.getWarehouseId());
-				}
-			}
-			catch (Exception e) {
-				logger.error("processCreateShipmentEvent: error creating shipment for orderId={}: {}",
-						order.getOrderId(), e.getMessage(), e);
+		List<Long> createdShipmentIds = new ArrayList<>();
+		try {
+			// Idempotency guard: skip if a FORWARD shipment already exists for this
+			// order
+			List<ShippingEO> existingShipments = shippingRepository.findByOrder(order);
+			Optional<ShippingEO> existingForwardShipment = existingShipments == null ? Optional.empty()
+					: existingShipments.stream()
+						.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType())
+								&& !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
+						.findFirst();
+			boolean forwardShipmentExists = existingForwardShipment.isPresent();
+			// Only treat the shipment as fully processed (and skip re-creation) when
+			// a FORWARD shipment exists AND every Shiprocket processing step
+			// (order creation, AWB generation, pickup request, label generation,
+			// track shipment) has already completed successfully. If any step is
+			// missing/failed, allow the flow to continue so it can be retried/
+			// completed instead of silently exiting.
+			boolean allStepsSuccessful = existingForwardShipment
+				.map(s -> Constants.SUCCESS_STATUS.equals(s.getShiprocketOrderStatus())
+						&& Constants.SUCCESS_STATUS.equals(s.getGenerateAwbStatus())
+						&& Constants.SUCCESS_STATUS.equals(s.getRequestPickupStatus())
+						&& Constants.SUCCESS_STATUS.equals(s.getGenerateLabelStatus())
+						&& Constants.SUCCESS_STATUS.equals(s.getTrackShipmentStatus()))
+				.orElse(false);
+			if (forwardShipmentExists && allStepsSuccessful) {
+				logger.warn(
+						"processCreateShipmentEvent: active FORWARD shipment already exists and fully processed for orderId={}, skipping duplicate creation",
+						order.getOrderId());
+				return ShippingResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage(
+							"An active FORWARD shipment already exists for orderId=" + order.getOrderId())
+					.orderId(shippingDTO.getOrderId())
+					.build();
 			}
 
+			// A FORWARD shipment already exists but one or more Shiprocket
+			// processing steps previously failed/are missing. Do NOT create new
+			// ShippingEO / ShipmentTrackingHistoryEO / ShipmentItemEO records —
+			// simply rebuild the event for the existing shipment and re-trigger
+			// Shiprocket processing so the remaining steps can be retried/completed.
+			if (forwardShipmentExists && !allStepsSuccessful) {
+				ShippingEO existingShippingEO = existingForwardShipment.get();
+				logger.info(
+						"processCreateShipmentEvent: active FORWARD shipment exists but not fully processed for orderId={}, shipmentId={}, resuming Shiprocket processing without creating new records",
+						order.getOrderId(), existingShippingEO.getShipmentId());
+				ShiprocketOrderEvent shiprocketEvent = ShiprocketOrderEvent.builder()
+					.shipmentId(existingShippingEO.getShipmentId() != null
+							? existingShippingEO.getShipmentId().longValue() : null)
+					.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
+					.warehouseId(existingShippingEO.getWarehouse() != null
+							? existingShippingEO.getWarehouse().getWarehouseId() : null)
+					.cartonNo(shippingDTO.getCartonNo())
+					.requestCreateCartonDTO(shippingDTO.getRequestCreateCartonDTO())
+					.bestCourierId(shippingDTO.getBestCourierId())
+					.build();
+				ShiprocketOrderEventResponseDTO shiprocketOrderEventResponseDTO = processShiprocketOrderEvent(
+						shiprocketEvent);
+				logger.info(
+						"Resumed Shiprocket order processing for existing shipmentId={}, orderId={}, warehouseId={}",
+						shiprocketEvent.getShipmentId(), shiprocketEvent.getOrderId(),
+						shiprocketEvent.getWarehouseId());
+				createdShipmentIds.add(existingShippingEO.getShipmentId());
+				return ShippingResponseDTO.builder()
+					.responseStatus(Constants.SUCCESS_STATUS)
+					.responseMessage(
+							"Resumed Shiprocket processing for existing FORWARD shipment for orderId="
+									+ order.getOrderId())
+					.orderId(shippingDTO.getOrderId())
+					.shipmentIds(createdShipmentIds)
+					.build();
+			}
+
+			List<OrderItemEO> orderItems = orderItemRepository.findByOrder(order);
+
+			// ── N+1 fix: batch-load all inventory records in a single query
+			// ──────────
+			List<ProductVariantEO> variants = orderItems.stream()
+				.map(OrderItemEO::getProductVar)
+				.filter(Objects::nonNull)
+				.collect(Collectors.toList());
+			Map<Integer, InventoryEO> inventoryByVariantId = inventoryRepository.findByProductVariantIn(variants)
+				.stream()
+				.filter(inv -> inv.getProductVariant() != null)
+				.collect(
+						Collectors.toMap(inv -> inv.getProductVariant().getId(), Function.identity(), (a, b) -> a));
+			// ─────────────────────────────────────────────────────────────────────────
+
+			// Group order items by warehouse ID
+			Map<Long, List<OrderItemEO>> warehouseItemMap = new LinkedHashMap<>();
+			Map<Long, WarehouseEO> warehouseById = new LinkedHashMap<>();
+			for (OrderItemEO item : orderItems) {
+				ProductVariantEO productVariantEO = item.getProductVar();
+				InventoryEO inventoryEO = null;
+				if (productVariantEO != null) {
+					inventoryEO = inventoryByVariantId.get(productVariantEO.getId());
+				}
+				if (inventoryEO != null && inventoryEO.getWarehouse() != null) {
+					WarehouseEO warehouseEO = inventoryEO.getWarehouse();
+					Long warehouseId = warehouseEO.getWarehouseId();
+					warehouseItemMap.computeIfAbsent(warehouseId, k -> new ArrayList<>()).add(item);
+					warehouseById.putIfAbsent(warehouseId, warehouseEO);
+				}
+			}
+
+			if (warehouseItemMap.isEmpty()) {
+				logger.warn(
+						"processCreateShipmentEvent: no warehouse-mapped items found for orderId={}, cannot create shipment",
+						order.getOrderId());
+				return ShippingResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage(
+							"No warehouse-mapped items found for orderId=" + order.getOrderId()
+									+ ", cannot create shipment")
+					.orderId(shippingDTO.getOrderId())
+					.build();
+			}
+			// For each warehouse, create a shipment and shipment items
+			for (Map.Entry<Long, List<OrderItemEO>> entry : warehouseItemMap.entrySet()) {
+				WarehouseEO warehouseEO = warehouseById.get(entry.getKey());
+				List<OrderItemEO> itemsForWarehouse = entry.getValue();
+				ShippingEO shippingEO = new ShippingEO();
+				shippingEO.setOrder(order);
+				String orderNumber = (order.getOrderNumber() != null) ? order.getOrderNumber() : "UNKNOWN";
+				shippingEO.setTrackingNumber("TRK" + orderNumber + "_" + warehouseEO.getWarehouseId());
+				// shippingEO.setCourierName(Constants.COURIER_NAME);
+				shippingEO.setShipmentStatus(Constants.SHIPMENT_STATUS_CREATED);
+				shippingEO.setWarehouse(warehouseEO);
+				shippingEO.setType(Constants.SHIPMENT_TYPE_FORWARD);
+				ShippingEO savedShippingEO = shippingRepository.save(shippingEO);
+				createdShipmentIds.add(savedShippingEO.getShipmentId());
+				ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
+				shipmentTrackingHistoryEO.setShipment(savedShippingEO);
+				shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_ORDER_STATUS_CREATED);
+				shipmentTrackingHistoryEO.setLocation(warehouseEO.getAddressLine1() + ", "
+						+ warehouseEO.getAddressLine2() + "," + warehouseEO.getCity() + ", "
+						+ warehouseEO.getState() + " - " + warehouseEO.getPostalCode());
+				shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_STATUS_CREATED_REMARK);
+				shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+
+				// Save ShipmentItemEO records so downstream processing can fetch them
+				for (OrderItemEO item : itemsForWarehouse) {
+					ShipmentItemEO shipmentItemEO = new ShipmentItemEO();
+					shipmentItemEO.setShipment(savedShippingEO);
+					shipmentItemEO.setOrderItem(item);
+					shipmentItemEO.setQuantity(item.getQuantity());
+					shippingItemRepository.save(shipmentItemEO);
+				}
+
+				// Build event and trigger Shiprocket order creation directly (in-process)
+				ShiprocketOrderEvent shiprocketEvent = ShiprocketOrderEvent.builder()
+					.shipmentId(savedShippingEO.getShipmentId() != null
+							? savedShippingEO.getShipmentId().longValue() : null)
+					.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
+					.warehouseId(warehouseEO.getWarehouseId())
+					.cartonNo(shippingDTO.getCartonNo())
+					.requestCreateCartonDTO(shippingDTO.getRequestCreateCartonDTO())
+					.bestCourierId(shippingDTO.getBestCourierId())
+					.build();
+				// Directly trigger Shiprocket order creation
+				ShiprocketOrderEventResponseDTO shiprocketOrderEventResponseDTO=processShiprocketOrderEvent(shiprocketEvent);
+				logger.info("Triggered Shiprocket order creation for shipmentId={}, orderId={}, warehouseId={}",
+						shiprocketEvent.getShipmentId(), shiprocketEvent.getOrderId(),
+						shiprocketEvent.getWarehouseId());
+			}
+
+			return ShippingResponseDTO.builder()
+				.responseStatus(Constants.SUCCESS_STATUS)
+				.responseMessage("Shipment(s) created successfully for orderId=" + order.getOrderId())
+				.orderId(shippingDTO.getOrderId())
+				.shipmentIds(createdShipmentIds)
+				.build();
 		}
+		catch (Exception e) {
+			logger.error("processCreateShipmentEvent: error creating shipment for orderId={}: {}",
+					order.getOrderId(), e.getMessage(), e);
+			return ShippingResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("An error occurred while creating shipment: " + e.getMessage())
+				.orderId(shippingDTO.getOrderId())
+				.shipmentIds(createdShipmentIds)
+				.build();
+		}
+	}
+
+	// ─── Helper: create and persist a new CartonEO from a RequestCreateCartonDTO ──
+	private CartonEO createCartonFromRequest(com.user.dto.RequestCreateCartonDTO requestCreateCartonDTO) {
+		CartonEO cartonEO = CartonEO.builder()
+			.name(requestCreateCartonDTO.getName())
+			.length(requestCreateCartonDTO.getLength())
+			.breadth(requestCreateCartonDTO.getBreadth())
+			.height(requestCreateCartonDTO.getHeight())
+			.maxWeight(requestCreateCartonDTO.getMaxWeight())
+			.emptyWeight(requestCreateCartonDTO.getEmptyWeight())
+			.status("A")
+			.who(requestCreateCartonDTO.getWho())
+			.build();
+		return cartonRepository.save(cartonEO);
 	}
 
 	// ─── Helper: create and persist a brand-new step log row ────────────────
@@ -266,530 +379,1113 @@ public class ShippingServiceImpl implements ShippingService {
 		return shiprocketOrderLogRepository.save(stepLog);
 	}
 
+	// ─── Helpers: persist per-step status onto ShippingEO and record a
+	// corresponding history row for auditability. ────────────────────────────
+	private void recordShiprocketOrderStatus(ShippingEO shippingEO, String status, String remarks) {
+		try {
+			shippingEO.setShiprocketOrderStatus(status);
+			shippingRepository.save(shippingEO);
+			shiprocketOrderStatusHistoryRepository.save(ShiprocketOrderStatusHistoryEO.builder()
+				.shipment(shippingEO)
+				.status(status)
+				.remarks(remarks)
+				.build());
+		}
+		catch (Exception ex) {
+			logger.warn("recordShiprocketOrderStatus: failed to persist status={} for shipmentId={}: {}", status,
+					shippingEO != null ? shippingEO.getShipmentId() : null, ex.getMessage());
+		}
+	}
+
+	private void recordGenerateAwbStatus(ShippingEO shippingEO, String status, String remarks) {
+		try {
+			shippingEO.setGenerateAwbStatus(status);
+			shippingRepository.save(shippingEO);
+			generateAwbStatusHistoryRepository.save(GenerateAwbStatusHistoryEO.builder()
+				.shipment(shippingEO)
+				.status(status)
+				.remarks(remarks)
+				.build());
+		}
+		catch (Exception ex) {
+			logger.warn("recordGenerateAwbStatus: failed to persist status={} for shipmentId={}: {}", status,
+					shippingEO != null ? shippingEO.getShipmentId() : null, ex.getMessage());
+		}
+	}
+
+	private void recordRequestPickupStatus(ShippingEO shippingEO, String status, String remarks) {
+		try {
+			shippingEO.setRequestPickupStatus(status);
+			shippingRepository.save(shippingEO);
+			requestPickupStatusHistoryRepository.save(RequestPickupStatusHistoryEO.builder()
+				.shipment(shippingEO)
+				.status(status)
+				.remarks(remarks)
+				.build());
+		}
+		catch (Exception ex) {
+			logger.warn("recordRequestPickupStatus: failed to persist status={} for shipmentId={}: {}", status,
+					shippingEO != null ? shippingEO.getShipmentId() : null, ex.getMessage());
+		}
+	}
+
+	private void recordGenerateLabelStatus(ShippingEO shippingEO, String status, String remarks) {
+		try {
+			shippingEO.setGenerateLabelStatus(status);
+			shippingRepository.save(shippingEO);
+			generateLabelStatusHistoryRepository.save(GenerateLabelStatusHistoryEO.builder()
+				.shipment(shippingEO)
+				.status(status)
+				.remarks(remarks)
+				.build());
+		}
+		catch (Exception ex) {
+			logger.warn("recordGenerateLabelStatus: failed to persist status={} for shipmentId={}: {}", status,
+					shippingEO != null ? shippingEO.getShipmentId() : null, ex.getMessage());
+		}
+	}
+
+	private void recordTrackShipmentStatus(ShippingEO shippingEO, String status, String remarks) {
+		try {
+			shippingEO.setTrackShipmentStatus(status);
+			shippingRepository.save(shippingEO);
+			trackShipmentStatusHistoryRepository.save(TrackShipmentStatusHistoryEO.builder()
+				.shipment(shippingEO)
+				.status(status)
+				.remarks(remarks)
+				.build());
+		}
+		catch (Exception ex) {
+			logger.warn("recordTrackShipmentStatus: failed to persist status={} for shipmentId={}: {}", status,
+					shippingEO != null ? shippingEO.getShipmentId() : null, ex.getMessage());
+		}
+	}
+
+	private void recordEstimateStatus(ShippingEO shippingEO, String status, String remarks) {
+		try {
+			shippingEO.setEstimateStatus(status);
+			shippingRepository.save(shippingEO);
+			estimateStatusHistoryRepository.save(EstimateStatusHistoryEO.builder()
+				.shipment(shippingEO)
+				.status(status)
+				.remarks(remarks)
+				.build());
+		}
+		catch (Exception ex) {
+			logger.warn("recordEstimateStatus: failed to persist status={} for shipmentId={}: {}", status,
+					shippingEO != null ? shippingEO.getShipmentId() : null, ex.getMessage());
+		}
+	}
+
+	// ─── Helper: mark the order Ready to Ship whenever any required shipment
+	// detail (carton, Shiprocket order/AWB, courier, label) could not be
+	// generated. The already-created shipping / shipment_item /
+	// shipment_tracking_history / shiprocket_order_log records are left as-is
+	// (with whatever details are available) — only the Order status is
+	// updated so downstream processes can pick this up for manual completion.
+	private void markOrderReadyToShip(OrderEO order, ShippingEO shippingEO, String reason) {
+		if (order == null) {
+			return;
+		}
+		try {
+			order.setOrderStatus(Constants.ORDER_STATUS_READY_TO_SHIP);
+			orderRepository.save(order);
+			logger.info("Order status updated to Ready to Ship for orderId={}: {}", order.getOrderId(), reason);
+
+			if (shippingEO != null && !shipmentTrackingHistoryRepository
+					.existsByShipmentAndStatusIgnoreCase(shippingEO, Constants.ORDER_STATUS_READY_TO_SHIP)) {
+				ShipmentTrackingHistoryEO readyHistory = new ShipmentTrackingHistoryEO();
+				readyHistory.setShipment(shippingEO);
+				readyHistory.setStatus(Constants.ORDER_STATUS_READY_TO_SHIP);
+				readyHistory.setRemarks(reason);
+				readyHistory.setUpdatedAt(LocalDateTime.now());
+				shipmentTrackingHistoryRepository.save(readyHistory);
+			}
+		}
+		catch (Exception ex) {
+			logger.error("Failed to mark order Ready to Ship for orderId={}: {}",
+					order.getOrderId(), ex.getMessage(), ex);
+		}
+	}
+
 	@Override
-	public void processShiprocketOrderEvent(ShiprocketOrderEvent event) {
+	public ShiprocketOrderEventResponseDTO processShiprocketOrderEvent(ShiprocketOrderEvent event) {
 		if (event == null || event.getShipmentId() == null) {
 			logger.warn("processShiprocketOrderEvent: null or incomplete event received");
-			return;
+			return ShiprocketOrderEventResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("null or incomplete event received")
+				.failedStep("VALIDATION")
+				.build();
 		}
 		logger.info("Processing ShiprocketOrderEvent for shipmentId={}, orderId={}", event.getShipmentId(),
 				event.getOrderId());
 
-		// ── Pre-flight: save an IN_PROGRESS marker so the event is always traceable ──
-		saveStepLog(event, "CREATE_ORDER", "IN_PROGRESS", null);
-
 		try {
-			ShippingEO shippingEO = shippingRepository.findById(event.getShipmentId()).orElse(null);
-			if (shippingEO == null) {
-				saveStepLog(event, "CREATE_ORDER", "FAILED",
-						"ShippingEO not found for shipmentId=" + event.getShipmentId());
-				logger.error("processShiprocketOrderEvent: ShippingEO not found for shipmentId={}",
-						event.getShipmentId());
-				return;
-			}
-			OrderEO order = orderRepository.findById(event.getOrderId()).orElse(null);
-			if (order == null) {
-				saveStepLog(event, "CREATE_ORDER", "FAILED", "OrderEO not found for orderId=" + event.getOrderId());
-				logger.error("processShiprocketOrderEvent: OrderEO not found for orderId={}", event.getOrderId());
-				return;
+			ShiprocketEventContext ctx = new ShiprocketEventContext();
+
+			ShiprocketOrderEventResponseDTO loadFailure = loadShipmentAndOrder(event, ctx);
+			if (loadFailure != null) {
+				return loadFailure;
 			}
 
-			// Fetch shipment items for this shipment
-			List<ShipmentItemEO> shipmentItems = shippingItemRepository.findByShipment(shippingEO);
-			List<OrderItemEO> itemsForWarehouse = new ArrayList<>();
-			for (ShipmentItemEO si : shipmentItems) {
-				if (si.getOrderItem() != null) {
-					itemsForWarehouse.add(si.getOrderItem());
-				}
+			Map<String, Object> shiprocketOrderRequest = buildBaseShiprocketOrderRequest(event, ctx);
+
+			ShiprocketOrderEventResponseDTO cartonFailure = selectCartonForShipment(event, ctx);
+			if (cartonFailure != null) {
+				return cartonFailure;
 			}
-
-			OrderAddressEO orderAddress = orderAddressRepository.findByOrder(order).orElse(null);
-
-			// Resolve warehouse name and channel ID from the inventory-associated
-			// warehouse for this shipment
-			String shipmentWarehouseName = null;
-			String shipmentChannelId = null;
-			if (event.getWarehouseId() != null) {
-				WarehouseEO shipmentWarehouse = warehouseRepository.findById(event.getWarehouseId()).orElse(null);
-				if (shipmentWarehouse != null) {
-					shipmentWarehouseName = shipmentWarehouse.getWarehouseName();
-					shipmentChannelId = shipmentWarehouse.getChannelId();
-				}
-			}
-
-			Map<String, Object> shiprocketOrderRequest = new HashMap<>();
-			DateTimeFormatter formatter = DateTimeFormatter.ofPattern("d-M-yyyy");
-			String orderDate = LocalDate.now().format(formatter);
-			shiprocketOrderRequest.put("order_id", order.getOrderNumber());
-			shiprocketOrderRequest.put("order_date", orderDate);
-			shiprocketOrderRequest.put("pickup_location",
-					shipmentWarehouseName != null ? shipmentWarehouseName : "warehouse");
-			shiprocketOrderRequest.put("channel_id", shipmentChannelId != null ? shipmentChannelId : "10576563");
-			String customername = order.getCustomer() != null ? order.getCustomer().getFirstName()
-					: orderAddress != null && orderAddress.getRecipientName() != null ? orderAddress.getRecipientName()
-							: "Customer";
-			String customermobileno = order.getCustomer() != null ? order.getCustomer().getMobileNumber() : "Customer";
-			if (customername == null || customername.isEmpty()) {
-				customername = customermobileno;
-			}
-			shiprocketOrderRequest.put("billing_customer_name", customername);
-			shiprocketOrderRequest.put("billing_address", orderAddress != null && orderAddress.getAddressLine1() != null
-					? orderAddress.getAddressLine1() : "");
-			shiprocketOrderRequest.put("billing_city",
-					orderAddress != null && orderAddress.getCity() != null ? orderAddress.getCity() : "");
-			shiprocketOrderRequest.put("billing_pincode",
-					orderAddress != null && orderAddress.getPostalCode() != null ? orderAddress.getPostalCode() : "");
-			shiprocketOrderRequest.put("billing_state",
-					orderAddress != null && orderAddress.getState() != null ? orderAddress.getState() : "");
-			shiprocketOrderRequest.put("billing_country",
-					orderAddress != null && orderAddress.getCountry() != null && !orderAddress.getCountry().isEmpty()
-							? orderAddress.getCountry() : "India");
-			shiprocketOrderRequest.put("billing_email",
-					order.getCustomer() != null ? order.getCustomer().getEmail() : "");
-			shiprocketOrderRequest.put("billing_phone",
-					order.getCustomer() != null ? order.getCustomer().getMobileNumber() : "");
-			shiprocketOrderRequest.put("shipping_is_billing", true);
-			shiprocketOrderRequest.put("billing_last_name", "");
-
-			List<Map<String, Object>> orderItemsList = new ArrayList<>();
-			double weight = 0.0;
-			for (OrderItemEO item : itemsForWarehouse) {
-				Map<String, Object> itemMap = new HashMap<>();
-				ProductVariantEO variant = item.getProductVar();
-				if (variant != null) {
-					weight += variant.getWeight();
-				}
-
-				itemMap.put("name", item.getProductVar() != null && item.getProductVar().getProduct() != null
-						? item.getProductVar().getProduct().getName() : "");
-				itemMap.put("sku", item.getProductVar() != null ? item.getProductVar().getSkuCode() : "");
-				itemMap.put("units", item.getQuantity());
-				itemMap.put("selling_price", item.getUnitPrice());
-				// Calculate discount as (mrp - sellingPrice) if both are present
-				double discount = 0.0;
-				if (variant != null && variant.getMrp() != null && variant.getSellingPrice() != null) {
-					discount = variant.getMrp().doubleValue() - variant.getSellingPrice().doubleValue();
-				}
-				itemMap.put("discount", discount);
-				itemMap.put("tax", 0);
-				itemMap.put("hsn", "");
-				orderItemsList.add(itemMap);
-			}
-
-			CartonEO selectedCarton = cartonSelectionService.selectCarton(itemsForWarehouse);
-			shiprocketOrderRequest.put("order_items", orderItemsList);
-			shiprocketOrderRequest.put("payment_method",
-					order.getPaymentStatus() != null && order.getPaymentStatus().equalsIgnoreCase("PAID") ? "Prepaid"
-							: "COD");
-			shiprocketOrderRequest.put("sub_total", order.getTotalAmount());
-			shiprocketOrderRequest.put("length", selectedCarton.getLength());
-			shiprocketOrderRequest.put("breadth", selectedCarton.getBreadth());
-			shiprocketOrderRequest.put("height", selectedCarton.getHeight());
-			shiprocketOrderRequest.put("weight", (selectedCarton.getEmptyWeight() + weight) / 1000.0);
-			shippingEO.setLength(selectedCarton.getLength());
-			shippingEO.setBreadth(selectedCarton.getBreadth());
-			shippingEO.setHeight(selectedCarton.getHeight());
-			shippingEO.setWeight((selectedCarton.getEmptyWeight() + weight) / 1000.0);
+			finalizeShiprocketOrderRequest(ctx, shiprocketOrderRequest);
 
 			// Step 1: Create Order on Shiprocket
-			Integer shipOrderId = null;
-			Integer shipmentId = null;
-			// ── Idempotency / retrigger guard ──────────────────────────────────
-			// If this shipment already has a Shiprocket order (e.g. this call is a
-			// manual admin retrigger after a downstream step failed), reuse the
-			// existing order/shipment ids instead of calling createOrder again —
-			// that would create a duplicate order on Shiprocket.
-			if (shippingEO.getShipOrderId() != null && shippingEO.getShipShipmentId() != null) {
-				shipOrderId = shippingEO.getShipOrderId();
-				shipmentId = shippingEO.getShipShipmentId();
-				shippingRepository.save(shippingEO); // persist carton dims computed above
-				saveStepLog(event, "CREATE_ORDER", "SKIPPED",
-						"Shiprocket order already exists (order_id=" + shipOrderId + ", shipment_id=" + shipmentId
-								+ "); reusing existing order instead of creating a duplicate");
-				logger.info("Step CREATE_ORDER SKIPPED (already exists): reusing order_id={}, shipment_id={}",
-						shipOrderId, shipmentId);
-			}
-			else
-			try {
-				Map response = shiprocketService.createOrder(shiprocketOrderRequest);
-				if (response != null) {
-					shipOrderId = (Integer) response.get("order_id");
-					shipmentId = (Integer) response.get("shipment_id");
-					shippingEO.setShipOrderId(shipOrderId);
-					shippingEO.setShipShipmentId(shipmentId);
-					// Populate estimated_delivery_date from createOrder response
-					Object estDelivery = response.get("estimated_delivery_date");
-					if (estDelivery instanceof String && !((String) estDelivery).isEmpty()) {
-						try {
-							shippingEO.setEstimatedDeliveryDate(LocalDateTime.parse((String) estDelivery,
-									DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-						}
-						catch (Exception ignored) {
-							try {
-								shippingEO.setEstimatedDeliveryDate(
-										java.time.LocalDate.parse((String) estDelivery).atStartOfDay());
-							}
-							catch (Exception ex2) {
-								logger.warn("Could not parse estimated_delivery_date '{}': {}", estDelivery,
-										ex2.getMessage());
-							}
-						}
-					}
-					shippingRepository.save(shippingEO);
-					// ── Separate log record for CREATE_ORDER success ──
-					shiprocketOrderLogRepository.save(ShiprocketOrderLogEO.builder()
-						.shipmentId(event.getShipmentId())
-						.orderId(event.getOrderId())
-						.warehouseId(event.getWarehouseId())
-						.step("CREATE_ORDER")
-						.status("SUCCESS")
-						.shiprocketOrderId(shipOrderId)
-						.shiprocketShipmentId(shipmentId)
-						.build());
-					logger.info("Step CREATE_ORDER SUCCESS: order_id={}, shipment_id={}", shipOrderId, shipmentId);
-				}
-				else {
-					saveStepLog(event, "CREATE_ORDER", "FAILED", "Shiprocket createOrder returned null response");
-					logger.error("Step CREATE_ORDER FAILED: null response from Shiprocket");
-					return;
-				}
-			}
-			catch (Exception ex) {
-				saveStepLog(event, "CREATE_ORDER", "FAILED", ex.getMessage());
-				logger.error("Step CREATE_ORDER FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
-						ex);
-				return;
+			ShiprocketOrderEventResponseDTO createOrderFailure = executeCreateOrderStep(event, ctx,
+					shiprocketOrderRequest);
+			if (createOrderFailure != null) {
+				return createOrderFailure;
 			}
 
 			// Step 1.5: Find Top-N Best Courier Services via Serviceability API
-			List<Integer> bestCourierIds = new ArrayList<>();
-			Map<Integer, Double> courierRateMap = new HashMap<>();
-			List<Map<String, Object>> courierDetailsList = new ArrayList<>();
-			try {
-				String deliveryPostcode = orderAddress != null ? orderAddress.getPostalCode() : null;
-				if (deliveryPostcode != null && !deliveryPostcode.isEmpty() && shipmentId != null) {
-					Double weighttemp1 = shippingEO.getWeight() != null ? shippingEO.getWeight() : 1.1;
-					if (weighttemp1 <= 1.1) {
-						weighttemp1 = 1.1;
-					}
+			executeFindBestCourierStep(event, ctx);
 
-					String weighttemp = shippingEO.getWeight() != null ? String.valueOf(shippingEO.getWeight()) : "1.0";
-					ServiceabilityRequestDTO serviceabilityReq = ServiceabilityRequestDTO.builder()
-						.orderId(shipOrderId)
-						.pickupPostcode(Integer.parseInt(getWarehousePostalCode(shipmentWarehouseName)))
-						.deliveryPostcode(Integer.parseInt(deliveryPostcode.trim()))
-						.cod(order.getPaymentStatus() != null && order.getPaymentStatus().equalsIgnoreCase("PAID") ? 0
-								: 1)
-						.weight(String.valueOf(weighttemp1))
-						.length(shippingEO.getLength() != null && shippingEO.getLength() > 0
-								? shippingEO.getLength().intValue() : null)
-						.breadth(shippingEO.getBreadth() != null && shippingEO.getBreadth() > 0
-								? shippingEO.getBreadth().intValue() : null)
-						.height(shippingEO.getHeight() != null && shippingEO.getHeight() > 0
-								? shippingEO.getHeight().intValue() : null)
-						.build();
-
-					List<Integer> allBestCouriers = shiprocketService.getBestCourierServices(serviceabilityReq,
-							Constants.MAX_BEST_COURIER_COUNT, courierRateMap, courierDetailsList);
-
-					// Filter out blocklisted courier IDs
-					for (Integer cId : allBestCouriers) {
-						if (cId != null && !Constants.BLOCKLISTED_COURIER_COMPANY_IDS.contains(cId)) {
-							bestCourierIds.add(cId);
-						}
-						else {
-							logger.info("Step FIND_BEST_COURIER: skipping blocklisted courierCompanyId={}", cId);
-						}
-					}
-
-					// ── Persist all candidate couriers to courier_selection_log ──
-					String orderNumber = order.getOrderNumber();
-					for (Map<String, Object> detail : courierDetailsList) {
-						try {
-							Integer cId = (Integer) detail.get("courierCompanyId");
-							String cName = (String) detail.get("courierName");
-							Double cRate = (Double) detail.get("rate");
-							Double cDays = (Double) detail.get("estimatedDeliveryDays");
-							Integer cRank = (Integer) detail.get("rank");
-							CourierSelectionLogEO logEntry = CourierSelectionLogEO.builder()
-								.orderId(event.getOrderId())
-								.orderNumber(orderNumber)
-								.shipmentId(event.getShipmentId())
-								.shipShipmentId(shipmentId)
-								.courierCompanyId(cId)
-								.courierName(cName)
-								.rate(cRate != null ? new java.math.BigDecimal(cRate) : null)
-								.estimatedDeliveryDays(cDays)
-								.rank(cRank)
-								.isSelected(false)
-								.build();
-							courierSelectionLogRepository.save(logEntry);
-						}
-						catch (Exception saveEx) {
-							logger.warn("Could not save courier_selection_log entry: {}", saveEx.getMessage());
-						}
-					}
-
-					// ── Separate log record for FIND_BEST_COURIER ──
-					String fcStatus = bestCourierIds.isEmpty() ? "NOT_FOUND" : "SUCCESS";
-					String fcError = bestCourierIds.isEmpty()
-							? "No eligible (non-blocked) couriers found; AWB will use Shiprocket auto-assign" : null;
-					saveStepLog(event, "FIND_BEST_COURIER", fcStatus, fcError);
-					logger.info("Step FIND_BEST_COURIER: {} eligible couriers for shipmentId={}: {}",
-							bestCourierIds.size(), shipmentId, bestCourierIds);
-				}
-				else {
-					saveStepLog(event, "FIND_BEST_COURIER", "SKIPPED",
-							"Delivery postcode unavailable; serviceability check skipped");
-					logger.warn("Step FIND_BEST_COURIER skipped: delivery postcode unavailable for shipmentId={}",
-							event.getShipmentId());
-				}
-			}
-			catch (Exception ex) {
-				saveStepLog(event, "FIND_BEST_COURIER", "FAILED",
-						"Will proceed with auto-assign. Error: " + ex.getMessage());
-				logger.warn("Step FIND_BEST_COURIER FAILED for shipmentId={}, will proceed with auto-assign: {}",
-						event.getShipmentId(), ex.getMessage());
-			}
-
-			// Step 1.6: If no eligible courier was found via getBestCourierServices, the
-			// Shiprocket order is already created (Step 1) — stop here and flag the
-			// shipment for manual processing instead of attempting AWB/pickup
-			// auto-assign, which is unreliable when Shiprocket itself found no
-			// serviceable courier for this route/weight/COD combination.
-			if (bestCourierIds.isEmpty()) {
-				shippingEO.setShipmentStatus(Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED);
-				shippingRepository.save(shippingEO);
-
-				ShipmentTrackingHistoryEO manualTrackingEntry = new ShipmentTrackingHistoryEO();
-				manualTrackingEntry.setShipment(shippingEO);
-				manualTrackingEntry.setStatus(Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED);
-				manualTrackingEntry.setRemarks(
-						"No eligible courier found for this route/weight/COD combination. Shiprocket order created (order_id="
-								+ shipOrderId + "); shipment requires manual courier assignment.");
-				shipmentTrackingHistoryRepository.save(manualTrackingEntry);
-
-				saveStepLog(event, "GENERATE_AWB", "SKIPPED",
-						"No eligible courier found via getBestCourierServices; Shiprocket order was created successfully, shipment will be processed manually");
-				logger.warn(
-						"Step GENERATE_AWB SKIPPED for shipmentId={}: no eligible courier found. Shiprocket order_id={} was created; shipment flagged for manual processing.",
-						event.getShipmentId(), shipOrderId);
-
-				// Best-effort admin push notification — never breaks order processing.
-				try {
-					pushNotificationService.notifyAdminsNoCourierFound(shippingEO, shipOrderId);
-				}
-				catch (Exception pushEx) {
-					logger.error("Failed to send no-courier-found push notification for shipmentId={}: {}",
-							event.getShipmentId(), pushEx.getMessage(), pushEx);
-				}
-
-				return;
+			// Step 1.6: bail out to manual processing if no eligible courier was found
+			ShiprocketOrderEventResponseDTO noCourierFailure = handleNoCourierFound(event, ctx);
+			if (noCourierFailure != null) {
+				return noCourierFailure;
 			}
 
 			// Step 2: Generate AWB — try best couriers in order
-			String awbCode = null;
-			int usedCourierIndex = -1;
-			try {
-				if (shipmentId == null) {
-					saveStepLog(event, "GENERATE_AWB", "FAILED",
-							"Cannot generate AWB without shipment_id from Shiprocket");
-					logger.error("Step GENERATE_AWB FAILED: shipment_id is null, cannot proceed");
-					return;
-				}
-
-				// Only ranked/eligible couriers are attempted now — bestCourierIds is
-				// guaranteed non-empty at this point.
-				List<Integer> couriersToTry = bestCourierIds;
-
-				Integer courierCompanyId = null;
-				String courierName = null;
-				java.math.BigDecimal shippingPrice = null;
-
-				for (int ci = 0; ci < couriersToTry.size() && awbCode == null; ci++) {
-					Integer tryCourierId = couriersToTry.get(ci);
-					try {
-						Map awbResp = shiprocketService.generateAWB(shipmentId, tryCourierId);
-						String extracted = extractAwbCode(awbResp);
-						if (extracted != null) {
-							awbCode = extracted;
-							usedCourierIndex = ci;
-
-							// Extract courier details
-							Object responseObj = awbResp != null ? awbResp.get("response") : null;
-							Map dataDetail = null;
-							if (responseObj instanceof Map) {
-								Object dataObj = ((Map) responseObj).get("data");
-								if (dataObj instanceof Map)
-									dataDetail = (Map) dataObj;
-								else
-									dataDetail = (Map) responseObj;
-							}
-							if (dataDetail != null) {
-								Object ccId = dataDetail.get("courier_company_id");
-								if (ccId instanceof Number)
-									courierCompanyId = ((Number) ccId).intValue();
-								Object cn = dataDetail.get("courier_name");
-								if (cn instanceof String)
-									courierName = (String) cn;
-								// freight_charge / rate → shipping price
-								Object freightObj = dataDetail.get("freight_charge");
-								if (freightObj == null)
-									freightObj = dataDetail.get("rate");
-								if (freightObj instanceof Number) {
-									shippingPrice = new java.math.BigDecimal(((Number) freightObj).doubleValue());
-								}
-								// etd
-								Object etdObj = dataDetail.get("etd");
-								if (etdObj instanceof String && !((String) etdObj).isEmpty()) {
-									final String etdStr = (String) etdObj;
-									try {
-										shippingEO.setExpectedDeliveryDate(LocalDateTime.parse(etdStr,
-												DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-									}
-									catch (Exception ignored) {
-										try {
-											shippingEO.setExpectedDeliveryDate(
-													java.time.LocalDate.parse(etdStr).atStartOfDay());
-										}
-										catch (Exception ex2) {
-											logger.warn("Could not parse etd '{}': {}", etdStr, ex2.getMessage());
-										}
-									}
-								}
-							}
-							logger.info("Step GENERATE_AWB SUCCESS on attempt #{} with courierCompanyId={}: awb={}",
-									ci + 1, tryCourierId, awbCode);
-						}
-						else {
-							// Log per-attempt failure as a separate record
-							String awbErr = extractAwbGenerateError(awbResp);
-							saveStepLog(event, "GENERATE_AWB", "ATTEMPT_FAILED", "courierCompanyId=" + tryCourierId
-									+ " attempt #" + (ci + 1) + (awbErr != null ? ". Error: " + awbErr : ""));
-							logger.warn("Step GENERATE_AWB: courier {} (attempt #{}) returned no AWB code. error={}",
-									tryCourierId, ci + 1, awbErr);
-						}
-					}
-					catch (Exception ex) {
-						saveStepLog(event, "GENERATE_AWB", "ATTEMPT_FAILED", "courierCompanyId=" + tryCourierId
-								+ " attempt #" + (ci + 1) + ". Exception: " + ex.getMessage());
-						logger.warn("Step GENERATE_AWB: exception with courierCompanyId={} (attempt #{}): {}",
-								tryCourierId, ci + 1, ex.getMessage());
-					}
-				}
-
-				// ── Separate final log record for GENERATE_AWB outcome ──
-				if (awbCode == null) {
-					saveStepLog(event, "GENERATE_AWB", "FAILED", "AWB code not received from Shiprocket after trying "
-							+ couriersToTry.size() + " courier(s)");
-					logger.error("Step GENERATE_AWB FAILED for shipmentId={} after trying {} couriers",
-							event.getShipmentId(), couriersToTry.size());
-				}
-				else {
-					shippingEO.setAwb(awbCode);
-					if (courierCompanyId != null)
-						shippingEO.setCourierCompanyId(courierCompanyId);
-					if (courierName != null)
-						shippingEO.setCourierName(courierName);
-					// Set shipping price: prefer AWB response freight_charge; fall back
-					// to serviceability rate map
-					if (shippingPrice != null) {
-						shippingEO.setShippingPrice(shippingPrice);
-					}
-					else if (courierCompanyId != null && courierRateMap.containsKey(courierCompanyId)) {
-						shippingEO.setShippingPrice(new java.math.BigDecimal(courierRateMap.get(courierCompanyId)));
-					}
-					shippingRepository.save(shippingEO);
-
-					// ── Mark the selected courier in courier_selection_log ──
-					final Integer finalCourierCompanyId = courierCompanyId;
-					final String finalAwbCode = awbCode;
-					final java.math.BigDecimal finalShippingPriceForLog = shippingEO.getShippingPrice();
-					if (finalCourierCompanyId != null) {
-						try {
-							courierSelectionLogRepository.findByShipmentIdOrderByRankAsc(event.getShipmentId())
-								.stream()
-								.filter(e -> finalCourierCompanyId.equals(e.getCourierCompanyId()))
-								.findFirst()
-								.ifPresent(entry -> {
-									entry.setIsSelected(true);
-									entry.setAwbCode(finalAwbCode);
-									entry.setShippingPrice(finalShippingPriceForLog);
-									courierSelectionLogRepository.save(entry);
-								});
-						}
-						catch (Exception markEx) {
-							logger.warn("Could not mark selected courier in courier_selection_log: {}",
-									markEx.getMessage());
-						}
-					}
-
-					ShiprocketOrderLogEO awbLog = ShiprocketOrderLogEO.builder()
-						.shipmentId(event.getShipmentId())
-						.orderId(event.getOrderId())
-						.warehouseId(event.getWarehouseId())
-						.step("GENERATE_AWB")
-						.status("SUCCESS")
-						.awbCode(awbCode)
-						.build();
-					shiprocketOrderLogRepository.save(awbLog);
-				}
+			ShiprocketOrderEventResponseDTO awbFailure = executeGenerateAwbStep(event, ctx);
+			if (awbFailure != null) {
+				return awbFailure;
 			}
-			catch (Exception ex) {
-				saveStepLog(event, "GENERATE_AWB", "FAILED", ex.getMessage());
-				logger.error("Step GENERATE_AWB FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
-						ex);
-			}
-
 			// Step 3: Request Pickup
-			try {
-				Map pickupResponseMap = shiprocketService.requestPickup(shipmentId.toString());
-				shippingEO.setShipmentStatus("PICKUP_SCHEDULED");
+			executeRequestPickupStep(event, ctx);
 
-				// Check if Shiprocket indicated the pickup was already in queue
-				boolean alreadyInQueue = pickupResponseMap != null
-						&& Boolean.TRUE.equals(pickupResponseMap.get("already_in_pickup_queue"));
+			// Step 4: Generate Label
+			executeGenerateLabelStep(event, ctx);
 
-				// Persist pickup_id, pickup_scheduled_date, pickup_token from response
-				// Shiprocket nests these inside pickupResponseMap → "response"
-				if (pickupResponseMap != null && !alreadyInQueue) {
-					Map pickupData = null;
-					Object responseObj = pickupResponseMap.get("response");
-					if (responseObj instanceof Map) {
-						pickupData = (Map) responseObj;
+			// Step 5: Track Shipment
+			executeTrackShipmentStep(event, ctx);
+
+			return finalizeOrderStatusAndBuildResponse(event, ctx);
+		}
+		catch (Exception e) {
+			// Outer catch-all: save a generic FAILED record so nothing is silently lost
+			saveStepLog(event, "PROCESS_EVENT", "FAILED", "Unexpected error: " + e.getMessage());
+			logger.error("Error processing ShiprocketOrderEvent for shipmentId={}: {}", event.getShipmentId(),
+					e.getMessage(), e);
+			return ShiprocketOrderEventResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("Unexpected error: " + e.getMessage())
+				.shipmentId(event.getShipmentId())
+				.orderId(event.getOrderId())
+				.warehouseId(event.getWarehouseId())
+				.failedStep("PROCESS_EVENT")
+				.build();
+		}
+	}
+
+	/**
+	 * Mutable holder used internally by {@link #processShiprocketOrderEvent} to
+	 * thread shared state through the per-step helper methods below without
+	 * having to pass a long list of individual parameters around. All fields are
+	 * package-private for brevity since this is a private implementation detail.
+	 */
+	private static class ShiprocketEventContext {
+		ShippingEO shippingEO;
+		OrderEO order;
+		OrderAddressEO orderAddress;
+		String previousOrderStatusForEmail;
+
+		boolean orderStatusAlreadySuccess;
+		boolean awbStatusAlreadySuccess;
+		boolean pickupStatusAlreadySuccess;
+		boolean labelStatusAlreadySuccess;
+		boolean trackStatusAlreadySuccess;
+
+		List<OrderItemEO> itemsForWarehouse;
+		String shipmentWarehouseName;
+		String shipmentChannelId;
+
+		List<Map<String, Object>> orderItemsList;
+		double itemsWeight;
+
+		CartonEO selectedCarton;
+
+		Integer shipOrderId;
+		Integer shipmentId;
+
+		List<Integer> bestCourierIds = new ArrayList<>();
+		Map<Integer, Double> courierRateMap = new HashMap<>();
+
+		String awbCode;
+		String generatedLabelUrl;
+	}
+
+	/**
+	 * Loads the ShippingEO and OrderEO referenced by the event, along with the
+	 * per-step idempotency flags, order items, order address and warehouse
+	 * name/channel id. Returns a terminal failure response if either entity is
+	 * missing; otherwise returns {@code null} and leaves {@code ctx} populated so
+	 * processing can continue.
+	 */
+	private ShiprocketOrderEventResponseDTO loadShipmentAndOrder(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = shippingRepository.findById(event.getShipmentId()).orElse(null);
+		if (shippingEO == null) {
+			saveStepLog(event, "CREATE_ORDER", "FAILED",
+					"ShippingEO not found for shipmentId=" + event.getShipmentId());
+			logger.error("processShiprocketOrderEvent: ShippingEO not found for shipmentId={}",
+					event.getShipmentId());
+			return ShiprocketOrderEventResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("ShippingEO not found for shipmentId=" + event.getShipmentId())
+				.shipmentId(event.getShipmentId())
+				.orderId(event.getOrderId())
+				.warehouseId(event.getWarehouseId())
+				.failedStep("CREATE_ORDER")
+				.build();
+		}
+		ctx.shippingEO = shippingEO;
+
+		OrderEO order = orderRepository.findById(event.getOrderId()).orElse(null);
+		// Capture the order status as it was before this event's processing so we
+		// can detect (after all 5 steps have run) whether it actually changed and
+		// only then send a single "Order Status Update" email.
+		ctx.previousOrderStatusForEmail = order != null ? order.getOrderStatus() : null;
+		if (order == null) {
+			saveStepLog(event, "CREATE_ORDER", "FAILED", "OrderEO not found for orderId=" + event.getOrderId());
+			logger.error("processShiprocketOrderEvent: OrderEO not found for orderId={}", event.getOrderId());
+			return ShiprocketOrderEventResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("OrderEO not found for orderId=" + event.getOrderId())
+				.shipmentId(event.getShipmentId())
+				.orderId(event.getOrderId())
+				.warehouseId(event.getWarehouseId())
+				.shipmentStatus(shippingEO.getShipmentStatus())
+				.failedStep("CREATE_ORDER")
+				.build();
+		}
+		ctx.order = order;
+
+		// ── Per-step idempotency guards ────────────────────────────────────
+		// Validate each of the five Shiprocket processing step statuses already
+		// persisted on ShippingEO. If a step previously completed successfully,
+		// skip re-executing it; otherwise (missing/failed) execute it.
+		ctx.orderStatusAlreadySuccess = Constants.SUCCESS_STATUS.equals(shippingEO.getShiprocketOrderStatus());
+		ctx.awbStatusAlreadySuccess = Constants.SUCCESS_STATUS.equals(shippingEO.getGenerateAwbStatus());
+		ctx.pickupStatusAlreadySuccess = Constants.SUCCESS_STATUS.equals(shippingEO.getRequestPickupStatus());
+		ctx.labelStatusAlreadySuccess = Constants.SUCCESS_STATUS.equals(shippingEO.getGenerateLabelStatus());
+		ctx.trackStatusAlreadySuccess = Constants.SUCCESS_STATUS.equals(shippingEO.getTrackShipmentStatus());
+
+		// Fetch shipment items for this shipment
+		List<ShipmentItemEO> shipmentItems = shippingItemRepository.findByShipment(shippingEO);
+		List<OrderItemEO> itemsForWarehouse = new ArrayList<>();
+		for (ShipmentItemEO si : shipmentItems) {
+			if (si.getOrderItem() != null) {
+				itemsForWarehouse.add(si.getOrderItem());
+			}
+		}
+		ctx.itemsForWarehouse = itemsForWarehouse;
+
+		ctx.orderAddress = orderAddressRepository.findByOrder(order).orElse(null);
+
+		// Resolve warehouse name and channel ID from the inventory-associated
+		// warehouse for this shipment
+		if (event.getWarehouseId() != null) {
+			WarehouseEO shipmentWarehouse = warehouseRepository.findById(event.getWarehouseId()).orElse(null);
+			if (shipmentWarehouse != null) {
+				ctx.shipmentWarehouseName = shipmentWarehouse.getWarehouseName();
+				ctx.shipmentChannelId = shipmentWarehouse.getChannelId();
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Builds the Shiprocket create-order request payload from the order, order
+	 * address and order items — everything except the carton-dependent fields,
+	 * which are added later by {@link #finalizeShiprocketOrderRequest} once a
+	 * carton has been selected. Also stores the built order-items list and total
+	 * item weight on {@code ctx} for later use.
+	 */
+	private Map<String, Object> buildBaseShiprocketOrderRequest(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx) {
+		OrderEO order = ctx.order;
+		OrderAddressEO orderAddress = ctx.orderAddress;
+
+		Map<String, Object> shiprocketOrderRequest = new HashMap<>();
+		DateTimeFormatter formatter = DateTimeFormatter.ofPattern("d-M-yyyy");
+		String orderDate = LocalDate.now().format(formatter);
+		shiprocketOrderRequest.put("order_id", order.getOrderNumber());
+		shiprocketOrderRequest.put("order_date", orderDate);
+		shiprocketOrderRequest.put("pickup_location",
+				ctx.shipmentWarehouseName != null ? ctx.shipmentWarehouseName : "warehouse");
+		shiprocketOrderRequest.put("channel_id",
+				ctx.shipmentChannelId != null ? ctx.shipmentChannelId : Constants.DEFAULT_SHIPMENT_CHANNEL_ID);
+		String customername = order.getCustomer() != null ? order.getCustomer().getFirstName()
+				: orderAddress != null && orderAddress.getRecipientName() != null ? orderAddress.getRecipientName()
+						: "Customer";
+		String customermobileno = order.getCustomer() != null ? order.getCustomer().getMobileNumber() : "Customer";
+		if (customername == null || customername.isEmpty()) {
+			customername = customermobileno;
+		}
+		shiprocketOrderRequest.put("billing_customer_name", customername);
+		shiprocketOrderRequest.put("billing_address", orderAddress != null && orderAddress.getAddressLine1() != null
+				? orderAddress.getAddressLine1() : "");
+		shiprocketOrderRequest.put("billing_city",
+				orderAddress != null && orderAddress.getCity() != null ? orderAddress.getCity() : "");
+		shiprocketOrderRequest.put("billing_pincode",
+				orderAddress != null && orderAddress.getPostalCode() != null ? orderAddress.getPostalCode() : "");
+		shiprocketOrderRequest.put("billing_state",
+				orderAddress != null && orderAddress.getState() != null ? orderAddress.getState() : "");
+		shiprocketOrderRequest.put("billing_country",
+				orderAddress != null && orderAddress.getCountry() != null && !orderAddress.getCountry().isEmpty()
+						? orderAddress.getCountry() : "India");
+		shiprocketOrderRequest.put("billing_email",
+				order.getCustomer() != null ? order.getCustomer().getEmail() : "");
+		shiprocketOrderRequest.put("billing_phone",
+				order.getCustomer() != null ? order.getCustomer().getMobileNumber() : "");
+		shiprocketOrderRequest.put("shipping_is_billing", true);
+		shiprocketOrderRequest.put("billing_last_name", "");
+
+		List<Map<String, Object>> orderItemsList = new ArrayList<>();
+		double weightTemp = 0.0;
+		for (OrderItemEO item : ctx.itemsForWarehouse) {
+			Map<String, Object> itemMap = new HashMap<>();
+			ProductVariantEO variant = item.getProductVar();
+			if (variant != null) {
+				int qty = item.getQuantity() != null ? item.getQuantity() : 1;
+				// variant.getWeight() is the per-unit weight in GRAMS (see
+				// product-api-docs.md / ProductVariantEO); multiply by quantity so
+				// items ordered more than once are weighed correctly. The running
+				// total is converted from grams to kilograms below (ctx.itemsWeight).
+				weightTemp += variant.getWeight() * qty;
+			}
+
+			itemMap.put("name", item.getProductVar() != null && item.getProductVar().getProduct() != null
+					? item.getProductVar().getProduct().getName() : "");
+			itemMap.put("sku", item.getProductVar() != null ? item.getProductVar().getSkuCode() : "");
+			itemMap.put("units", item.getQuantity());
+			itemMap.put("selling_price", item.getUnitPrice());
+			// Calculate discount as (mrp - sellingPrice) if both are present
+			double discount = 0.0;
+			if (variant != null && variant.getMrp() != null && variant.getSellingPrice() != null) {
+				discount = variant.getMrp().doubleValue() - variant.getSellingPrice().doubleValue();
+			}
+			itemMap.put("discount", discount);
+			itemMap.put("tax", 0);
+			itemMap.put("hsn", "");
+			orderItemsList.add(itemMap);
+		}
+		ctx.orderItemsList = orderItemsList;
+		ctx.itemsWeight = weightTemp/1000.0;
+		return shiprocketOrderRequest;
+	}
+
+	/**
+	 * Resolves the carton to use for this shipment (caller-supplied cartonNo,
+	 * caller-supplied requestCreateCartonDTO, or automatic selection) and stores
+	 * it on {@code ctx.selectedCarton}. On failure the order is marked Ready to
+	 * Ship and a terminal failure response is returned.
+	 */
+	private ShiprocketOrderEventResponseDTO selectCartonForShipment(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx) {
+		CartonEO selectedCarton;
+		String requestedCartonNo = event.getCartonNo();
+		com.user.dto.RequestCreateCartonDTO requestedCreateCartonDTO = event.getRequestCreateCartonDTO();
+		boolean cartonNoProvided = requestedCartonNo != null && !requestedCartonNo.trim().isEmpty();
+		boolean createCartonDTOProvided = requestedCreateCartonDTO != null;
+		try {
+			if (!cartonNoProvided && !createCartonDTOProvided) {
+				// Neither cartonNo nor requestCreateCartonDTO supplied — fall back to
+				// the existing automatic carton selection logic.
+				selectedCarton = cartonSelectionService.selectCarton(ctx.itemsForWarehouse);
+			}
+			else if (cartonNoProvided) {
+				// Caller supplied a specific cartonNo — try to fetch that carton by id.
+				Long cartonId = null;
+				try {
+					cartonId = Long.parseLong(requestedCartonNo.trim());
+				}
+				catch (NumberFormatException nfe) {
+					logger.warn(
+							"Step SELECT_CARTON: cartonNo '{}' is not a valid numeric carton id for shipmentId={}",
+							requestedCartonNo, event.getShipmentId());
+				}
+				selectedCarton = cartonId != null ? cartonRepository.findById(cartonId).orElse(null) : null;
+				if (selectedCarton == null) {
+					if (createCartonDTOProvided) {
+						// No carton found for the supplied cartonNo — create a new one
+						// using the supplied requestCreateCartonDTO and use it.
+						selectedCarton = createCartonFromRequest(requestedCreateCartonDTO);
+						logger.info(
+								"Step SELECT_CARTON: cartonNo='{}' not found; created new cartonId={} for shipmentId={}",
+								requestedCartonNo, selectedCarton.getId(), event.getShipmentId());
 					}
 					else {
-						// Fallback: fields at top level
-						pickupData = pickupResponseMap;
-					}
-
-					Object pickupIdObj = pickupData.get("pickup_id");
-					if (pickupIdObj instanceof Number) {
-						shippingEO.setPickupId(((Number) pickupIdObj).longValue());
-					}
-					Object scheduledDateObj = pickupData.get("pickup_scheduled_date");
-					if (scheduledDateObj instanceof String) {
-						try {
-							shippingEO.setPickupScheduledDate(LocalDateTime.parse((String) scheduledDateObj,
-									DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-						}
-						catch (Exception ex) {
-							logger.warn("Could not parse pickup_scheduled_date '{}': {}", scheduledDateObj,
-									ex.getMessage());
-						}
-					}
-					Object tokenObj = pickupData.get("pickup_token_number");
-					if (tokenObj instanceof String) {
-						shippingEO.setPickupToken((String) tokenObj);
+						throw new IllegalStateException("No carton found for cartonNo=" + requestedCartonNo
+								+ " and no requestCreateCartonDTO provided to create a new one");
 					}
 				}
-				shippingEO = shippingRepository.save(shippingEO);
+				else {
+					logger.info("Step SELECT_CARTON: using caller-supplied cartonNo={} (cartonId={}) for shipmentId={}",
+							requestedCartonNo, selectedCarton.getId(), event.getShipmentId());
+				}
+			}
+			else {
+				// cartonNo not provided but requestCreateCartonDTO is — create a new
+				// carton from the supplied details and use it.
+				selectedCarton = createCartonFromRequest(requestedCreateCartonDTO);
+				logger.info("Step SELECT_CARTON: created new cartonId={} from requestCreateCartonDTO for shipmentId={}",
+						selectedCarton.getId(), event.getShipmentId());
+			}
+		}
+		catch (Exception cartonEx) {
+			// Automatic carton creation is disabled — CartonSelectionService already
+			// notified admins. Log a specific, actionable step so this doesn't get
+			// buried under a generic "PROCESS_EVENT FAILED" audit entry.
+			saveStepLog(event, "SELECT_CARTON", "FAILED", cartonEx.getMessage());
+			logger.error("Step SELECT_CARTON FAILED for shipmentId={}: {}", event.getShipmentId(),
+					cartonEx.getMessage(), cartonEx);
+			// Carton unavailable — cannot proceed to Shiprocket. Keep the order
+			// (and whatever shipping/shipment_item/tracking-history/order-log
+			// records already exist) but mark it Ready to Ship so it can be
+			// picked up for manual processing instead of leaving it stuck.
+			markOrderReadyToShip(ctx.order, ctx.shippingEO, "Carton not available: " + cartonEx.getMessage());
+			return ShiprocketOrderEventResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("Carton not available: " + cartonEx.getMessage())
+				.shipmentId(event.getShipmentId())
+				.orderId(event.getOrderId())
+				.warehouseId(event.getWarehouseId())
+				.shipmentStatus(ctx.shippingEO.getShipmentStatus())
+				.failedStep("SELECT_CARTON")
+				.build();
+		}
+		ctx.selectedCarton = selectedCarton;
+		return null;
+	}
 
-				// ── Separate log record for REQUEST_PICKUP success ──
-				String pickupNote = alreadyInQueue ? "Already in Pickup Queue – treated as PICKUP_SCHEDULED" : null;
-				saveStepLog(event, "REQUEST_PICKUP", "SUCCESS", pickupNote);
+	/**
+	 * Adds the carton-dependent fields (order_items, payment_method, sub_total,
+	 * dimensions, weight) to the Shiprocket create-order request now that a
+	 * carton has been selected, and persists the resolved dimensions/weight onto
+	 * the ShippingEO.
+	 */
+	private void finalizeShiprocketOrderRequest(ShiprocketEventContext ctx,
+			Map<String, Object> shiprocketOrderRequest) {
+		OrderEO order = ctx.order;
+		CartonEO selectedCarton = ctx.selectedCarton;
+		ShippingEO shippingEO = ctx.shippingEO;
 
-				// ── Save PICKUP_SCHEDULED entry in shipment_tracking_history ──
+		shiprocketOrderRequest.put("order_items", ctx.orderItemsList);
+		shiprocketOrderRequest.put("payment_method",
+				order.getPaymentStatus() != null && order.getPaymentStatus().equalsIgnoreCase("PAID") ? "Prepaid"
+						: "COD");
+		shiprocketOrderRequest.put("sub_total", order.getTotalAmount());
+		shiprocketOrderRequest.put("length", selectedCarton.getLength());
+		shiprocketOrderRequest.put("breadth", selectedCarton.getBreadth());
+		shiprocketOrderRequest.put("height", selectedCarton.getHeight());
+		// NOTE: variant weight (see ctx.itemsWeight in buildBaseShiprocketOrderRequest)
+		// and carton empty/max weight (see CartonEO / shipping-api-docs.md — carton
+		// weights are captured/stored in GRAMS) are both entered in grams, but
+		// Shiprocket's "weight" field expects kilograms. ctx.itemsWeight is already
+		// converted to kg, so the carton's empty weight must also be converted here
+		// (grams / 1000) before being added — otherwise the total weight sent to
+		// Shiprocket ends up ~1000x too large (e.g. a 400g box becomes "400 kg").
+		double emptyWeightKg = selectedCarton.getEmptyWeight() / 1000.0;
+		double totalWeightKg = emptyWeightKg + ctx.itemsWeight;
+		// Shiprocket requires a minimum shipment weight of 1.1 kg; enforce that
+		// floor here so lightweight orders aren't sent with an under-billed weight.
+		final double MIN_SHIPMENT_WEIGHT_KG = 1.1;
+		if (totalWeightKg < MIN_SHIPMENT_WEIGHT_KG) {
+			totalWeightKg = MIN_SHIPMENT_WEIGHT_KG;
+		}
+		shiprocketOrderRequest.put("weight", totalWeightKg);
+		shippingEO.setLength(selectedCarton.getLength());
+		shippingEO.setBreadth(selectedCarton.getBreadth());
+		shippingEO.setHeight(selectedCarton.getHeight());
+		shippingEO.setWeight(totalWeightKg);
+		// Persist a direct entity reference to the carton used for this shipment.
+		shippingEO.setCarton(selectedCarton);
+	}
+
+	/**
+	 * Step 1: Create Order on Shiprocket (or reuse an already-created order if
+	 * this call is a retrigger). Populates {@code ctx.shipOrderId} /
+	 * {@code ctx.shipmentId} on success. Returns a terminal failure response if
+	 * the order could not be created.
+	 */
+	private ShiprocketOrderEventResponseDTO executeCreateOrderStep(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx, Map<String, Object> shiprocketOrderRequest) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		OrderEO order = ctx.order;
+		Integer shipOrderId = null;
+		Integer shipmentId = null;
+		// ── Idempotency / retrigger guard ──────────────────────────────────
+		// If this shipment already has a Shiprocket order (e.g. this call is a
+		// manual admin retrigger after a downstream step failed), reuse the
+		// existing order/shipment ids instead of calling createOrder again —
+		// that would create a duplicate order on Shiprocket.
+		if (ctx.orderStatusAlreadySuccess && shippingEO.getShipOrderId() != null
+				&& shippingEO.getShipShipmentId() != null) {
+			shipOrderId = shippingEO.getShipOrderId();
+			shipmentId = shippingEO.getShipShipmentId();
+			shippingRepository.save(shippingEO); // persist carton dims computed above
+			saveStepLog(event, "CREATE_ORDER", "SKIPPED",
+					"Shiprocket order already exists (order_id=" + shipOrderId + ", shipment_id=" + shipmentId
+							+ "); reusing existing order instead of creating a duplicate");
+			logger.info("Step CREATE_ORDER SKIPPED (already exists): reusing order_id={}, shipment_id={}",
+					shipOrderId, shipmentId);
+		}
+		else
+		try {
+			Map response = shiprocketService.createOrder(shiprocketOrderRequest);
+			shipOrderId = response != null ? (Integer) response.get("order_id") : null;
+			if (response != null && shipOrderId != null) {
+				shipmentId = (Integer) response.get("shipment_id");
+				shippingEO.setShipOrderId(shipOrderId);
+				shippingEO.setShipShipmentId(shipmentId);
+				// Populate estimated_delivery_date from createOrder response
+				Object estDelivery = response.get("estimated_delivery_date");
+				if (estDelivery instanceof String && !((String) estDelivery).isEmpty()) {
+					try {
+						shippingEO.setEstimatedDeliveryDate(LocalDateTime.parse((String) estDelivery,
+								DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+					}
+					catch (Exception ignored) {
+						try {
+							shippingEO.setEstimatedDeliveryDate(
+									java.time.LocalDate.parse((String) estDelivery).atStartOfDay());
+						}
+						catch (Exception ex2) {
+							logger.warn("Could not parse estimated_delivery_date '{}': {}", estDelivery,
+									ex2.getMessage());
+						}
+					}
+				}
+				shippingRepository.save(shippingEO);
+				// ── Separate log record for CREATE_ORDER success ──
+				shiprocketOrderLogRepository.save(ShiprocketOrderLogEO.builder()
+					.shipmentId(event.getShipmentId())
+					.orderId(event.getOrderId())
+					.warehouseId(event.getWarehouseId())
+					.step("CREATE_ORDER")
+					.status(Constants.SUCCESS_STATUS)
+					.shiprocketOrderId(shipOrderId)
+					.shiprocketShipmentId(shipmentId)
+					.build());
+				logger.info("Step CREATE_ORDER SUCCESS: order_id={}, shipment_id={}", shipOrderId, shipmentId);
+				// Order successfully created and a non-null shipOrderId was returned —
+				// mark shiprocket_order_status SUCCESS on ShippingEO and record the
+				// corresponding status-history row.
+				recordShiprocketOrderStatus(shippingEO, Constants.SUCCESS_STATUS, null);
+			}
+			else {
+				// Either Shiprocket returned no response at all, or it returned a
+				// response without an order_id (shipOrderId == null) — both are
+				// treated as a failed order creation.
+				String failureReason = response == null ? "Shiprocket createOrder returned null response"
+						: "Shiprocket createOrder response did not contain an order_id";
+				saveStepLog(event, "CREATE_ORDER", "FAILED", failureReason);
+				logger.error("Step CREATE_ORDER FAILED: {}", failureReason);
+				// Mark shiprocket_order_status FAILED on ShippingEO and record the
+				// corresponding status-history row.
+				recordShiprocketOrderStatus(shippingEO, "FAILED", failureReason);
+				markOrderReadyToShip(order, shippingEO, "Shiprocket order was not generated (" + failureReason + ")");
+				return ShiprocketOrderEventResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("Shiprocket order was not generated (" + failureReason + ")")
+					.shipmentId(event.getShipmentId())
+					.orderId(event.getOrderId())
+					.warehouseId(event.getWarehouseId())
+					.shipmentStatus(shippingEO.getShipmentStatus())
+					.failedStep("CREATE_ORDER")
+					.build();
+			}
+		}
+		catch (Exception ex) {
+			// Exception while calling createOrder — mark shiprocket_order_status
+			// FAILED on ShippingEO and record the corresponding status-history row.
+			saveStepLog(event, "CREATE_ORDER", "FAILED", ex.getMessage());
+			logger.error("Step CREATE_ORDER FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
+					ex);
+			recordShiprocketOrderStatus(shippingEO, "FAILED", ex.getMessage());
+			markOrderReadyToShip(order, shippingEO, "Shiprocket order was not generated: " + ex.getMessage());
+			return ShiprocketOrderEventResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("Shiprocket order was not generated: " + ex.getMessage())
+				.shipmentId(event.getShipmentId())
+				.orderId(event.getOrderId())
+				.warehouseId(event.getWarehouseId())
+				.shipmentStatus(shippingEO.getShipmentStatus())
+				.failedStep("CREATE_ORDER")
+				.build();
+		}
+		ctx.shipOrderId = shipOrderId;
+		ctx.shipmentId = shipmentId;
+		return null;
+	}
+
+	/**
+	 * Step 1.5: Find Top-N Best Courier Services via Serviceability API.
+	 * Populates {@code ctx.bestCourierIds} and {@code ctx.courierRateMap}. Never
+	 * fails the overall event — any error here just falls back to Shiprocket
+	 * auto-assign.
+	 */
+	private void executeFindBestCourierStep(ShiprocketOrderEvent event, ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		OrderEO order = ctx.order;
+		OrderAddressEO orderAddress = ctx.orderAddress;
+		Integer shipOrderId = ctx.shipOrderId;
+		Integer shipmentId = ctx.shipmentId;
+		List<Integer> bestCourierIds = ctx.bestCourierIds;
+		Map<Integer, Double> courierRateMap = ctx.courierRateMap;
+		List<Map<String, Object>> courierDetailsList = new ArrayList<>();
+		try {
+			if (event.getBestCourierId() != null
+					&& !Constants.BLOCKLISTED_COURIER_COMPANY_IDS.contains(event.getBestCourierId())) {
+				// Caller already specified a preferred courier — skip the serviceability
+				// lookup entirely and use it directly.
+				bestCourierIds.add(event.getBestCourierId());
+				saveStepLog(event, "FIND_BEST_COURIER", "SKIPPED",
+						"Using caller-supplied bestCourierId=" + event.getBestCourierId());
+				logger.info("Step FIND_BEST_COURIER: using caller-supplied bestCourierId={} for shipmentId={}",
+						event.getBestCourierId(), shipmentId);
+			}
+			else if (event.getBestCourierId() != null) {
+				logger.warn(
+						"Step FIND_BEST_COURIER: caller-supplied bestCourierId={} is blocklisted, falling back to serviceability lookup",
+						event.getBestCourierId());
+			}
+
+			String deliveryPostcode = orderAddress != null ? orderAddress.getPostalCode() : null;
+			if (!bestCourierIds.isEmpty()) {
+				// Already resolved via caller-supplied bestCourierId above.
+			}
+			else if (deliveryPostcode != null && !deliveryPostcode.isEmpty() && shipmentId != null) {
+				Double weighttemp1 = shippingEO.getWeight() != null ? shippingEO.getWeight() : 1.1;
+				if (weighttemp1 <= 1.1) {
+					weighttemp1 = 1.1;
+				}
+
+				ServiceabilityRequestDTO serviceabilityReq = ServiceabilityRequestDTO.builder()
+					.orderId(shipOrderId)
+					.pickupPostcode(Integer.parseInt(getWarehousePostalCode(ctx.shipmentWarehouseName)))
+					.deliveryPostcode(Integer.parseInt(deliveryPostcode.trim()))
+					.cod(order.getPaymentStatus() != null && order.getPaymentStatus().equalsIgnoreCase("PAID") ? 0
+							: 1)
+					.weight(String.valueOf(weighttemp1))
+					.length(shippingEO.getLength() != null && shippingEO.getLength() > 0
+							? shippingEO.getLength().intValue() : null)
+					.breadth(shippingEO.getBreadth() != null && shippingEO.getBreadth() > 0
+							? shippingEO.getBreadth().intValue() : null)
+					.height(shippingEO.getHeight() != null && shippingEO.getHeight() > 0
+							? shippingEO.getHeight().intValue() : null)
+					.build();
+
+				List<Integer> allBestCouriers = shiprocketService.getBestCourierServices(serviceabilityReq,
+						Constants.MAX_BEST_COURIER_COUNT, courierRateMap, courierDetailsList);
+
+				// Filter out blocklisted courier IDs
+				for (Integer cId : allBestCouriers) {
+					if (cId != null && !Constants.BLOCKLISTED_COURIER_COMPANY_IDS.contains(cId)) {
+						bestCourierIds.add(cId);
+					}
+					else {
+						logger.info("Step FIND_BEST_COURIER: skipping blocklisted courierCompanyId={}", cId);
+					}
+				}
+
+				// ── Persist all candidate couriers to courier_selection_log ──
+				String orderNumber = order.getOrderNumber();
+				for (Map<String, Object> detail : courierDetailsList) {
+					try {
+						Integer cId = (Integer) detail.get("courierCompanyId");
+						String cName = (String) detail.get("courierName");
+						Double cRate = (Double) detail.get("rate");
+						Double cDays = (Double) detail.get("estimatedDeliveryDays");
+						Integer cRank = (Integer) detail.get("rank");
+						CourierSelectionLogEO logEntry = CourierSelectionLogEO.builder()
+							.orderId(event.getOrderId())
+							.orderNumber(orderNumber)
+							.shipmentId(event.getShipmentId())
+							.shipShipmentId(shipmentId)
+							.courierCompanyId(cId)
+							.courierName(cName)
+							.rate(cRate != null ? new java.math.BigDecimal(cRate) : null)
+							.estimatedDeliveryDays(cDays)
+							.rank(cRank)
+							.isSelected(false)
+							.build();
+						courierSelectionLogRepository.save(logEntry);
+					}
+					catch (Exception saveEx) {
+						logger.warn("Could not save courier_selection_log entry: {}", saveEx.getMessage());
+					}
+				}
+
+				// ── Separate log record for FIND_BEST_COURIER ──
+				String fcStatus = bestCourierIds.isEmpty() ? "NOT_FOUND" : Constants.SUCCESS_STATUS;
+				String fcError = bestCourierIds.isEmpty()
+						? "No eligible (non-blocked) couriers found; AWB will use Shiprocket auto-assign" : null;
+				saveStepLog(event, "FIND_BEST_COURIER", fcStatus, fcError);
+				logger.info("Step FIND_BEST_COURIER: {} eligible couriers for shipmentId={}: {}",
+						bestCourierIds.size(), shipmentId, bestCourierIds);
+			}
+			else {
+				saveStepLog(event, "FIND_BEST_COURIER", "SKIPPED",
+						"Delivery postcode unavailable; serviceability check skipped");
+				logger.warn("Step FIND_BEST_COURIER skipped: delivery postcode unavailable for shipmentId={}",
+						event.getShipmentId());
+			}
+		}
+		catch (Exception ex) {
+			saveStepLog(event, "FIND_BEST_COURIER", "FAILED",
+					"Will proceed with auto-assign. Error: " + ex.getMessage());
+			logger.warn("Step FIND_BEST_COURIER FAILED for shipmentId={}, will proceed with auto-assign: {}",
+					event.getShipmentId(), ex.getMessage());
+		}
+	}
+
+	/**
+	 * Step 1.6: If no eligible courier was found via getBestCourierServices, the
+	 * Shiprocket order is already created (Step 1) — stop here and flag the
+	 * shipment for manual processing instead of attempting AWB/pickup
+	 * auto-assign, which is unreliable when Shiprocket itself found no
+	 * serviceable courier for this route/weight/COD combination. Returns
+	 * {@code null} if a courier was found (i.e. processing should continue).
+	 */
+	private ShiprocketOrderEventResponseDTO handleNoCourierFound(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx) {
+		if (!ctx.bestCourierIds.isEmpty()) {
+			return null;
+		}
+		ShippingEO shippingEO = ctx.shippingEO;
+		OrderEO order = ctx.order;
+		Integer shipOrderId = ctx.shipOrderId;
+
+		shippingEO.setShipmentStatus(Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED);
+		shippingRepository.save(shippingEO);
+
+		recordShiprocketOrderStatus(shippingEO, Constants.FAILURE_STATUS,
+				"No Best Courier for this Order");
+
+		ShipmentTrackingHistoryEO manualTrackingEntry = new ShipmentTrackingHistoryEO();
+		manualTrackingEntry.setShipment(shippingEO);
+		manualTrackingEntry.setStatus(Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED);
+		manualTrackingEntry.setRemarks(
+				"No eligible courier found for this route/weight/COD combination. Shiprocket order created (order_id="
+						+ shipOrderId + "); shipment requires manual courier assignment.");
+		if (!shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(shippingEO,
+				Constants.SHIPMENT_STATUS_MANUAL_PROCESSING_REQUIRED)) {
+			shipmentTrackingHistoryRepository.save(manualTrackingEntry);
+		}
+
+		saveStepLog(event, "GENERATE_AWB", "SKIPPED",
+				"No eligible courier found via getBestCourierServices; Shiprocket order was created successfully, shipment will be processed manually");
+		logger.warn(
+				"Step GENERATE_AWB SKIPPED for shipmentId={}: no eligible courier found. Shiprocket order_id={} was created; shipment flagged for manual processing.",
+				event.getShipmentId(), shipOrderId);
+		recordGenerateAwbStatus(shippingEO, "SKIPPED", "No eligible courier found via getBestCourierServices");
+
+		// Best-effort admin push notification — never breaks order processing.
+		try {
+			pushNotificationService.notifyAdminsNoCourierFound(shippingEO, shipOrderId);
+		}
+		catch (Exception pushEx) {
+			logger.error("Failed to send no-courier-found push notification for shipmentId={}: {}", event.getShipmentId(),
+					pushEx.getMessage(), pushEx);
+		}
+
+		// Courier service not available — Shiprocket order exists but AWB /
+		// label cannot be generated without a courier. Mark Ready to Ship.
+		markOrderReadyToShip(order, shippingEO, "No courier service available for this shipment");
+		return ShiprocketOrderEventResponseDTO.builder()
+			.responseStatus(Constants.FAILURE_STATUS)
+			.responseMessage("No courier service available for this shipment")
+			.shipmentId(event.getShipmentId())
+			.orderId(event.getOrderId())
+			.warehouseId(event.getWarehouseId())
+			.shipOrderId(shipOrderId)
+			.shipShipmentId(ctx.shipmentId)
+			.shipmentStatus(shippingEO.getShipmentStatus())
+			.failedStep("GENERATE_AWB")
+			.build();
+	}
+
+	/**
+	 * Step 2: Generate AWB — try best couriers in order until one succeeds.
+	 * Populates {@code ctx.awbCode} on success. Returns a terminal failure
+	 * response only when {@code shipmentId} is missing (AWB cannot even be
+	 * attempted); any per-courier failures are recorded but do not stop
+	 * processing.
+	 */
+	private ShiprocketOrderEventResponseDTO executeGenerateAwbStep(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		OrderEO order = ctx.order;
+		Integer shipOrderId = ctx.shipOrderId;
+		Integer shipmentId = ctx.shipmentId;
+		List<Integer> bestCourierIds = ctx.bestCourierIds;
+		Map<Integer, Double> courierRateMap = ctx.courierRateMap;
+
+		String awbCode = null;
+		if (ctx.awbStatusAlreadySuccess && shippingEO.getAwb() != null) {
+			awbCode = shippingEO.getAwb();
+			saveStepLog(event, "GENERATE_AWB", "SKIPPED", "AWB already generated previously: " + awbCode);
+			logger.info("Step GENERATE_AWB SKIPPED (already success) for shipmentId={}: awb={}",
+					event.getShipmentId(), awbCode);
+		}
+		else
+		try {
+			if (shipmentId == null) {
+				saveStepLog(event, "GENERATE_AWB", "FAILED",
+						"Cannot generate AWB without shipment_id from Shiprocket");
+				logger.error("Step GENERATE_AWB FAILED: shipment_id is null, cannot proceed");
+				recordGenerateAwbStatus(shippingEO, "FAILED", "Cannot generate AWB without shipment_id from Shiprocket");
+				markOrderReadyToShip(order, shippingEO, "AWB not generated: shipment_id missing from Shiprocket");
+				return ShiprocketOrderEventResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("AWB not generated: shipment_id missing from Shiprocket")
+					.shipmentId(event.getShipmentId())
+					.orderId(event.getOrderId())
+					.warehouseId(event.getWarehouseId())
+					.shipOrderId(shipOrderId)
+					.shipShipmentId(shipmentId)
+					.shipmentStatus(shippingEO.getShipmentStatus())
+					.failedStep("GENERATE_AWB")
+					.build();
+			}
+
+			// Only ranked/eligible couriers are attempted now — bestCourierIds is
+			// guaranteed non-empty at this point.
+			List<Integer> couriersToTry = bestCourierIds;
+
+			Integer courierCompanyId = null;
+			String courierName = null;
+			java.math.BigDecimal shippingPrice = null;
+
+			for (int ci = 0; ci < couriersToTry.size() && awbCode == null; ci++) {
+				Integer tryCourierId = couriersToTry.get(ci);
+				try {
+					Map awbResp = shiprocketService.generateAWB(shipmentId, tryCourierId);
+					String extracted = extractAwbCode(awbResp);
+					if (extracted != null) {
+						awbCode = extracted;
+
+						// Extract courier details
+						Object responseObj = awbResp != null ? awbResp.get("response") : null;
+						Map dataDetail = null;
+						if (responseObj instanceof Map) {
+							Object dataObj = ((Map) responseObj).get("data");
+							if (dataObj instanceof Map)
+								dataDetail = (Map) dataObj;
+							else
+								dataDetail = (Map) responseObj;
+						}
+						if (dataDetail != null) {
+							Object ccId = dataDetail.get("courier_company_id");
+							if (ccId instanceof Number)
+								courierCompanyId = ((Number) ccId).intValue();
+							Object cn = dataDetail.get("courier_name");
+							if (cn instanceof String)
+								courierName = (String) cn;
+							// freight_charge / rate → shipping price
+							Object freightObj = dataDetail.get("freight_charge");
+							if (freightObj == null)
+								freightObj = dataDetail.get("rate");
+							if (freightObj instanceof Number) {
+								shippingPrice = new java.math.BigDecimal(((Number) freightObj).doubleValue());
+							}
+							// etd
+							Object etdObj = dataDetail.get("etd");
+							if (etdObj instanceof String && !((String) etdObj).isEmpty()) {
+								final String etdStr = (String) etdObj;
+								try {
+									shippingEO.setExpectedDeliveryDate(LocalDateTime.parse(etdStr,
+											DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+								}
+								catch (Exception ignored) {
+									try {
+										shippingEO.setExpectedDeliveryDate(
+												java.time.LocalDate.parse(etdStr).atStartOfDay());
+									}
+									catch (Exception ex2) {
+										logger.warn("Could not parse etd '{}': {}", etdStr, ex2.getMessage());
+									}
+								}
+							}
+						}
+						logger.info("Step GENERATE_AWB SUCCESS on attempt #{} with courierCompanyId={}: awb={}",
+								ci + 1, tryCourierId, awbCode);
+					}
+					else {
+						// Log per-attempt failure as a separate record
+						String awbErr = extractAwbGenerateError(awbResp);
+						saveStepLog(event, "GENERATE_AWB", "ATTEMPT_FAILED", "courierCompanyId=" + tryCourierId
+								+ " attempt #" + (ci + 1) + (awbErr != null ? ". Error: " + awbErr : ""));
+						logger.warn("Step GENERATE_AWB: courier {} (attempt #{}) returned no AWB code. error={}",
+								tryCourierId, ci + 1, awbErr);
+					}
+				}
+				catch (Exception ex) {
+					saveStepLog(event, "GENERATE_AWB", "ATTEMPT_FAILED", "courierCompanyId=" + tryCourierId
+							+ " attempt #" + (ci + 1) + ". Exception: " + ex.getMessage());
+					logger.warn("Step GENERATE_AWB: exception with courierCompanyId={} (attempt #{}): {}",
+							tryCourierId, ci + 1, ex.getMessage());
+				}
+			}
+
+			// ── Separate final log record for GENERATE_AWB outcome ──
+			if (awbCode == null) {
+				String awbFailureReason = "AWB code not received from Shiprocket after trying "
+						+ couriersToTry.size() + " courier(s)";
+				saveStepLog(event, "GENERATE_AWB", "FAILED", awbFailureReason);
+				logger.error("Step GENERATE_AWB FAILED for shipmentId={} after trying {} couriers",
+						event.getShipmentId(), couriersToTry.size());
+				// Persist generateAwbStatus=FAILED on ShippingEO and record the
+				// corresponding status-history row.
+				recordGenerateAwbStatus(shippingEO, "FAILED", awbFailureReason);
+			}
+			else {
+				shippingEO.setAwb(awbCode);
+				if (courierCompanyId != null)
+					shippingEO.setCourierCompanyId(courierCompanyId);
+				if (courierName != null)
+					shippingEO.setCourierName(courierName);
+				// Set shipping price: prefer AWB response freight_charge; fall back
+				// to serviceability rate map
+				if (shippingPrice != null) {
+					shippingEO.setShippingPrice(shippingPrice);
+				}
+				else if (courierCompanyId != null && courierRateMap.containsKey(courierCompanyId)) {
+					shippingEO.setShippingPrice(new java.math.BigDecimal(courierRateMap.get(courierCompanyId)));
+				}
+				shippingRepository.save(shippingEO);
+
+				// ── Mark the selected courier in courier_selection_log ──
+				final Integer finalCourierCompanyId = courierCompanyId;
+				final String finalAwbCode = awbCode;
+				final java.math.BigDecimal finalShippingPriceForLog = shippingEO.getShippingPrice();
+				if (finalCourierCompanyId != null) {
+					try {
+						courierSelectionLogRepository.findByShipmentIdOrderByRankAsc(event.getShipmentId())
+							.stream()
+							.filter(e -> finalCourierCompanyId.equals(e.getCourierCompanyId()))
+							.findFirst()
+							.ifPresent(entry -> {
+								entry.setIsSelected(true);
+								entry.setAwbCode(finalAwbCode);
+								entry.setShippingPrice(finalShippingPriceForLog);
+								courierSelectionLogRepository.save(entry);
+							});
+					}
+					catch (Exception markEx) {
+						logger.warn("Could not mark selected courier in courier_selection_log: {}",
+								markEx.getMessage());
+					}
+				}
+
+				ShiprocketOrderLogEO awbLog = ShiprocketOrderLogEO.builder()
+					.shipmentId(event.getShipmentId())
+					.orderId(event.getOrderId())
+					.warehouseId(event.getWarehouseId())
+					.step("GENERATE_AWB")
+					.status(Constants.SUCCESS_STATUS)
+					.awbCode(awbCode)
+					.build();
+				shiprocketOrderLogRepository.save(awbLog);
+				recordGenerateAwbStatus(shippingEO, Constants.SUCCESS_STATUS, null);
+			}
+		}
+		catch (Exception ex) {
+			saveStepLog(event, "GENERATE_AWB", "FAILED", ex.getMessage());
+			logger.error("Step GENERATE_AWB FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
+					ex);
+			recordGenerateAwbStatus(shippingEO, "FAILED", ex.getMessage());
+		}
+		ctx.awbCode = awbCode;
+		return null;
+	}
+
+	/**
+	 * Step 3: Request Pickup — only attempted once CREATE_ORDER and GENERATE_AWB
+	 * have both succeeded. Never returns a terminal failure; any error here is
+	 * logged/recorded and processing continues to the remaining steps.
+	 */
+	private void executeRequestPickupStep(ShiprocketOrderEvent event, ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		Integer shipmentId = ctx.shipmentId;
+
+		boolean pickupPrerequisitesMet = Constants.SUCCESS_STATUS.equals(shippingEO.getShiprocketOrderStatus())
+				&& Constants.SUCCESS_STATUS.equals(shippingEO.getGenerateAwbStatus());
+		if (ctx.pickupStatusAlreadySuccess) {
+			saveStepLog(event, "REQUEST_PICKUP", "SKIPPED", "Pickup already requested successfully previously");
+			logger.info("Step REQUEST_PICKUP SKIPPED (already success) for shipmentId={}", event.getShipmentId());
+		}
+		else if (!pickupPrerequisitesMet) {
+			String pickupSkipReason = "Skipping REQUEST_PICKUP: prerequisite steps not successful (shiprocketOrderStatus="
+					+ shippingEO.getShiprocketOrderStatus() + ", generateAwbStatus="
+					+ shippingEO.getGenerateAwbStatus() + ")";
+			saveStepLog(event, "REQUEST_PICKUP", "SKIPPED", pickupSkipReason);
+			logger.warn("Step REQUEST_PICKUP SKIPPED for shipmentId={}: {}", event.getShipmentId(),
+					pickupSkipReason);
+			recordRequestPickupStatus(shippingEO, "SKIPPED", pickupSkipReason);
+		}
+		else
+		try {
+			Map pickupResponseMap = shiprocketService.requestPickup(shipmentId.toString());
+			shippingEO.setShipmentStatus("PICKUP_SCHEDULED");
+
+			// Check if Shiprocket indicated the pickup was already in queue
+			boolean alreadyInQueue = pickupResponseMap != null
+					&& Boolean.TRUE.equals(pickupResponseMap.get("already_in_pickup_queue"));
+
+			// Persist pickup_id, pickup_scheduled_date, pickup_token from response
+			// Shiprocket nests these inside pickupResponseMap → "response"
+			if (pickupResponseMap != null && !alreadyInQueue) {
+				Map pickupData = null;
+				Object responseObj = pickupResponseMap.get("response");
+				if (responseObj instanceof Map) {
+					pickupData = (Map) responseObj;
+				}
+				else {
+					// Fallback: fields at top level
+					pickupData = pickupResponseMap;
+				}
+
+				Object pickupIdObj = pickupData.get("pickup_id");
+				if (pickupIdObj instanceof Number) {
+					shippingEO.setPickupId(((Number) pickupIdObj).longValue());
+				}
+				Object scheduledDateObj = pickupData.get("pickup_scheduled_date");
+				if (scheduledDateObj instanceof String) {
+					try {
+						shippingEO.setPickupScheduledDate(LocalDateTime.parse((String) scheduledDateObj,
+								DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+					}
+					catch (Exception ex) {
+						logger.warn("Could not parse pickup_scheduled_date '{}': {}", scheduledDateObj,
+								ex.getMessage());
+					}
+				}
+				Object tokenObj = pickupData.get("pickup_token_number");
+				if (tokenObj instanceof String) {
+					shippingEO.setPickupToken((String) tokenObj);
+				}
+			}
+			ctx.shippingEO = shippingRepository.save(shippingEO);
+			shippingEO = ctx.shippingEO;
+
+			// ── Separate log record for REQUEST_PICKUP success ──
+			String pickupNote = alreadyInQueue ? "Already in Pickup Queue – treated as PICKUP_SCHEDULED" : null;
+			saveStepLog(event, "REQUEST_PICKUP", Constants.SUCCESS_STATUS, pickupNote);
+
+			// ── Save PICKUP_SCHEDULED entry in shipment_tracking_history ──
+			if (!shipmentTrackingHistoryRepository.existsByShipmentAndStatusIgnoreCase(shippingEO,
+					"PICKUP_SCHEDULED")) {
 				ShipmentTrackingHistoryEO pickupHistory = new ShipmentTrackingHistoryEO();
 				pickupHistory.setShipment(shippingEO);
 				pickupHistory.setStatus("PICKUP_SCHEDULED");
@@ -797,277 +1493,310 @@ public class ShippingServiceImpl implements ShippingService {
 						: "Pickup requested successfully");
 				pickupHistory.setUpdatedAt(LocalDateTime.now());
 				shipmentTrackingHistoryRepository.save(pickupHistory);
-
-				logger.info("Step REQUEST_PICKUP SUCCESS for shipmentId={}, alreadyInQueue={}", event.getShipmentId(),
-						alreadyInQueue);
-			}
-			catch (Exception ex) {
-				saveStepLog(event, "REQUEST_PICKUP", "FAILED", ex.getMessage());
-				logger.error("Step REQUEST_PICKUP FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
-						ex);
 			}
 
-			// Step 4: Generate Label — if label fails, transfer to next best courier and
-			// retry once
-			String generatedLabelUrl = null;
-			try {
-				List<String> shipmentIdStrings = new ArrayList<>();
-				shipmentIdStrings.add(shipmentId.toString());
-				Map response4 = shiprocketService.generateLabel(shipmentIdStrings);
-				generatedLabelUrl = extractLabelUrl(response4);
-				logger.info("Step GENERATE_LABEL raw response keys={}", response4 != null ? response4.keySet() : null);
-
-				// If label generation failed and AWB was assigned, try transferring to
-				// the next best courier
-				if (generatedLabelUrl == null && usedCourierIndex >= 0) {
-					for (int ci = usedCourierIndex + 1; ci < bestCourierIds.size() && generatedLabelUrl == null; ci++) {
-						Integer nextCourierId = bestCourierIds.get(ci);
-						logger.info(
-								"Step GENERATE_LABEL: label failed, attempting transfer to courierCompanyId={} (candidate #{})",
-								nextCourierId, ci + 1);
-						try {
-							// Transfer shipment to next best courier — separate log
-							// record
-							shiprocketService.transferCourier(shipmentId, nextCourierId);
-							saveStepLog(event, "TRANSFER_COURIER", "SUCCESS",
-									"Transferred shipmentId=" + shipmentId + " to courierCompanyId=" + nextCourierId);
-							logger.info(
-									"Step TRANSFER_COURIER SUCCESS: shipmentId={} transferred to courierCompanyId={}",
-									shipmentId, nextCourierId);
-
-							// Update courier details in ShippingEO
-							shippingEO.setCourierCompanyId(nextCourierId);
-							shippingRepository.save(shippingEO);
-
-							// Re-request pickup with the new courier — separate log
-							// record
-							try {
-								Map pickupResp = shiprocketService.requestPickup(shipmentId.toString());
-								boolean rePickupAlreadyInQueue = pickupResp != null
-										&& Boolean.TRUE.equals(pickupResp.get("already_in_pickup_queue"));
-								if (pickupResp != null && !rePickupAlreadyInQueue) {
-									Map pickupData = null;
-									Object rObj = pickupResp.get("response");
-									pickupData = (rObj instanceof Map) ? (Map) rObj : pickupResp;
-									Object pidObj = pickupData.get("pickup_id");
-									if (pidObj instanceof Number)
-										shippingEO.setPickupId(((Number) pidObj).longValue());
-									Object sdObj = pickupData.get("pickup_scheduled_date");
-									if (sdObj instanceof String) {
-										try {
-											shippingEO.setPickupScheduledDate(LocalDateTime.parse((String) sdObj,
-													DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-										}
-										catch (Exception ignored) {
-										}
-									}
-									Object tokObj = pickupData.get("pickup_token_number");
-									if (tokObj instanceof String)
-										shippingEO.setPickupToken((String) tokObj);
-								}
-								shippingEO.setShipmentStatus("PICKUP_SCHEDULED");
-								shippingEO = shippingRepository.save(shippingEO);
-								// Save tracking history for re-pickup after transfer
-								ShipmentTrackingHistoryEO rePickupHistory = new ShipmentTrackingHistoryEO();
-								rePickupHistory.setShipment(shippingEO);
-								rePickupHistory.setStatus("PICKUP_SCHEDULED");
-								rePickupHistory.setRemarks(rePickupAlreadyInQueue
-										? "Pickup already in queue after courier transfer - Pickup Scheduled"
-										: "Pickup requested after courier transfer");
-								rePickupHistory.setUpdatedAt(LocalDateTime.now());
-								shipmentTrackingHistoryRepository.save(rePickupHistory);
-								saveStepLog(event, "REQUEST_PICKUP_AFTER_TRANSFER", "SUCCESS",
-										"Re-pickup after transfer to courierCompanyId=" + nextCourierId
-												+ (rePickupAlreadyInQueue ? " (already in queue)" : ""));
-								logger.info(
-										"Step REQUEST_PICKUP (after transfer) SUCCESS for courierCompanyId={}, alreadyInQueue={}",
-										nextCourierId, rePickupAlreadyInQueue);
-							}
-							catch (Exception pickupEx) {
-								saveStepLog(event, "REQUEST_PICKUP_AFTER_TRANSFER", "FAILED",
-										"courierCompanyId=" + nextCourierId + ". Error: " + pickupEx.getMessage());
-								logger.warn("Step REQUEST_PICKUP (after transfer) FAILED for courierCompanyId={}: {}",
-										nextCourierId, pickupEx.getMessage());
-							}
-
-							// Retry label generation
-							Map retryLabelResp = shiprocketService.generateLabel(shipmentIdStrings);
-							generatedLabelUrl = extractLabelUrl(retryLabelResp);
-							if (generatedLabelUrl != null) {
-								logger.info(
-										"Step GENERATE_LABEL SUCCESS after transfer to courierCompanyId={}: labelUrl={}",
-										nextCourierId, generatedLabelUrl);
-								usedCourierIndex = ci;
-							}
-							else {
-								logger.warn("Step GENERATE_LABEL still failed after transfer to courierCompanyId={}",
-										nextCourierId);
-							}
-						}
-						catch (Exception transferEx) {
-							saveStepLog(event, "TRANSFER_COURIER", "FAILED",
-									"courierCompanyId=" + nextCourierId + ". Error: " + transferEx.getMessage());
-							logger.warn("Step TRANSFER_COURIER FAILED for courierCompanyId={}: {}", nextCourierId,
-									transferEx.getMessage());
-						}
-					}
-				}
-
-				// ── Separate final log record for GENERATE_LABEL outcome ──
-				if (generatedLabelUrl == null) {
-					saveStepLog(event, "GENERATE_LABEL", "FAILED",
-							"Label URL not received from Shiprocket after all attempts");
-				}
-				else {
-					ShiprocketOrderLogEO labelLog = ShiprocketOrderLogEO.builder()
-						.shipmentId(event.getShipmentId())
-						.orderId(event.getOrderId())
-						.warehouseId(event.getWarehouseId())
-						.step("GENERATE_LABEL")
-						.status("SUCCESS")
-						.labelUrl(generatedLabelUrl)
-						.build();
-					shiprocketOrderLogRepository.save(labelLog);
-				}
-				shippingEO.setLabelUrl(generatedLabelUrl);
-				shippingRepository.save(shippingEO);
-				logger.info("Step GENERATE_LABEL {}: labelUrl={}", generatedLabelUrl != null ? "SUCCESS" : "FAILED",
-						generatedLabelUrl);
-			}
-			catch (Exception ex) {
-				saveStepLog(event, "GENERATE_LABEL", "FAILED", ex.getMessage());
-				logger.error("Step GENERATE_LABEL FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
-						ex);
-			}
-
-			// Step 5: Track Shipment — populate track_url, etd, edd
-			try {
-				String awbForTracking = shippingEO.getAwb();
-				if (awbForTracking != null && !awbForTracking.isEmpty()) {
-					Map trackResponse = shiprocketService.trackShipment(awbForTracking);
-					if (trackResponse != null) {
-						Object trackingDataObj = trackResponse.get("tracking_data");
-						if (trackingDataObj instanceof Map) {
-							Map trackingData = (Map) trackingDataObj;
-
-							// track_url → shippingEO.trackUrl
-							Object trackUrlObj = trackingData.get("track_url");
-							if (trackUrlObj instanceof String) {
-								shippingEO.setTrackUrl((String) trackUrlObj);
-							}
-
-							// etd → expectedDeliveryDate
-							Object etdObj = trackingData.get("etd");
-							if (etdObj instanceof String && !((String) etdObj).isEmpty()) {
-								try {
-									shippingEO.setExpectedDeliveryDate(LocalDateTime.parse((String) etdObj,
-											DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-								}
-								catch (Exception ignored) {
-									logger.warn("Could not parse etd '{}' in trackShipment response", etdObj);
-								}
-							}
-
-							// edd from shipment_track[0].edd → estimatedDeliveryDate
-							Object shipmentTrackObj = trackingData.get("shipment_track");
-							if (shipmentTrackObj instanceof List) {
-								List shipmentTrackList = (List) shipmentTrackObj;
-								if (!shipmentTrackList.isEmpty() && shipmentTrackList.get(0) instanceof Map) {
-									Object eddObj = ((Map) shipmentTrackList.get(0)).get("edd");
-									if (eddObj instanceof String && !((String) eddObj).isEmpty()) {
-										try {
-											shippingEO.setEstimatedDeliveryDate(LocalDateTime.parse((String) eddObj,
-													DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-										}
-										catch (Exception ignored) {
-											logger.warn("Could not parse edd '{}' in trackShipment response", eddObj);
-										}
-									}
-								}
-							}
-
-							shippingRepository.save(shippingEO);
-							// ── Separate log record for TRACK_SHIPMENT success ──
-							saveStepLog(event, "TRACK_SHIPMENT", "SUCCESS", null);
-							logger.info("Step TRACK_SHIPMENT SUCCESS for awb={}: trackUrl={}, etd={}, edd={}",
-									awbForTracking, shippingEO.getTrackUrl(), shippingEO.getExpectedDeliveryDate(),
-									shippingEO.getEstimatedDeliveryDate());
-
-							// ── Send Order Status Update email now that tracking is
-							// available ──
-							try {
-								OrderEO emailOrder = shippingEO.getOrder();
-								if (emailOrder != null && emailOrder.getCustomer() != null) {
-									CustomerEO customer = emailOrder.getCustomer();
-									String customerName = customer.getFirstName();
-									String customerEmail = customer.getEmail();
-									String customerMobile = customer.getMobileNumber();
-
-									// Format expected delivery date
-									String deliveryDateStr = null;
-									DateTimeFormatter displayFmt = DateTimeFormatter.ofPattern("dd MMM yyyy");
-									if (shippingEO.getEstimatedDeliveryDate() != null) {
-										deliveryDateStr = shippingEO.getEstimatedDeliveryDate().format(displayFmt);
-									}
-									else if (shippingEO.getExpectedDeliveryDate() != null) {
-										deliveryDateStr = shippingEO.getExpectedDeliveryDate().format(displayFmt);
-									}
-
-									EmailDetails emailDetails = EmailDetails.builder()
-										.orderId(emailOrder.getOrderNumber())
-										.customerName(customerName)
-										.orderStatus(emailOrder.getOrderStatus())
-										.trackingNumber(shippingEO.getAwb())
-										.expectedDelivery(deliveryDateStr)
-										.trackingUrl(shippingEO.getTrackUrl())
-										.build();
-
-									Event notificationEvent = Event.builder()
-										.email(customerEmail)
-										.mobile(customerMobile)
-										.purpose(Constants.COMMUNICATION_PURPOSE_ORDER_CONFIRMATION)
-										.emailSubject("Order Status Update - " + emailOrder.getOrderNumber())
-										.emailMessage(String.format("Hi %s, your order %s is now %s. Track: %s",
-												customerName, emailOrder.getOrderNumber(), emailOrder.getOrderStatus(),
-												shippingEO.getTrackUrl()))
-										.smsSubject("Order Status Update")
-										.smsMessage(String.format("Order #%s is now %s. Track: %s",
-												emailOrder.getOrderNumber(), emailOrder.getOrderStatus(),
-												shippingEO.getAwb()))
-										.channel(Constants.COMMUNICATION_CHANNEL_BOTH)
-										.emailDetails(emailDetails)
-										.build();
-
-									notificationService.processEvent(notificationEvent);
-									logger.info("Order status update email event sent for orderNumber={}",
-											emailOrder.getOrderNumber());
-								}
-							}
-							catch (Exception emailEx) {
-								logger.error("Failed to send order status update email for shipmentId={}: {}",
-										event.getShipmentId(), emailEx.getMessage());
-							}
-						}
-					}
-				}
-				else {
-					saveStepLog(event, "TRACK_SHIPMENT", "SKIPPED",
-							"AWB not available for shipmentId=" + event.getShipmentId());
-					logger.warn("Step TRACK_SHIPMENT skipped: AWB not available for shipmentId={}",
-							event.getShipmentId());
-				}
-			}
-			catch (Exception ex) {
-				saveStepLog(event, "TRACK_SHIPMENT", "FAILED", ex.getMessage());
-				logger.warn("Step TRACK_SHIPMENT FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage());
-			}
-
+			logger.info("Step REQUEST_PICKUP SUCCESS for shipmentId={}, alreadyInQueue={}", event.getShipmentId(),
+					alreadyInQueue);
+			recordRequestPickupStatus(shippingEO, Constants.SUCCESS_STATUS, pickupNote);
 		}
-		catch (Exception e) {
-			// Outer catch-all: save a generic FAILED record so nothing is silently lost
-			saveStepLog(event, "PROCESS_EVENT", "FAILED", "Unexpected error: " + e.getMessage());
-			logger.error("Error processing ShiprocketOrderEvent for shipmentId={}: {}", event.getShipmentId(),
-					e.getMessage(), e);
+		catch (Exception ex) {
+			saveStepLog(event, "REQUEST_PICKUP", "FAILED", ex.getMessage());
+			logger.error("Step REQUEST_PICKUP FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
+					ex);
+			recordRequestPickupStatus(shippingEO, "FAILED", ex.getMessage());
+		}
+	}
+
+	/**
+	 * Step 4: Generate Label. Populates {@code ctx.generatedLabelUrl}. Never
+	 * returns a terminal failure; failures are logged/recorded and processing
+	 * continues.
+	 */
+	private void executeGenerateLabelStep(ShiprocketOrderEvent event, ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		Integer shipmentId = ctx.shipmentId;
+		String generatedLabelUrl = null;
+		if (ctx.labelStatusAlreadySuccess && shippingEO.getLabelUrl() != null) {
+			generatedLabelUrl = shippingEO.getLabelUrl();
+			saveStepLog(event, "GENERATE_LABEL", "SKIPPED",
+					"Label already generated previously: " + generatedLabelUrl);
+			logger.info("Step GENERATE_LABEL SKIPPED (already success) for shipmentId={}: labelUrl={}",
+					event.getShipmentId(), generatedLabelUrl);
+		}
+		else
+		try {
+			List<String> shipmentIdStrings = new ArrayList<>();
+			shipmentIdStrings.add(shipmentId.toString());
+			Map response4 = shiprocketService.generateLabel(shipmentIdStrings);
+			generatedLabelUrl = extractLabelUrl(response4);
+			logger.info("Step GENERATE_LABEL raw response keys={}", response4 != null ? response4.keySet() : null);
+
+			// ── Separate final log record for GENERATE_LABEL outcome ──
+			if (generatedLabelUrl == null) {
+				saveStepLog(event, "GENERATE_LABEL", "FAILED",
+						"Label URL not received from Shiprocket after all attempts");
+			}
+			else {
+				ShiprocketOrderLogEO labelLog = ShiprocketOrderLogEO.builder()
+					.shipmentId(event.getShipmentId())
+					.orderId(event.getOrderId())
+					.warehouseId(event.getWarehouseId())
+					.step("GENERATE_LABEL")
+					.status(Constants.SUCCESS_STATUS)
+					.labelUrl(generatedLabelUrl)
+					.build();
+				shiprocketOrderLogRepository.save(labelLog);
+			}
+			shippingEO.setLabelUrl(generatedLabelUrl);
+			shippingRepository.save(shippingEO);
+			logger.info("Step GENERATE_LABEL {}: labelUrl={}",
+					generatedLabelUrl != null ? Constants.SUCCESS_STATUS : "FAILED", generatedLabelUrl);
+			recordGenerateLabelStatus(shippingEO, generatedLabelUrl != null ? Constants.SUCCESS_STATUS : "FAILED",
+					generatedLabelUrl != null ? null : "Label URL not received from Shiprocket after all attempts");
+		}
+		catch (Exception ex) {
+			saveStepLog(event, "GENERATE_LABEL", "FAILED", ex.getMessage());
+			logger.error("Step GENERATE_LABEL FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage(),
+					ex);
+			recordGenerateLabelStatus(shippingEO, "FAILED", ex.getMessage());
+		}
+		ctx.generatedLabelUrl = generatedLabelUrl;
+	}
+
+	/**
+	 * Step 5: Track Shipment — populates track_url, etd, edd. Only attempted if
+	 * GENERATE_LABEL succeeded. Never returns a terminal failure.
+	 */
+	private void executeTrackShipmentStep(ShiprocketOrderEvent event, ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		boolean generateLabelSucceeded = Constants.SUCCESS_STATUS.equals(shippingEO.getGenerateLabelStatus());
+		if (ctx.trackStatusAlreadySuccess) {
+			saveStepLog(event, "TRACK_SHIPMENT", "SKIPPED", "Tracking already completed successfully previously");
+			logger.info("Step TRACK_SHIPMENT SKIPPED (already success) for shipmentId={}", event.getShipmentId());
+		}
+		else if (!generateLabelSucceeded) {
+			String skipReason = "GENERATE_LABEL step did not succeed (status="
+					+ shippingEO.getGenerateLabelStatus() + "); skipping TRACK_SHIPMENT";
+			saveStepLog(event, "TRACK_SHIPMENT", "SKIPPED", skipReason);
+			logger.warn("Step TRACK_SHIPMENT SKIPPED for shipmentId={}: {}", event.getShipmentId(), skipReason);
+			recordTrackShipmentStatus(shippingEO, "SKIPPED", skipReason);
+		}
+		else
+		try {
+			String awbForTracking = shippingEO.getAwb();
+			if (awbForTracking != null && !awbForTracking.isEmpty()) {
+				Map trackResponse = shiprocketService.trackShipment(awbForTracking);
+				if (trackResponse != null) {
+					Object trackingDataObj = trackResponse.get("tracking_data");
+					if (trackingDataObj instanceof Map) {
+						Map trackingData = (Map) trackingDataObj;
+
+						// track_url → shippingEO.trackUrl
+						Object trackUrlObj = trackingData.get("track_url");
+						if (trackUrlObj instanceof String) {
+							shippingEO.setTrackUrl((String) trackUrlObj);
+						}
+
+						// etd → expectedDeliveryDate
+						Object etdObj = trackingData.get("etd");
+						if (etdObj instanceof String && !((String) etdObj).isEmpty()) {
+							try {
+								shippingEO.setExpectedDeliveryDate(LocalDateTime.parse((String) etdObj,
+										DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+							}
+							catch (Exception ignored) {
+								logger.warn("Could not parse etd '{}' in trackShipment response", etdObj);
+							}
+						}
+
+						// edd from shipment_track[0].edd → estimatedDeliveryDate
+						Object shipmentTrackObj = trackingData.get("shipment_track");
+						if (shipmentTrackObj instanceof List) {
+							List shipmentTrackList = (List) shipmentTrackObj;
+							if (!shipmentTrackList.isEmpty() && shipmentTrackList.get(0) instanceof Map) {
+								Object eddObj = ((Map) shipmentTrackList.get(0)).get("edd");
+								if (eddObj instanceof String && !((String) eddObj).isEmpty()) {
+									try {
+										shippingEO.setEstimatedDeliveryDate(LocalDateTime.parse((String) eddObj,
+												DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+									}
+									catch (Exception ignored) {
+										logger.warn("Could not parse edd '{}' in trackShipment response", eddObj);
+									}
+								}
+							}
+						}
+
+						shippingRepository.save(shippingEO);
+						// ── Separate log record for TRACK_SHIPMENT success ──
+						saveStepLog(event, "TRACK_SHIPMENT", Constants.SUCCESS_STATUS, null);
+						logger.info("Step TRACK_SHIPMENT SUCCESS for awb={}: trackUrl={}, etd={}, edd={}",
+								awbForTracking, shippingEO.getTrackUrl(), shippingEO.getExpectedDeliveryDate(),
+								shippingEO.getEstimatedDeliveryDate());
+						recordTrackShipmentStatus(shippingEO, Constants.SUCCESS_STATUS, null);
+						boolean estimateAvailable = shippingEO.getEstimatedDeliveryDate() != null
+								|| shippingEO.getExpectedDeliveryDate() != null;
+						recordEstimateStatus(shippingEO, estimateAvailable ? Constants.SUCCESS_STATUS : "NOT_AVAILABLE",
+								estimateAvailable ? null
+										: "No estimated/expected delivery date returned by Shiprocket tracking response");
+					}
+				}
+			}
+			else {
+				saveStepLog(event, "TRACK_SHIPMENT", "SKIPPED",
+						"AWB not available for shipmentId=" + event.getShipmentId());
+				logger.warn("Step TRACK_SHIPMENT skipped: AWB not available for shipmentId={}",
+						event.getShipmentId());
+				recordTrackShipmentStatus(shippingEO, "SKIPPED", "AWB not available for shipmentId=" + event.getShipmentId());
+			}
+		}
+		catch (Exception ex) {
+			saveStepLog(event, "TRACK_SHIPMENT", "FAILED", ex.getMessage());
+			logger.warn("Step TRACK_SHIPMENT FAILED for shipmentId={}: {}", event.getShipmentId(), ex.getMessage());
+			recordTrackShipmentStatus(shippingEO, "FAILED", ex.getMessage());
+		}
+	}
+
+	/**
+	 * Determines the final order status now that all 5 steps have run, sends the
+	 * "Order Status Update" notification if the status actually changed, and
+	 * builds the final response DTO.
+	 */
+	private ShiprocketOrderEventResponseDTO finalizeOrderStatusAndBuildResponse(ShiprocketOrderEvent event,
+			ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		OrderEO order = ctx.order;
+		Integer shipOrderId = ctx.shipOrderId;
+		Integer shipmentId = ctx.shipmentId;
+		String awbCode = ctx.awbCode;
+		String generatedLabelUrl = ctx.generatedLabelUrl;
+
+		// ── Final Order status determination ──
+		// Only when ALL five Shiprocket processing steps (order creation, AWB
+		// generation, pickup request, label generation, and shipment tracking)
+		// have completed successfully do we consider the shipment fully ready;
+		// in that case mark the order PICKUP_SCHEDULED. If any step is
+		// missing/failed, keep the order (and its already-created shipping/
+		// shipment_item/tracking-history/shiprocket_order_log records) as
+		// Ready to Ship so it can be completed/monitored manually.
+		boolean allShipmentDetailsPresent = Constants.SUCCESS_STATUS.equals(shippingEO.getShiprocketOrderStatus())
+				&& Constants.SUCCESS_STATUS.equals(shippingEO.getGenerateAwbStatus())
+				&& Constants.SUCCESS_STATUS.equals(shippingEO.getRequestPickupStatus())
+				&& Constants.SUCCESS_STATUS.equals(shippingEO.getGenerateLabelStatus());
+		if (allShipmentDetailsPresent) {
+			order.setOrderStatus(Constants.ORDER_STATUS_PICKUP_SCHEDULED);
+			orderRepository.save(order);
+			logger.info(
+					"Order status updated to PICKUP_SCHEDULED for orderId={}: shiprocket order, AWB, pickup, label and tracking all successful",
+					event.getOrderId());
+		}
+		else {
+			markOrderReadyToShip(order, shippingEO,
+					"Incomplete shipment processing (shiprocketOrderStatus=" + shippingEO.getShiprocketOrderStatus()
+							+ ", generateAwbStatus=" + shippingEO.getGenerateAwbStatus()
+							+ ", requestPickupStatus=" + shippingEO.getRequestPickupStatus()
+							+ ", generateLabelStatus=" + shippingEO.getGenerateLabelStatus()
+							+ ", trackShipmentStatus=" + shippingEO.getTrackShipmentStatus() + ")");
+		}
+
+		sendOrderStatusUpdateEmail(event, ctx);
+
+		// ── Build the final response now that every step has run ──
+		String finalFailedStep = allShipmentDetailsPresent ? null
+				: (shipOrderId == null ? "CREATE_ORDER"
+						: (awbCode == null ? "GENERATE_AWB"
+								: (generatedLabelUrl == null ? "GENERATE_LABEL" : "REQUEST_PICKUP")));
+		return ShiprocketOrderEventResponseDTO.builder()
+			.responseStatus(allShipmentDetailsPresent ? Constants.SUCCESS_STATUS : Constants.FAILURE_STATUS)
+			.responseMessage(allShipmentDetailsPresent
+					? "Shiprocket order, courier, AWB and label all generated successfully"
+					: "Incomplete shipment details (shipOrderId=" + shipOrderId + ", awb=" + awbCode
+							+ ", courierCompanyId=" + shippingEO.getCourierCompanyId() + ", labelUrl="
+							+ generatedLabelUrl + ")")
+			.shipmentId(event.getShipmentId())
+			.orderId(event.getOrderId())
+			.warehouseId(event.getWarehouseId())
+			.shipOrderId(shipOrderId)
+			.shipShipmentId(shipmentId)
+			.awbCode(awbCode)
+			.courierCompanyId(shippingEO.getCourierCompanyId())
+			.courierName(shippingEO.getCourierName())
+			.labelUrl(generatedLabelUrl)
+			.trackUrl(shippingEO.getTrackUrl())
+			.shipmentStatus(shippingEO.getShipmentStatus())
+			.failedStep(finalFailedStep)
+			.build();
+	}
+
+	/**
+	 * Sends the "Order Status Update" notification now that all 5 shipment steps
+	 * have completed, but only if the order's status actually changed as a
+	 * result of this processing run. Never throws — failures are logged only.
+	 */
+	private void sendOrderStatusUpdateEmail(ShiprocketOrderEvent event, ShiprocketEventContext ctx) {
+		ShippingEO shippingEO = ctx.shippingEO;
+		OrderEO order = ctx.order;
+		try {
+			String currentOrderStatusForEmail = order.getOrderStatus();
+			boolean orderStatusChanged = currentOrderStatusForEmail != null
+					&& !currentOrderStatusForEmail.equals(ctx.previousOrderStatusForEmail);
+			if (orderStatusChanged) {
+				OrderEO emailOrder = order;
+				if (emailOrder.getCustomer() != null) {
+					CustomerEO customer = emailOrder.getCustomer();
+					String customerName = customer.getFirstName();
+					String customerEmail = customer.getEmail();
+					String customerMobile = customer.getMobileNumber();
+
+					// Format expected delivery date
+					String deliveryDateStr = null;
+					DateTimeFormatter displayFmt = DateTimeFormatter.ofPattern("dd MMM yyyy");
+					if (shippingEO.getEstimatedDeliveryDate() != null) {
+						deliveryDateStr = shippingEO.getEstimatedDeliveryDate().format(displayFmt);
+					}
+					else if (shippingEO.getExpectedDeliveryDate() != null) {
+						deliveryDateStr = shippingEO.getExpectedDeliveryDate().format(displayFmt);
+					}
+
+					EmailDetails emailDetails = EmailDetails.builder()
+						.orderId(emailOrder.getOrderNumber())
+						.customerName(customerName)
+						.orderStatus(emailOrder.getOrderStatus())
+						.trackingNumber(shippingEO.getAwb())
+						.expectedDelivery(deliveryDateStr)
+						.trackingUrl(shippingEO.getTrackUrl())
+						.build();
+
+					Event notificationEvent = Event.builder()
+						.email(customerEmail)
+						.mobile(customerMobile)
+						.purpose(Constants.COMMUNICATION_PURPOSE_ORDER_CONFIRMATION)
+						.emailSubject("Order Status Update - " + emailOrder.getOrderNumber())
+						.emailMessage(String.format("Hi %s, your order %s is now %s. Track: %s", customerName,
+								emailOrder.getOrderNumber(), emailOrder.getOrderStatus(),
+								shippingEO.getTrackUrl()))
+						.smsSubject("Order Status Update")
+						.smsMessage(String.format("Order #%s is now %s. Track: %s", emailOrder.getOrderNumber(),
+								emailOrder.getOrderStatus(), shippingEO.getAwb()))
+						.channel(Constants.COMMUNICATION_CHANNEL_BOTH)
+						.emailDetails(emailDetails)
+						.build();
+
+					notificationService.processEvent(notificationEvent);
+					logger.info(
+							"Order status update email event sent for orderNumber={} after all 5 shipment steps completed (status changed {} -> {})",
+							emailOrder.getOrderNumber(), ctx.previousOrderStatusForEmail, currentOrderStatusForEmail);
+				}
+			}
+			else {
+				logger.info(
+						"Skipping order status update email for orderId={}: order status unchanged ({}) after all 5 shipment steps completed",
+						event.getOrderId(), currentOrderStatusForEmail);
+			}
+		}
+		catch (Exception emailEx) {
+			logger.error("Failed to send order status update email for shipmentId={}: {}", event.getShipmentId(),
+					emailEx.getMessage());
 		}
 	}
 
@@ -1078,9 +1807,10 @@ public class ShippingServiceImpl implements ShippingService {
 				requestDTO != null ? requestDTO.getTrackId() : null);
 		try {
 			String trackingNumber = requestDTO.getTrackId();
-			ShippingEO shipment = shippingRepository.findByTrackingNumber(trackingNumber);
+			// Fetch only non-cancelled shipment by tracking number
+			ShippingEO shipment = shippingRepository.findByTrackingNumberNonCancelled(trackingNumber);
 			if (shipment == null) {
-				logger.warn("No shipment found for tracking number: {}", trackingNumber);
+				logger.warn("No non-cancelled shipment found for tracking number: {}", trackingNumber);
 				return responseDTO;
 			}
 			List<ShipmentTrackingHistoryEO> historyList = shipmentTrackingHistoryRepository
@@ -1659,7 +2389,7 @@ public class ShippingServiceImpl implements ShippingService {
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Manual Shiprocket step APIs
-	// ──────────────────────────────────────────────────────────────────────────
+	// ───────��──────────────────────────────────────────────────────────────────
 
 	@Override
 	public AwbResponse generateAwb(AwbRequest request) {
@@ -1714,7 +2444,8 @@ public class ShippingServiceImpl implements ShippingService {
 					}
 					catch (Exception ignored) {
 						try {
-							shippingEO.setExpectedDeliveryDate(java.time.LocalDate.parse(etd).atStartOfDay());
+							shippingEO.setExpectedDeliveryDate(
+									java.time.LocalDate.parse(etd).atStartOfDay());
 						}
 						catch (Exception ex2) {
 							logger.warn("Could not parse etd '{}': {}", etd, ex2.getMessage());
@@ -1873,7 +2604,7 @@ public class ShippingServiceImpl implements ShippingService {
 				response.setShiprocketTracking(null);
 			}
 
-			response.setResponseStatus("SUCCESS");
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
 			response.setResponseMessage("Shipment tracked successfully");
 			logger.info("trackShipment SUCCESS for awbCode={}", awbCode);
 
@@ -1888,7 +2619,7 @@ public class ShippingServiceImpl implements ShippingService {
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Manual Shiprocket create / update API
-	// ──────────────────────────────────────────────────────────────────────────
+	// ────────────────────────────────────────────���─────────────────────────────
 
 	@Override
 	@Transactional
@@ -2062,15 +2793,18 @@ public class ShippingServiceImpl implements ShippingService {
 		if (request.getOrderId() != null) {
 			OrderEO order = orderRepository.findById(request.getOrderId()).orElse(null);
 			if (order != null) {
-				List<ShippingEO> list = shippingRepository.findByOrder(order);
-				if (list != null && !list.isEmpty()) {
-					// Prefer the active FORWARD shipment
-					return list.stream()
-						.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType())
-								&& !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
-						.findFirst()
-						.orElse(list.get(0));
-				}
+			List<ShippingEO> list = shippingRepository.findByOrder(order);
+			if (list != null && !list.isEmpty()) {
+				// Filter out cancelled shipments first
+				List<ShippingEO> nonCancelledList = list.stream()
+					.filter(s -> !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
+					.collect(Collectors.toList());
+				// Prefer the active FORWARD shipment
+				return nonCancelledList.stream()
+					.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType()))
+					.findFirst()
+					.orElse(nonCancelledList.isEmpty() ? null : nonCancelledList.get(0));
+			}
 			}
 			logger.warn("resolveShipment: no ShippingEO found for orderId={}", request.getOrderId());
 		}
@@ -2079,16 +2813,19 @@ public class ShippingServiceImpl implements ShippingService {
 			ShippingEO eo = shippingRepository.findByTrackingNumber(request.getOrderNumber().trim());
 			// trackingNumber is "TRK{orderNumber}_{warehouseId}", so also search order
 			if (eo == null) {
-				// Attempt to locate via order
-				List<ShippingEO> all = shippingRepository.findAllByOptionalStatusAndOrderNumber(null,
-						request.getOrderNumber().trim());
-				if (all != null && !all.isEmpty()) {
-					return all.stream()
-						.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType())
-								&& !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
-						.findFirst()
-						.orElse(all.get(0));
-				}
+			// Attempt to locate via order
+			List<ShippingEO> all = shippingRepository.findAllByOptionalStatusAndOrderNumber(null,
+					request.getOrderNumber().trim());
+			if (all != null && !all.isEmpty()) {
+				// Filter out cancelled shipments first
+				List<ShippingEO> nonCancelledAll = all.stream()
+					.filter(s -> !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
+					.collect(Collectors.toList());
+				return nonCancelledAll.stream()
+					.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType()))
+					.findFirst()
+					.orElse(nonCancelledAll.isEmpty() ? null : nonCancelledAll.get(0));
+			}
 			}
 			else {
 				return eo;
@@ -2817,6 +3554,314 @@ public class ShippingServiceImpl implements ShippingService {
 		return response;
 	}
 
+	@Override
+	@Transactional(readOnly = true)
+	public FailedShiprocketOrdersResponseDTO getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep() {
+		FailedShiprocketOrdersResponseDTO response = new FailedShiprocketOrdersResponseDTO();
+		logger.info(
+				"getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep called: fetching Confirmed/Ready to Ship orders with any failed Shiprocket step or no shipment.");
+		try {
+			// Step 1: fetch all orders with status "Confirmed"
+			List<OrderEO> orders = new ArrayList<>(
+					orderRepository.findByOrderStatus(Constants.ORDER_STATUS_CONFIRMED));
+
+			// Step 2: fetch all orders with status "Ready to Ship" and append to the same list
+			orders.addAll(orderRepository.findByOrderStatus(Constants.ORDER_STATUS_READY_TO_SHIP));
+
+			List<OrderShipmentFailureDTO> results = new ArrayList<>();
+			for (OrderEO order : orders) {
+				// Step 3: fetch the respective shipment(s) for this order, preferring an
+				// active FORWARD shipment when more than one shipment record exists.
+				List<ShippingEO> shipments = shippingRepository.findByOrder(order);
+				// Filter out cancelled shipments
+				List<ShippingEO> nonCancelledShipments = shipments.stream()
+					.filter(s -> !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
+					.collect(Collectors.toList());
+				ShippingEO shipping = nonCancelledShipments.stream()
+					.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType()))
+					.findFirst()
+					.orElse(nonCancelledShipments.isEmpty() ? null : nonCancelledShipments.get(0));
+
+				List<String> failedSteps = new ArrayList<>();
+				if (shipping == null) {
+					failedSteps.add("no_shipment");
+				}
+				else {
+					if (Constants.FAILURE_STATUS.equals(shipping.getShiprocketOrderStatus())) {
+						failedSteps.add("shiprocket_order_status");
+					}
+					if (Constants.FAILURE_STATUS.equals(shipping.getGenerateAwbStatus())) {
+						failedSteps.add("generate_awb_status");
+					}
+					if (Constants.FAILURE_STATUS.equals(shipping.getRequestPickupStatus())) {
+						failedSteps.add("request_pickup_status");
+					}
+					if (Constants.FAILURE_STATUS.equals(shipping.getGenerateLabelStatus())) {
+						failedSteps.add("generate_label_status");
+					}
+					if (Constants.FAILURE_STATUS.equals(shipping.getTrackShipmentStatus())) {
+						failedSteps.add("track_shipment_status");
+					}
+					if (Constants.FAILURE_STATUS.equals(shipping.getEstimateStatus())) {
+						failedSteps.add("estimate_status");
+					}
+				}
+
+
+				OrderShipmentFailureDTO.OrderDetails.OrderDetailsBuilder orderDetailsBuilder = OrderShipmentFailureDTO.OrderDetails
+					.builder()
+					.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
+					.orderNumber(order.getOrderNumber())
+					.orderStatus(order.getOrderStatus())
+					.paymentStatus(order.getPaymentStatus())
+					.totalAmount(order.getTotalAmount())
+					.orderCreatedAt(order.getCreatedAt());
+				if (order.getCustomer() != null) {
+					CustomerEO customer = order.getCustomer();
+					String fullName = (customer.getFirstName() != null ? customer.getFirstName() : "")
+							+ (customer.getLastName() != null ? " " + customer.getLastName() : "");
+					orderDetailsBuilder.customerName(fullName.trim())
+						.customerEmail(customer.getEmail())
+						.customerMobile(customer.getMobileNumber());
+				}
+
+			OrderShipmentFailureDTO.ShippingDetails shippingDetails = null;
+			if (shipping != null) {
+				// Fetch status history logs for each Shiprocket step
+				List<ShiprocketOrderStatusHistoryEO> shiprocketOrderStatuslog =
+					shiprocketOrderStatusHistoryRepository.findByShipmentOrderByCreatedAtAsc(shipping);
+				List<GenerateAwbStatusHistoryEO> generateAwbStatuslog =
+					generateAwbStatusHistoryRepository.findByShipmentOrderByCreatedAtAsc(shipping);
+				List<RequestPickupStatusHistoryEO> requestPickupStatuslog =
+					requestPickupStatusHistoryRepository.findByShipmentOrderByCreatedAtAsc(shipping);
+				List<GenerateLabelStatusHistoryEO> generateLabelStatuslog =
+					generateLabelStatusHistoryRepository.findByShipmentOrderByCreatedAtAsc(shipping);
+				List<TrackShipmentStatusHistoryEO> trackShipmentStatuslog =
+					trackShipmentStatusHistoryRepository.findByShipmentOrderByCreatedAtAsc(shipping);
+				List<EstimateStatusHistoryEO> estimateStatuslog =
+					estimateStatusHistoryRepository.findByShipmentOrderByCreatedAtAsc(shipping);
+
+				// Convert entities to DTOs
+				List<StatusHistoryLogDTO> shiprocketOrderStatuslogDTOs = shiprocketOrderStatuslog.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+				List<StatusHistoryLogDTO> generateAwbStatuslogDTOs = generateAwbStatuslog.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+				List<StatusHistoryLogDTO> requestPickupStatuslogDTOs = requestPickupStatuslog.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+				List<StatusHistoryLogDTO> generateLabelStatuslogDTOs = generateLabelStatuslog.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+				List<StatusHistoryLogDTO> trackShipmentStatuslogDTOs = trackShipmentStatuslog.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+				List<StatusHistoryLogDTO> estimateStatuslogDTOs = estimateStatuslog.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+
+				// Fetch shipment logs (complete audit trail from shiprocket_order_log)
+				List<ShiprocketOrderLogEO> shipmentLogEOs = shiprocketOrderLogRepository
+					.findByShipmentIdOrderByCreatedAtAsc(shipping.getShipmentId());
+				List<ShipmentLogDTO> shipmentlogDTOs = shipmentLogEOs.stream()
+					.map(this::convertToDTO)
+					.collect(Collectors.toList());
+
+				shippingDetails = OrderShipmentFailureDTO.ShippingDetails.builder()
+					.shipmentId(shipping.getShipmentId())
+					.trackingNumber(shipping.getTrackingNumber())
+					.shipmentType(shipping.getType())
+					.shipmentStatus(shipping.getShipmentStatus())
+					.awb(shipping.getAwb())
+					.courierName(shipping.getCourierName())
+					.courierCompanyId(shipping.getCourierCompanyId())
+					.shippingPrice(shipping.getShippingPrice())
+					.shippedDate(shipping.getShippedDate())
+					.deliveredDate(shipping.getDeliveredDate())
+					.shipmentCreatedAt(shipping.getCreatedAt())
+					.shipmentUpdatedAt(shipping.getUpdatedAt())
+					.cartonId(shipping.getCarton() != null ? shipping.getCarton().getId() : null)
+					.length(shipping.getLength())
+					.breadth(shipping.getBreadth())
+					.height(shipping.getHeight())
+					.weight(shipping.getWeight())
+					.labelUrl(shipping.getLabelUrl())
+					.shipOrderId(shipping.getShipOrderId())
+					.shipShipmentId(shipping.getShipShipmentId())
+					.pickupId(shipping.getPickupId())
+					.pickupToken(shipping.getPickupToken())
+					.estimatedDeliveryDate(shipping.getEstimatedDeliveryDate())
+					.expectedDeliveryDate(shipping.getExpectedDeliveryDate())
+					.trackUrl(shipping.getTrackUrl())
+					.shiprocketOrderStatus(shipping.getShiprocketOrderStatus())
+					.generateAwbStatus(shipping.getGenerateAwbStatus())
+					.requestPickupStatus(shipping.getRequestPickupStatus())
+					.generateLabelStatus(shipping.getGenerateLabelStatus())
+					.trackShipmentStatus(shipping.getTrackShipmentStatus())
+					.estimateStatus(shipping.getEstimateStatus())
+					.shiprocketOrderStatuslog(shiprocketOrderStatuslogDTOs)
+					.generateAwbStatuslog(generateAwbStatuslogDTOs)
+					.requestPickupStatuslog(requestPickupStatuslogDTOs)
+					.generateLabelStatuslog(generateLabelStatuslogDTOs)
+					.trackShipmentStatuslog(trackShipmentStatuslogDTOs)
+					.estimateStatuslog(estimateStatuslogDTOs)
+					.shipmentlogs(shipmentlogDTOs)
+					.build();
+			}
+
+				results.add(OrderShipmentFailureDTO.builder()
+					.orderDetails(orderDetailsBuilder.build())
+					.shippingDetails(shippingDetails)
+					.failedSteps(failedSteps)
+					.build());
+			}
+
+			response.setOrders(results);
+			response.setTotalCount(results.size());
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage("Fetched " + results.size()
+					+ " Confirmed/Ready to Ship order(s) with at least one failed Shiprocket step or no shipment.");
+			logger.info("getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep fetched {} record(s)",
+					results.size());
+		}
+		catch (Exception e) {
+			logger.error("Error in getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep: {}", e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage(
+					"An error occurred while fetching failed Shiprocket orders: " + e.getMessage());
+			response.setOrders(new ArrayList<>());
+			response.setTotalCount(0);
+		}
+		return response;
+	}
+
+	/**
+	 * GET — Fetch the list of available courier services (excluding blocklisted
+	 * couriers) for the given order id. Pickup postcode is resolved from the
+	 * order's existing shipment's warehouse (falling back to the default
+	 * warehouse), delivery postcode is resolved from the order's shipping
+	 * address, and weight/dimensions are taken from the existing shipment record
+	 * if one exists — the same inputs used internally by
+	 * {@link #executeFindBestCourierStep(ShiprocketOrderEvent, ShiprocketEventContext)}
+	 * during automated Shiprocket processing.
+	 */
+	@Override
+	@Transactional(readOnly = true)
+	public AvailableCourierServicesResponseDTO getAvailableCourierServicesByOrderId(Long orderId) {
+		logger.info("getAvailableCourierServicesByOrderId called for orderId={}", orderId);
+		if (orderId == null) {
+			return AvailableCourierServicesResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("orderId must not be null")
+				.totalCount(0)
+				.build();
+		}
+		try {
+			OrderEO order = orderRepository.findById(orderId).orElse(null);
+			if (order == null) {
+				return AvailableCourierServicesResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("Order not found for orderId=" + orderId)
+					.totalCount(0)
+					.build();
+			}
+
+			OrderAddressEO orderAddress = orderAddressRepository.findByOrder(order).orElse(null);
+			String deliveryPostcode = orderAddress != null ? orderAddress.getPostalCode() : null;
+			if (deliveryPostcode == null || deliveryPostcode.trim().isEmpty()) {
+				return AvailableCourierServicesResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("No shipping address / delivery postcode found for orderId=" + orderId)
+					.totalCount(0)
+					.build();
+			}
+
+		// Prefer an active, non-cancelled FORWARD shipment (same preference used by
+		// getConfirmedOrReadyToShipOrdersWithFailedShiprocketStep) so weight/dimensions
+		// and pickup warehouse reflect the shipment actually being processed.
+		List<ShippingEO> shipments = shippingRepository.findByOrder(order);
+		// Filter out cancelled shipments first
+		List<ShippingEO> nonCancelledShipments = shipments.stream()
+			.filter(s -> !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
+			.collect(Collectors.toList());
+		ShippingEO shipping = nonCancelledShipments.stream()
+			.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType()))
+			.findFirst()
+			.orElse(nonCancelledShipments.isEmpty() ? null : nonCancelledShipments.get(0));
+
+			String warehouseName = (shipping != null && shipping.getWarehouse() != null)
+					? shipping.getWarehouse().getWarehouseName() : null;
+			String pickupPostcode = getWarehousePostalCode(warehouseName);
+			if (pickupPostcode == null || pickupPostcode.trim().isEmpty()) {
+				pickupPostcode = getWarehousePostalCode(Constants.DEFAULT_WAREHOUSE_NAME);
+			}
+			if (pickupPostcode == null || pickupPostcode.trim().isEmpty()) {
+				return AvailableCourierServicesResponseDTO.builder()
+					.responseStatus(Constants.FAILURE_STATUS)
+					.responseMessage("Unable to resolve a pickup postcode for orderId=" + orderId)
+					.totalCount(0)
+					.build();
+			}
+
+			// Weight: use the shipment's recorded weight (already stored in kg — see
+			// finalizeShiprocketOrderRequest) if present, otherwise fall back to the
+			// same 1.1 kg minimum used by executeFindBestCourierStep.
+			Double weight = (shipping != null && shipping.getWeight() != null) ? shipping.getWeight() : 1.1;
+			if (weight <= 1.1) {
+				weight = 1.1;
+			}
+
+			ServiceabilityRequestDTO serviceabilityReq = ServiceabilityRequestDTO.builder()
+				.orderId(shipping != null ? shipping.getShipOrderId() : null)
+				.pickupPostcode(Integer.parseInt(pickupPostcode.trim()))
+				.deliveryPostcode(Integer.parseInt(deliveryPostcode.trim()))
+				.cod(order.getPaymentStatus() != null && order.getPaymentStatus().equalsIgnoreCase("PAID") ? 0 : 1)
+				.weight(String.valueOf(weight))
+				.length(shipping != null && shipping.getLength() != null && shipping.getLength() > 0
+						? shipping.getLength().intValue() : null)
+				.breadth(shipping != null && shipping.getBreadth() != null && shipping.getBreadth() > 0
+						? shipping.getBreadth().intValue() : null)
+				.height(shipping != null && shipping.getHeight() != null && shipping.getHeight() > 0
+						? shipping.getHeight().intValue() : null)
+				.build();
+
+			List<CourierServiceDTO> couriers = shiprocketService
+				.getAvailableCourierServicesExcludingBlocklisted(serviceabilityReq);
+
+			logger.info("getAvailableCourierServicesByOrderId: found {} available courier(s) for orderId={}",
+					couriers.size(), orderId);
+
+			Integer currentlyUsedCourierId = shipping != null ? shipping.getCourierCompanyId() : null;
+
+			return AvailableCourierServicesResponseDTO.builder()
+				.responseStatus(Constants.SUCCESS_STATUS)
+				.responseMessage("Fetched " + couriers.size() + " available courier service(s).")
+				.totalCount(couriers.size())
+				.currentlyUsedCourierId(currentlyUsedCourierId)
+				.courierServices(couriers)
+				.build();
+		}
+		catch (NumberFormatException nfe) {
+			logger.warn("getAvailableCourierServicesByOrderId: invalid postcode for orderId={}: {}", orderId,
+					nfe.getMessage());
+			return AvailableCourierServicesResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("Invalid pickup/delivery postcode: " + nfe.getMessage())
+				.totalCount(0)
+				.build();
+		}
+		catch (Exception e) {
+			logger.error("Error in getAvailableCourierServicesByOrderId for orderId={}: {}", orderId, e.getMessage(),
+					e);
+			return AvailableCourierServicesResponseDTO.builder()
+				.responseStatus(Constants.FAILURE_STATUS)
+				.responseMessage("An error occurred while fetching available courier services: " + e.getMessage())
+				.totalCount(0)
+				.build();
+		}
+	}
+
 	/**
 	 * A shipment is considered fully/successfully processed by Shiprocket once it has
 	 * an AWB assigned, a pickup scheduled, a shipping label generated and a tracking
@@ -3226,6 +4271,106 @@ public class ShippingServiceImpl implements ShippingService {
 	// ─── Helper: build courier candidate DTO list from courier_selection_log ─────
 
 	/**
+	 * Convert a ShiprocketOrderStatusHistoryEO entity to a StatusHistoryLogDTO.
+	 */
+	private StatusHistoryLogDTO convertToDTO(ShiprocketOrderStatusHistoryEO entity) {
+		if (entity == null) return null;
+		return StatusHistoryLogDTO.builder()
+			.id(entity.getId())
+			.status(entity.getStatus())
+			.remarks(entity.getRemarks())
+			.createdAt(entity.getCreatedAt())
+			.build();
+	}
+
+	/**
+	 * Convert a GenerateAwbStatusHistoryEO entity to a StatusHistoryLogDTO.
+	 */
+	private StatusHistoryLogDTO convertToDTO(GenerateAwbStatusHistoryEO entity) {
+		if (entity == null) return null;
+		return StatusHistoryLogDTO.builder()
+			.id(entity.getId())
+			.status(entity.getStatus())
+			.remarks(entity.getRemarks())
+			.createdAt(entity.getCreatedAt())
+			.build();
+	}
+
+	/**
+	 * Convert a RequestPickupStatusHistoryEO entity to a StatusHistoryLogDTO.
+	 */
+	private StatusHistoryLogDTO convertToDTO(RequestPickupStatusHistoryEO entity) {
+		if (entity == null) return null;
+		return StatusHistoryLogDTO.builder()
+			.id(entity.getId())
+			.status(entity.getStatus())
+			.remarks(entity.getRemarks())
+			.createdAt(entity.getCreatedAt())
+			.build();
+	}
+
+	/**
+	 * Convert a GenerateLabelStatusHistoryEO entity to a StatusHistoryLogDTO.
+	 */
+	private StatusHistoryLogDTO convertToDTO(GenerateLabelStatusHistoryEO entity) {
+		if (entity == null) return null;
+		return StatusHistoryLogDTO.builder()
+			.id(entity.getId())
+			.status(entity.getStatus())
+			.remarks(entity.getRemarks())
+			.createdAt(entity.getCreatedAt())
+			.build();
+	}
+
+	/**
+	 * Convert a TrackShipmentStatusHistoryEO entity to a StatusHistoryLogDTO.
+	 */
+	private StatusHistoryLogDTO convertToDTO(TrackShipmentStatusHistoryEO entity) {
+		if (entity == null) return null;
+		return StatusHistoryLogDTO.builder()
+			.id(entity.getId())
+			.status(entity.getStatus())
+			.remarks(entity.getRemarks())
+			.createdAt(entity.getCreatedAt())
+			.build();
+	}
+
+	/**
+	 * Convert an EstimateStatusHistoryEO entity to a StatusHistoryLogDTO.
+	 */
+	private StatusHistoryLogDTO convertToDTO(EstimateStatusHistoryEO entity) {
+		if (entity == null) return null;
+		return StatusHistoryLogDTO.builder()
+			.id(entity.getId())
+			.status(entity.getStatus())
+			.remarks(entity.getRemarks())
+			.createdAt(entity.getCreatedAt())
+			.build();
+	}
+
+	/**
+	 * Convert a ShiprocketOrderLogEO entity to a ShipmentLogDTO.
+	 */
+	private ShipmentLogDTO convertToDTO(ShiprocketOrderLogEO entity) {
+		if (entity == null) return null;
+		return ShipmentLogDTO.builder()
+			.id(entity.getId())
+			.shipmentId(entity.getShipmentId())
+			.orderId(entity.getOrderId())
+			.warehouseId(entity.getWarehouseId())
+			.step(entity.getStep())
+			.status(entity.getStatus())
+			.shiprocketOrderId(entity.getShiprocketOrderId())
+			.shiprocketShipmentId(entity.getShiprocketShipmentId())
+			.awbCode(entity.getAwbCode())
+			.labelUrl(entity.getLabelUrl())
+			.errorMessage(entity.getErrorMessage())
+			.createdAt(entity.getCreatedAt())
+			.updatedAt(entity.getUpdatedAt())
+			.build();
+	}
+
+	/**
 	 * Loads all {@code CourierSelectionLogEO} rows for the given internal shipment ID and
 	 * maps them to {@link CourierSelectionLogDTO} objects sorted by rank.
 	 */
@@ -3242,7 +4387,7 @@ public class ShippingServiceImpl implements ShippingService {
 				.rate(row.getRate())
 				.estimatedDeliveryDays(row.getEstimatedDeliveryDays())
 				.rank(row.getRank())
-				.isSelected(row.getIsSelected())
+				.isSelected(false)
 				.awbCode(row.getAwbCode())
 				.shippingPrice(row.getShippingPrice())
 				.createdAt(row.getCreatedAt())
@@ -3250,6 +4395,551 @@ public class ShippingServiceImpl implements ShippingService {
 			dtos.add(dto);
 		}
 		return dtos;
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Order ID-based Shipping CRUD APIs
+	// ──────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * GET: Fetch all shipping records for a given orderId.
+	 * Called by: GET /api/order/{orderId}/shipping
+	 */
+	public ShippingEntityResponseDTO getShippingsByOrderId(Long orderId) {
+		ShippingEntityResponseDTO response = new ShippingEntityResponseDTO();
+		logger.info("getShippingsByOrderId called for orderId={}", orderId);
+		try {
+			if (orderId == null || orderId <= 0) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Order ID must be a valid positive number");
+				return response;
+			}
+
+			// Verify order exists
+			OrderEO order = orderRepository.findById(orderId).orElse(null);
+			if (order == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Order not found with orderId=" + orderId);
+				return response;
+			}
+
+			// Fetch all shipping records for this order
+			List<ShippingEO> shippingList = shippingRepository.findByOrderId(orderId);
+			
+			List<ShippingDetailDTO> shippingDTOs = new ArrayList<>();
+			for (ShippingEO shipping : shippingList) {
+				ShippingDetailDTO dto = convertShippingToDTO(shipping);
+				shippingDTOs.add(dto);
+			}
+
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage("Shipping records fetched successfully. Total: " + shippingDTOs.size());
+			response.setData(shippingDTOs);
+			response.setCount(shippingDTOs.size());
+			logger.info("getShippingsByOrderId: fetched {} shipping records for orderId={}", shippingDTOs.size(), orderId);
+		}
+		catch (Exception e) {
+			logger.error("Error in getShippingsByOrderId for orderId={}: {}", orderId, e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while fetching shipping records: " + e.getMessage());
+		}
+		return response;
+	}
+
+	/**
+	 * POST: Create or update a shipping record for a given orderId.
+	 * If a shipping record already exists for the order, it will be updated.
+	 * Otherwise, a new record will be created.
+	 * Called by: POST /api/order/{orderId}/shipping
+	 */
+	public ShippingEntityResponseDTO createShippingForOrder(Long orderId, CreateShippingRequestDTO request) {
+		ShippingEntityResponseDTO response = new ShippingEntityResponseDTO();
+		logger.info("createShippingForOrder called for orderId={}", orderId);
+		try {
+			// Validate orderId
+			if (orderId == null || orderId <= 0) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Order ID must be a valid positive number");
+				return response;
+			}
+
+			// Validate request
+			if (request == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Request body must not be null");
+				return response;
+			}
+
+			// Verify order exists
+			OrderEO order = orderRepository.findById(orderId).orElse(null);
+			if (order == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Order not found with orderId=" + orderId);
+				return response;
+			}
+
+			// Validate carton ID
+			if (request.getCartonId() == null || request.getCartonId() <= 0) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Carton ID is required and must be a valid positive number");
+				return response;
+			}
+
+			// Verify carton exists
+			CartonEO carton = cartonRepository.findById(request.getCartonId()).orElse(null);
+			if (carton == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Carton not found with cartonId=" + request.getCartonId());
+				return response;
+			}
+
+			// Check and update order status if provided and different
+			String currentOrderStatus = order.getOrderStatus();
+			String inputOrderStatus = request.getOrderStatus();
+			boolean orderStatusChanged = false;
+
+			if (inputOrderStatus != null && !inputOrderStatus.trim().isEmpty()
+					&& !inputOrderStatus.equals(currentOrderStatus)) {
+				// Order status has changed
+				logger.info("Order status changed for orderId={} from '{}' to '{}'", orderId, currentOrderStatus, inputOrderStatus);
+				order.setOrderStatus(inputOrderStatus);
+				orderRepository.save(order);
+				orderStatusChanged = true;
+				logger.info("Order status updated successfully for orderId={}", orderId);
+			}
+
+			// Check if a shipping record already exists for this order
+			java.util.Optional<ShippingEO> existingShipping = shippingRepository.findFirstByOrderId(orderId);
+			ShippingEO shipping;
+			boolean isUpdate = false;
+
+			if (existingShipping.isPresent()) {
+				// Update existing record
+				shipping = existingShipping.get();
+				isUpdate = true;
+				logger.info("Found existing shipping record for orderId={}, shipmentId={}, updating...", orderId, shipping.getShipmentId());
+			} else {
+				// Create new record
+				shipping = new ShippingEO();
+				shipping.setOrder(order);
+				logger.info("Creating new shipping record for orderId={}", orderId);
+			}
+
+			// Generate tracking number if not provided
+			// Format: TRK_{orderNumber}_{sequenceNumber}
+			// Sequence number is based on count of all shipments (including cancelled)
+			if (request.getTrackingNumber() == null || request.getTrackingNumber().trim().isEmpty()) {
+				long shipmentCount = shippingRepository.countByOrderId(orderId);
+				long sequenceNumber = shipmentCount + 1;
+				String orderNumber = order.getOrderNumber();
+				String generatedTrackingNumber = "TRK_" + orderNumber + "_" + sequenceNumber;
+
+				// Verify tracking number is unique (check across all shipments including cancelled)
+				ShippingEO existingWithTrackingNumber = shippingRepository.findByTrackingNumber(generatedTrackingNumber);
+				if (existingWithTrackingNumber != null) {
+					// Tracking number already exists, find the next available one
+					long attemptNumber = sequenceNumber;
+					while (existingWithTrackingNumber != null && attemptNumber < sequenceNumber + 1000) {
+						attemptNumber++;
+						generatedTrackingNumber = "TRK_" + orderNumber + "_" + attemptNumber;
+						existingWithTrackingNumber = shippingRepository.findByTrackingNumber(generatedTrackingNumber);
+					}
+					if (attemptNumber >= sequenceNumber + 1000) {
+						response.setResponseStatus(Constants.FAILURE_STATUS);
+						response.setResponseMessage("Unable to generate unique tracking number for orderId=" + orderId);
+						return response;
+					}
+					logger.warn("Generated tracking number already existed. Using alternative: {}", generatedTrackingNumber);
+				}
+				logger.info("Generated tracking number for orderId={}: {}", orderId, generatedTrackingNumber);
+				shipping.setTrackingNumber(generatedTrackingNumber);
+			} else {
+				// Use provided tracking number - validate it's unique
+				String providedTrackingNumber = request.getTrackingNumber().trim();
+				ShippingEO existingWithTrackingNumber = shippingRepository.findByTrackingNumber(providedTrackingNumber);
+
+				// If updating existing shipment, allow using the same tracking number
+				if (existingWithTrackingNumber != null && !isUpdate) {
+					response.setResponseStatus(Constants.FAILURE_STATUS);
+					response.setResponseMessage("Tracking number already exists: " + providedTrackingNumber);
+					return response;
+				}
+				// Allow update if it's the same shipment
+				if (existingWithTrackingNumber != null && isUpdate && !existingWithTrackingNumber.getShipmentId().equals(shipping.getShipmentId())) {
+					response.setResponseStatus(Constants.FAILURE_STATUS);
+					response.setResponseMessage("Tracking number already exists: " + providedTrackingNumber);
+					return response;
+				}
+				shipping.setTrackingNumber(providedTrackingNumber);
+			}
+
+			// ...existing code...
+			shipping.setCarton(carton);
+			shipping.setCourierName(request.getCourierName());
+			shipping.setType(request.getType());
+			shipping.setShipmentStatus(request.getShipmentStatus());
+			shipping.setShippedDate(request.getShippedDate());
+			shipping.setDeliveredDate(request.getDeliveredDate());
+			shipping.setLength(request.getLength());
+			shipping.setBreadth(request.getBreadth());
+			shipping.setHeight(request.getHeight());
+			shipping.setWeight(request.getWeight());
+			shipping.setAwb(request.getAwb());
+			shipping.setLabelUrl(request.getLabelUrl());
+			shipping.setShipOrderId(request.getShipOrderId());
+			shipping.setShipShipmentId(request.getShipShipmentId());
+			shipping.setPickupId(request.getPickupId());
+			shipping.setPickupScheduledDate(request.getPickupScheduledDate());
+			shipping.setPickupToken(request.getPickupToken());
+			shipping.setCourierCompanyId(request.getCourierCompanyId());
+			shipping.setEstimatedDeliveryDate(request.getEstimatedDeliveryDate());
+			shipping.setExpectedDeliveryDate(request.getExpectedDeliveryDate());
+			shipping.setTrackUrl(request.getTrackUrl());
+			shipping.setShippingPrice(request.getShippingPrice());
+			shipping.setShiprocketOrderStatus(request.getShiprocketOrderStatus());
+			shipping.setGenerateAwbStatus(request.getGenerateAwbStatus());
+			shipping.setRequestPickupStatus(request.getRequestPickupStatus());
+			shipping.setGenerateLabelStatus(request.getGenerateLabelStatus());
+			shipping.setTrackShipmentStatus(request.getTrackShipmentStatus());
+			shipping.setEstimateStatus(request.getEstimateStatus());
+			
+			if (request.getWarehouseId() != null) {
+				WarehouseEO warehouse = warehouseRepository.findById(request.getWarehouseId()).orElse(null);
+				if (warehouse != null) {
+					shipping.setWarehouse(warehouse);
+				}
+			}
+
+			// Save shipping record
+			ShippingEO savedShipping = shippingRepository.save(shipping);
+			String message = isUpdate ? "Shipping record updated successfully" : "Shipping record created successfully";
+			logger.info("Shipping record {} for orderId={}, shipmentId={}", isUpdate ? "updated" : "created", orderId, savedShipping.getShipmentId());
+
+			// Create shipment tracking history record if order status changed
+			if (orderStatusChanged && inputOrderStatus != null) {
+				try {
+					ShipmentTrackingHistoryEO trackingHistory = ShipmentTrackingHistoryEO.builder()
+						.shipment(savedShipping)
+						.status(inputOrderStatus)
+						.location(request.getType()) // Using type as location (FORWARD/RETURN_PICKUP)
+						.remarks("Order status updated: " + currentOrderStatus + " → " + inputOrderStatus)
+						.build();
+					shipmentTrackingHistoryRepository.save(trackingHistory);
+					logger.info("Tracking history record created for shipmentId={} with status='{}'",
+						savedShipping.getShipmentId(), inputOrderStatus);
+				} catch (Exception e) {
+					logger.warn("Failed to create tracking history record for shipmentId={}: {}",
+						savedShipping.getShipmentId(), e.getMessage());
+					// Log warning but continue - don't fail the entire operation
+				}
+			}
+
+			// Convert to DTO and set in response
+			ShippingDetailDTO shippingDTO = convertShippingToDTO(savedShipping);
+			response.setShipping(shippingDTO);
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage(message);
+		}
+		catch (Exception e) {
+			logger.error("Error in createShippingForOrder for orderId={}: {}", orderId, e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while creating/updating shipping record: " + e.getMessage());
+		}
+		return response;
+	}
+
+	/**
+	 * Convert a ShippingEO entity to a ShippingDetailDTO.
+	 */
+	private ShippingDetailDTO convertShippingToDTO(ShippingEO shipping) {
+		if (shipping == null) return null;
+
+		ShippingDetailDTO dto = ShippingDetailDTO.builder()
+			.shipmentId(shipping.getShipmentId())
+			.trackingNumber(shipping.getTrackingNumber())
+			.courierName(shipping.getCourierName())
+			.type(shipping.getType())
+			.shipmentStatus(shipping.getShipmentStatus())
+			.shippedDate(shipping.getShippedDate())
+			.deliveredDate(shipping.getDeliveredDate())
+			.length(shipping.getLength())
+			.breadth(shipping.getBreadth())
+			.height(shipping.getHeight())
+			.weight(shipping.getWeight())
+			.awb(shipping.getAwb())
+			.labelUrl(shipping.getLabelUrl())
+			.shipOrderId(shipping.getShipOrderId())
+			.shipShipmentId(shipping.getShipShipmentId())
+			.pickupId(shipping.getPickupId())
+			.pickupScheduledDate(shipping.getPickupScheduledDate())
+			.pickupToken(shipping.getPickupToken())
+			.courierCompanyId(shipping.getCourierCompanyId())
+			.estimatedDeliveryDate(shipping.getEstimatedDeliveryDate())
+			.expectedDeliveryDate(shipping.getExpectedDeliveryDate())
+			.trackUrl(shipping.getTrackUrl())
+			.shippingPrice(shipping.getShippingPrice())
+			.shiprocketOrderStatus(shipping.getShiprocketOrderStatus())
+			.generateAwbStatus(shipping.getGenerateAwbStatus())
+			.requestPickupStatus(shipping.getRequestPickupStatus())
+			.generateLabelStatus(shipping.getGenerateLabelStatus())
+			.trackShipmentStatus(shipping.getTrackShipmentStatus())
+			.estimateStatus(shipping.getEstimateStatus())
+			.createdAt(shipping.getCreatedAt())
+			.updatedAt(shipping.getUpdatedAt())
+			.build();
+
+		if (shipping.getOrder() != null) {
+			Integer orderId = shipping.getOrder().getOrderId();
+			dto.setOrderId(orderId != null ? orderId.longValue() : null);
+			dto.setOrderNumber(shipping.getOrder().getOrderNumber());
+		}
+
+		if (shipping.getCarton() != null) {
+			dto.setCartonId(shipping.getCarton().getId());
+			dto.setCartonNo(shipping.getCarton().getName());
+		}
+
+		if (shipping.getWarehouse() != null) {
+			dto.setWarehouseId(shipping.getWarehouse().getWarehouseId());
+		}
+
+		return dto;
+	}
+
+	/** 
+	 * POST — Save a shipping record with minimal information.
+	 * Used by POST /api/shipping endpoint when no order number/ID is provided in path.
+	 */
+	@Override
+	@Transactional
+	public ManualShiprocketUpdateResponseDTO saveShipping(ShippingOrderRequestDTO request) {
+		ManualShiprocketUpdateResponseDTO response = new ManualShiprocketUpdateResponseDTO();
+		try {
+			if (request == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Request body must not be null");
+				return response;
+			}
+
+			// Resolve warehouse if warehouseId supplied
+			WarehouseEO warehouse = null;
+			if (request.getWarehouseId() != null) {
+				warehouse = warehouseRepository.findById(request.getWarehouseId()).orElse(null);
+				if (warehouse == null) {
+					logger.warn("saveShipping: warehouseId={} not found, creating record without warehouse.",
+							request.getWarehouseId());
+				}
+			}
+
+			// Create ShippingEO without an order (order can be null for generic shipment records)
+			ShippingEO eo = ShippingEO.builder()
+				.warehouse(warehouse)
+				.type(request.getShipmentType() != null ? request.getShipmentType().trim()
+						: Constants.SHIPMENT_TYPE_FORWARD)
+				.shipmentStatus(request.getShipmentStatus() != null ? request.getShipmentStatus().trim()
+						: Constants.SHIPMENT_STATUS_CREATED)
+				.build();
+
+			applyShippingOrderRequest(eo, request);
+			ShippingEO saved = shippingRepository.save(eo);
+
+			boolean historyCreated = saveTrackingHistoryIfRequested(saved, request);
+			syncCourierSelectionLogSelection(saved);
+			logShiprocketOrderLog(saved, "MANUAL_SAVE", request.getNotes());
+
+			buildManualUpdateResponse(response, saved, historyCreated, "MANUAL_SAVE");
+			response.setResponseMessage("Shipping record saved successfully.");
+		}
+		catch (Exception e) {
+			logger.error("saveShipping: error — {}", e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while saving shipping record: " + e.getMessage());
+		}
+		return response;
+	}
+
+	/**
+	 * GET — Fetch shipping details by shipment ID, including tracking history.
+	 */
+	@Override
+	@Transactional(readOnly = true)
+	public ShippingDetailResponseDTO getShippingByShipmentId(Long shipmentId) {
+		ShippingDetailResponseDTO response = new ShippingDetailResponseDTO();
+		try {
+			if (shipmentId == null || shipmentId <= 0) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("Shipment ID must be a valid positive number.");
+				return response;
+			}
+
+			ShippingEO eo = shippingRepository.findById(shipmentId).orElse(null);
+			if (eo == null) {
+				response.setResponseStatus(Constants.FAILURE_STATUS);
+				response.setResponseMessage("No shipping record found for shipment ID: " + shipmentId);
+				return response;
+			}
+
+			// Tracking history (chronological)
+			List<ShipmentTrackingHistoryEO> historyEOs = shipmentTrackingHistoryRepository
+				.findByShipmentOrderByUpdatedAtAsc(eo);
+			List<ShipTrackHistoryDTO> history = historyEOs.stream()
+				.map(h -> ShipTrackHistoryDTO.builder()
+					.status(h.getStatus())
+					.location(h.getLocation())
+					.remarks(h.getRemarks())
+					.date(h.getUpdatedAt())
+					.build())
+				.collect(Collectors.toList());
+
+			response.setResponseStatus(Constants.SUCCESS_STATUS);
+			response.setResponseMessage("Shipping details fetched successfully.");
+			response.setShipmentId(eo.getShipmentId());
+			response.setOrderNumber(eo.getOrder() != null ? eo.getOrder().getOrderNumber() : null);
+			response.setOrderId(eo.getOrder() != null && eo.getOrder().getOrderId() != null
+					? eo.getOrder().getOrderId().longValue() : null);
+			response.setShiprocketOrderId(eo.getShipOrderId());
+			response.setShiprocketShipmentId(eo.getShipShipmentId());
+			response.setAwbCode(eo.getAwb());
+			response.setCourierName(eo.getCourierName());
+			response.setCourierCompanyId(eo.getCourierCompanyId());
+			response.setShipmentStatus(eo.getShipmentStatus());
+			response.setShipmentType(eo.getType());
+			response.setTrackingNumber(eo.getTrackingNumber());
+			response.setLength(eo.getLength());
+			response.setBreadth(eo.getBreadth());
+			response.setHeight(eo.getHeight());
+			response.setWeight(eo.getWeight());
+			response.setShippingPrice(eo.getShippingPrice());
+			response.setLabelUrl(eo.getLabelUrl());
+			response.setTrackUrl(eo.getTrackUrl());
+			response.setPickupId(eo.getPickupId());
+			response.setPickupToken(eo.getPickupToken());
+			response.setPickupScheduledDate(eo.getPickupScheduledDate());
+			response.setEstimatedDeliveryDate(eo.getEstimatedDeliveryDate());
+			response.setExpectedDeliveryDate(eo.getExpectedDeliveryDate());
+			response.setShippedDate(eo.getShippedDate());
+			response.setDeliveredDate(eo.getDeliveredDate());
+			response.setCreatedAt(eo.getCreatedAt());
+			response.setUpdatedAt(eo.getUpdatedAt());
+			if (eo.getWarehouse() != null) {
+				response.setWarehouseId(eo.getWarehouse().getWarehouseId());
+				response.setWarehouseName(eo.getWarehouse().getWarehouseName());
+			}
+			if (eo.getCarton() != null) {
+				response.setCartonId(eo.getCarton().getId());
+				response.setCartonNo(eo.getCarton().getName());
+			}
+			response.setTrackingHistory(history);
+		}
+		catch (Exception e) {
+			logger.error("getShippingByShipmentId: error for shipmentId={} — {}", shipmentId, e.getMessage(), e);
+			response.setResponseStatus(Constants.FAILURE_STATUS);
+			response.setResponseMessage("An error occurred while fetching shipping details: " + e.getMessage());
+		}
+		return response;
+	}
+
+	/**
+	 * Creates an initial shipment record after successful payment.
+	 * This method:
+	 * 1. Creates a ShippingEO record with status "Pending"
+	 * 2. Creates a ShipmentTrackingHistoryEO record with status "Order Confirmed"
+	 * 
+	 * Used by OrderServiceImpl.updateOrderPaymentStatus after payment is marked as PAID.
+	 */
+	public void createInitialShipmentAfterPayment(OrderEO order) {
+		try {
+			if (order == null || order.getOrderId() == null) {
+				logger.warn("createInitialShipmentAfterPayment: order is null or missing orderId");
+				return;
+			}
+
+			logger.info("createInitialShipmentAfterPayment: creating initial shipment for orderId={}, orderNumber={}",
+					order.getOrderId(), order.getOrderNumber());
+
+			// Check if shipment already exists for this order
+			ShippingEO existingShipment = shippingRepository.findFirstByOrderId(order.getOrderId().longValue()).orElse(null);
+			if (existingShipment != null) {
+				logger.info("createInitialShipmentAfterPayment: shipment already exists for orderId={}",
+						order.getOrderId());
+				return;
+			}
+
+			// Generate unique tracking number
+			// Format: TRK_{orderNumber}_{sequenceNumber}
+			// Sequence number is based on count of all shipments (including cancelled)
+			long shipmentCount = shippingRepository.countByOrderId(order.getOrderId().longValue());
+			long sequenceNumber = shipmentCount + 1;
+			String orderNumber = order.getOrderNumber();
+			String generatedTrackingNumber = "TRK_" + orderNumber + "_" + sequenceNumber;
+
+			// Verify tracking number is unique (check across all shipments including cancelled)
+			ShippingEO existingWithTrackingNumber = shippingRepository.findByTrackingNumber(generatedTrackingNumber);
+			if (existingWithTrackingNumber != null) {
+				// Tracking number already exists, find the next available one
+				long attemptNumber = sequenceNumber;
+				while (existingWithTrackingNumber != null && attemptNumber < sequenceNumber + 1000) {
+					attemptNumber++;
+					generatedTrackingNumber = "TRK_" + orderNumber + "_" + attemptNumber;
+					existingWithTrackingNumber = shippingRepository.findByTrackingNumber(generatedTrackingNumber);
+				}
+				if (attemptNumber >= sequenceNumber + 1000) {
+					logger.error("createInitialShipmentAfterPayment: Unable to generate unique tracking number for orderId={}",
+							order.getOrderId());
+					return;
+				}
+				logger.warn("createInitialShipmentAfterPayment: Generated tracking number already existed. Using alternative: {}",
+						generatedTrackingNumber);
+			}
+		logger.info("createInitialShipmentAfterPayment: Generated tracking number for orderId={}: {}",
+				order.getOrderId(), generatedTrackingNumber);
+
+		// Get default warehouse for address
+		WarehouseEO warehouse = warehouseRepository
+				.findByWarehouseNameIgnoreCaseAndStatus(Constants.DEFAULT_WAREHOUSE_NAME, Constants.STATUS_ACTIVE)
+				.orElse(null);
+		String warehouseLocation = "";
+		if (warehouse != null) {
+			warehouseLocation = (warehouse.getAddressLine1() != null ? warehouse.getAddressLine1() : "")
+					+ " " + (warehouse.getCity() != null ? warehouse.getCity() : "")
+					+ " " + (warehouse.getState() != null ? warehouse.getState() : "")
+					+ " " + (warehouse.getPostalCode() != null ? warehouse.getPostalCode() : "");
+			warehouseLocation = warehouseLocation.trim();
+		}
+		if (warehouseLocation.isEmpty()) {
+			warehouseLocation = Constants.DEFAULT_WAREHOUSE_NAME;
+		}
+
+		// Create initial ShippingEO record
+		ShippingEO shipment = new ShippingEO();
+		shipment.setOrder(order);
+		shipment.setTrackingNumber(generatedTrackingNumber); // Set the generated tracking number
+		shipment.setShipmentStatus(Constants.SHIPMENT_STATUS_INITIALIZED); // Pending status
+		shipment.setType(Constants.SHIPMENT_TYPE_FORWARD);
+		shipment.setCreatedAt(LocalDateTime.now());
+		shipment.setUpdatedAt(LocalDateTime.now());
+
+		ShippingEO savedShipment = shippingRepository.save(shipment);
+		logger.info("createInitialShipmentAfterPayment: shipment created with shipmentId={} for orderId={}",
+				savedShipment.getShipmentId(), order.getOrderId());
+
+		// Create ShipmentTrackingHistoryEO record
+		ShipmentTrackingHistoryEO trackingHistory = new ShipmentTrackingHistoryEO();
+		trackingHistory.setShipment(savedShipment);
+		trackingHistory.setStatus(Constants.SHIPMENT_ORDER_STATUS_CREATED); // "Order Confirmed"
+		trackingHistory.setLocation(warehouseLocation);
+		trackingHistory.setRemarks(Constants.SHIPMENT_ORDER_STATUS_CREATED_REMARK); // "Order Submitted shipment will be created."
+		trackingHistory.setUpdatedAt(LocalDateTime.now());
+
+		shipmentTrackingHistoryRepository.save(trackingHistory);
+		logger.info("createInitialShipmentAfterPayment: tracking history created for shipmentId={}",
+				savedShipment.getShipmentId());
+
+		} catch (Exception e) {
+			logger.error("createInitialShipmentAfterPayment: error creating shipment for orderId={} — {}",
+					order != null ? order.getOrderId() : "null", e.getMessage(), e);
+			// Don't throw exception - this is a best-effort operation and shouldn't fail payment confirmation
+		}
 	}
 
 }

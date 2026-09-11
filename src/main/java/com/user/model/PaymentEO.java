@@ -55,4 +55,15 @@ public class PaymentEO {
 	@Column(name = "payment_time")
 	private LocalDateTime paymentTime;
 
+	/**
+	 * Audit trail for the async Razorpay capture call (e.g. CAPTURED /
+	 * FAILED_OR_ALREADY_CAPTURED). Independent of {@link #paymentStatus}, which
+	 * tracks the order-level PAID/FAILED outcome.
+	 */
+	@Column(name = "capture_status")
+	private String captureStatus;
+
+	@Column(name = "captured_at")
+	private LocalDateTime capturedAt;
+
 }
