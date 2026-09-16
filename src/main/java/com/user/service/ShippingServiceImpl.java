@@ -173,7 +173,7 @@ public class ShippingServiceImpl implements ShippingService {
 			Optional<ShippingEO> existingForwardShipment = existingShipments == null ? Optional.empty()
 					: existingShipments.stream()
 						.filter(s -> Constants.SHIPMENT_TYPE_FORWARD.equals(s.getType())
-								&& !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()))
+								&& !Constants.SHIPMENT_STATUS_CANCELLED.equals(s.getShipmentStatus()) && !Constants.SHIPMENT_STATUS_INITIALIZED.equals(s.getShipmentStatus()))
 						.findFirst();
 			boolean forwardShipmentExists = existingForwardShipment.isPresent();
 			// Only treat the shipment as fully processed (and skip re-creation) when
@@ -282,54 +282,103 @@ public class ShippingServiceImpl implements ShippingService {
 					.orderId(shippingDTO.getOrderId())
 					.build();
 			}
-			// For each warehouse, create a shipment and shipment items
-			for (Map.Entry<Long, List<OrderItemEO>> entry : warehouseItemMap.entrySet()) {
-				WarehouseEO warehouseEO = warehouseById.get(entry.getKey());
-				List<OrderItemEO> itemsForWarehouse = entry.getValue();
-				ShippingEO shippingEO = new ShippingEO();
-				shippingEO.setOrder(order);
+		// For each warehouse, fetch INITIALIZED shipment or create new one
+		for (Map.Entry<Long, List<OrderItemEO>> entry : warehouseItemMap.entrySet()) {
+			WarehouseEO warehouseEO = warehouseById.get(entry.getKey());
+			List<OrderItemEO> itemsForWarehouse = entry.getValue();
+
+			// Try to fetch existing INITIALIZED shipment for this warehouse
+			List<ShippingEO> initializedShipments = shippingRepository.findByOrderIdAndStatus(
+					order.getOrderId().longValue(), Constants.SHIPMENT_STATUS_INITIALIZED);
+			ShippingEO shippingEO = null;
+			boolean isNewShipment = true;
+               if(initializedShipments!=null && initializedShipments.size()>0)
+			   {
+				   shippingEO=initializedShipments.get(0);
+
+				   isNewShipment = false;
+			   }
+
+
+			// If no INITIALIZED shipment found, create a new one
+			if (shippingEO == null) {
+				shippingEO = new ShippingEO();
+				shippingEO.setType(Constants.SHIPMENT_TYPE_FORWARD);
 				String orderNumber = (order.getOrderNumber() != null) ? order.getOrderNumber() : "UNKNOWN";
 				shippingEO.setTrackingNumber("TRK" + orderNumber + "_" + warehouseEO.getWarehouseId());
-				// shippingEO.setCourierName(Constants.COURIER_NAME);
+			}
+				shippingEO.setOrder(order);
+
 				shippingEO.setShipmentStatus(Constants.SHIPMENT_STATUS_CREATED);
 				shippingEO.setWarehouse(warehouseEO);
-				shippingEO.setType(Constants.SHIPMENT_TYPE_FORWARD);
-				ShippingEO savedShippingEO = shippingRepository.save(shippingEO);
-				createdShipmentIds.add(savedShippingEO.getShipmentId());
-				ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
+
+				logger.info("processCreateShipmentEvent: creating new shipment for warehouseId={}", warehouseEO.getWarehouseId());
+
+
+			ShippingEO savedShippingEO = shippingRepository.save(shippingEO);
+			createdShipmentIds.add(savedShippingEO.getShipmentId());
+
+			// Try to fetch existing tracking history or create new one
+			List<ShipmentTrackingHistoryEO> existingHistories = shipmentTrackingHistoryRepository.findByShipment(savedShippingEO);
+			ShipmentTrackingHistoryEO shipmentTrackingHistoryEO = null;
+
+			if (existingHistories != null && !existingHistories.isEmpty()) {
+				// Use existing tracking history
+				shipmentTrackingHistoryEO = existingHistories.get(0);
+				logger.info("processCreateShipmentEvent: updating existing tracking history for shipmentId={}",
+						savedShippingEO.getShipmentId());
+			} else {
+				// Create new tracking history if none exists
+				shipmentTrackingHistoryEO = new ShipmentTrackingHistoryEO();
 				shipmentTrackingHistoryEO.setShipment(savedShippingEO);
-				shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_ORDER_STATUS_CREATED);
-				shipmentTrackingHistoryEO.setLocation(warehouseEO.getAddressLine1() + ", "
-						+ warehouseEO.getAddressLine2() + "," + warehouseEO.getCity() + ", "
-						+ warehouseEO.getState() + " - " + warehouseEO.getPostalCode());
-				shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_STATUS_CREATED_REMARK);
-				shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
-
-				// Save ShipmentItemEO records so downstream processing can fetch them
-				for (OrderItemEO item : itemsForWarehouse) {
-					ShipmentItemEO shipmentItemEO = new ShipmentItemEO();
-					shipmentItemEO.setShipment(savedShippingEO);
-					shipmentItemEO.setOrderItem(item);
-					shipmentItemEO.setQuantity(item.getQuantity());
-					shippingItemRepository.save(shipmentItemEO);
-				}
-
-				// Build event and trigger Shiprocket order creation directly (in-process)
-				ShiprocketOrderEvent shiprocketEvent = ShiprocketOrderEvent.builder()
-					.shipmentId(savedShippingEO.getShipmentId() != null
-							? savedShippingEO.getShipmentId().longValue() : null)
-					.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
-					.warehouseId(warehouseEO.getWarehouseId())
-					.cartonNo(shippingDTO.getCartonNo())
-					.requestCreateCartonDTO(shippingDTO.getRequestCreateCartonDTO())
-					.bestCourierId(shippingDTO.getBestCourierId())
-					.build();
-				// Directly trigger Shiprocket order creation
-				ShiprocketOrderEventResponseDTO shiprocketOrderEventResponseDTO=processShiprocketOrderEvent(shiprocketEvent);
-				logger.info("Triggered Shiprocket order creation for shipmentId={}, orderId={}, warehouseId={}",
-						shiprocketEvent.getShipmentId(), shiprocketEvent.getOrderId(),
-						shiprocketEvent.getWarehouseId());
+				logger.info("processCreateShipmentEvent: creating new tracking history for shipmentId={}",
+						savedShippingEO.getShipmentId());
 			}
+
+			// Update tracking history fields
+			shipmentTrackingHistoryEO.setStatus(Constants.SHIPMENT_ORDER_STATUS_CREATED);
+			shipmentTrackingHistoryEO.setLocation(warehouseEO.getAddressLine1() + ", "
+					+ warehouseEO.getAddressLine2() + "," + warehouseEO.getCity() + ", "
+					+ warehouseEO.getState() + " - " + warehouseEO.getPostalCode());
+			shipmentTrackingHistoryEO.setRemarks(Constants.SHIPMENT_ORDER_STATUS_CREATED_REMARK);
+			shipmentTrackingHistoryRepository.save(shipmentTrackingHistoryEO);
+
+		// Save ShipmentItemEO records so downstream processing can fetch them
+		// Fetch existing items to avoid duplicates
+		List<ShipmentItemEO> existingItems = shippingItemRepository.findByShipment(savedShippingEO);
+		Set<Integer> existingOrderItemIds = new HashSet<>();
+		if (existingItems != null) {
+			existingOrderItemIds = existingItems.stream()
+					.map(si -> si.getOrderItem().getOrderItemId())
+					.collect(Collectors.toSet());
+		}
+
+		for (OrderItemEO item : itemsForWarehouse) {
+			if (!existingOrderItemIds.contains(item.getOrderItemId())) {
+				ShipmentItemEO shipmentItemEO = new ShipmentItemEO();
+				shipmentItemEO.setShipment(savedShippingEO);
+				shipmentItemEO.setOrderItem(item);
+				shipmentItemEO.setQuantity(item.getQuantity());
+				shippingItemRepository.save(shipmentItemEO);
+			}
+		}
+
+			// Build event and trigger Shiprocket order creation directly (in-process)
+			ShiprocketOrderEvent shiprocketEvent = ShiprocketOrderEvent.builder()
+				.shipmentId(savedShippingEO.getShipmentId() != null
+						? savedShippingEO.getShipmentId().longValue() : null)
+				.orderId(order.getOrderId() != null ? order.getOrderId().longValue() : null)
+				.warehouseId(warehouseEO.getWarehouseId())
+				.cartonNo(shippingDTO.getCartonNo())
+				.requestCreateCartonDTO(shippingDTO.getRequestCreateCartonDTO())
+				.bestCourierId(shippingDTO.getBestCourierId())
+				.build();
+			// Directly trigger Shiprocket order creation
+			ShiprocketOrderEventResponseDTO shiprocketOrderEventResponseDTO=processShiprocketOrderEvent(shiprocketEvent);
+			logger.info("Triggered Shiprocket order creation for shipmentId={}, orderId={}, warehouseId={}",
+					shiprocketEvent.getShipmentId(), shiprocketEvent.getOrderId(),
+					shiprocketEvent.getWarehouseId());
+		}
 
 			return ShippingResponseDTO.builder()
 				.responseStatus(Constants.SUCCESS_STATUS)

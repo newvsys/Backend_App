@@ -321,7 +321,7 @@ public class Constants {
 	public static final boolean IS_MULTI_WAREHOUSE_CONFIGURED = false;
 
 	// MSG91 Email
-	public static final String MSG91_EMAIL_DOMAIN = "mail.kuchimittai.com";
+	public static final String MSG91_EMAIL_DOMAIN = "mail.trynat.com";
 
 	public static final String MSG91_EMAIL_TEMPLATE_ORDER_STATUS_UPDATE = "orderstatusupdatetem";
 

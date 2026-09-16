@@ -43,4 +43,7 @@ public interface ShippingRepository extends JpaRepository<ShippingEO, Long> {
 	@Query("SELECT COUNT(s) FROM ShippingEO s WHERE s.order.orderId = :orderId")
 	long countByOrderId(@Param("orderId") Long orderId);
 
+	@Query("SELECT s FROM ShippingEO s WHERE s.order.orderId = :orderId AND s.shipmentStatus = :status ORDER BY s.createdAt DESC")
+	List<ShippingEO> findByOrderIdAndStatus(@Param("orderId") Long orderId, @Param("status") String status);
+
 }
