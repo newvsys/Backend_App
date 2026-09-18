@@ -2,18 +2,16 @@
 # Certbot initialization script - generates initial certificates if they don't exist,
 # then runs the renewal loop.
 
-set -e
-
 CERTBOT_DIR="/etc/letsencrypt/live"
 WEBROOT="/var/www/certbot"
-
-# Define domains to manage
-DOMAINS=("api.kuchimittai.com" "api.trynat.com")
 
 echo "Starting Certbot initialization..."
 
 # Generate initial certificates for each domain if they don't exist
-for domain in "${DOMAINS[@]}"; do
+# Using space-separated string instead of array (POSIX-compatible)
+DOMAINS="api.kuchimittai.com api.trynat.com"
+
+for domain in $DOMAINS; do
     CERT_PATH="$CERTBOT_DIR/$domain/fullchain.pem"
 
     if [ ! -f "$CERT_PATH" ]; then
@@ -24,8 +22,8 @@ for domain in "${DOMAINS[@]}"; do
             -d "$domain" \
             --non-interactive \
             --agree-tos \
-            -m operations@trynat.com \
-            || echo "Warning: Failed to generate certificate for $domain (might already exist or domain DNS not configured)"
+            -m operations@trynat.com || true
+        echo "Certificate generation attempted for $domain"
     else
         echo "Certificate already exists for $domain"
     fi
