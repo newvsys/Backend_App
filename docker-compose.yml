@@ -25,6 +25,9 @@ services:
     image: certbot/certbot:latest
     container_name: certbot
     restart: unless-stopped
+    depends_on:
+      nginx:
+        condition: service_started
     volumes:
       # Same real host cert directory as nginx (read-write here since certbot
       # needs to write renewed certs back to it).
