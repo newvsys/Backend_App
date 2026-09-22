@@ -50,4 +50,8 @@ public class ProductDTO {
 
 	private String videoUrl;
 
+	private Integer priority;
+
+	private String topFlag;
+
 }

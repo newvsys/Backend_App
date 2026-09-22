@@ -214,7 +214,13 @@ public class ProductServiceImpl implements ProductService {
 			productEO.setCategory(category);
 			productEO.setStatus("A");
 			ProductEO savedProduct = productRepository.save(productEO);
-			return UserMapper.toProductDTO(savedProduct);
+			ProductDTO productDTO = UserMapper.toProductDTO(savedProduct);
+			productDTO.setId(savedProduct.getId());
+			productDTO.setProductId(savedProduct.getId());
+			if (savedProduct.getCategory() != null) {
+				productDTO.setCategory(savedProduct.getCategory().getName());
+			}
+			return productDTO;
 		}
 		catch (Exception e) {
 			logger.error("Error creating product: {}", e.getMessage(), e);
@@ -231,12 +237,15 @@ public class ProductServiceImpl implements ProductService {
 			if (products == null || products.isEmpty()) {
 				return productDTOs;
 			}
-			for (ProductEO product : products) {
-				ProductDTO productDTO = UserMapper.toProductDTO(product);
-				productDTO.setId(product.getId());
-				if (product.getCategory() != null) {
-					productDTO.setCategory(product.getCategory().getName());
-				}
+		for (ProductEO product : products) {
+			ProductDTO productDTO = UserMapper.toProductDTO(product);
+			productDTO.setId(product.getId());
+			productDTO.setProductId(product.getId());
+			productDTO.setPriority(product.getPriority());
+			productDTO.setTopFlag(product.getTopFlag());
+			if (product.getCategory() != null) {
+				productDTO.setCategory(product.getCategory().getName());
+			}
 				List<ProductVariantEO> variants = productVariantRepository.findByProduct(product);
 				if (variants != null && !variants.isEmpty()) {
 					ProductVariantEO lowestVariant = variants.stream()
@@ -278,11 +287,14 @@ public class ProductServiceImpl implements ProductService {
 				logger.warn("Product not found or inactive for productId={}", productId);
 				return null;
 			}
-			productDTO = UserMapper.toProductDTO(product);
-			productDTO.setId(product.getId());
-			if (product.getCategory() != null) {
-				productDTO.setCategory(product.getCategory().getName());
-			}
+		productDTO = UserMapper.toProductDTO(product);
+		productDTO.setId(product.getId());
+		productDTO.setProductId(product.getId());
+		productDTO.setPriority(product.getPriority());
+		productDTO.setTopFlag(product.getTopFlag());
+		if (product.getCategory() != null) {
+			productDTO.setCategory(product.getCategory().getName());
+		}
 			List<ProductVariantEO> variants = productVariantRepository.findByProduct(product);
 			if (variants != null && !variants.isEmpty()) {
 				ProductVariantEO lowestVariant = variants.stream()
@@ -355,11 +367,21 @@ public class ProductServiceImpl implements ProductService {
 			if (productUpdateDTO.getSlug() != null) {
 				product.setSlug(productUpdateDTO.getSlug());
 			}
+		if (productUpdateDTO.getPriority() != null) {
+			product.setPriority(productUpdateDTO.getPriority());
+		}
+		if (productUpdateDTO.getTopFlag() != null) {
+			product.setTopFlag(productUpdateDTO.getTopFlag());
+		}
 
-			ProductEO updatedProduct = productRepository.save(product);
-			ProductDTO productDTO = UserMapper.toProductDTO(updatedProduct);
-			productDTO.setId(product.getId());
-			return productDTO;
+		ProductEO updatedProduct = productRepository.save(product);
+		ProductDTO productDTO = UserMapper.toProductDTO(updatedProduct);
+		productDTO.setId(product.getId());
+		productDTO.setProductId(product.getId());
+		if (product.getCategory() != null) {
+			productDTO.setCategory(product.getCategory().getName());
+		}
+		return productDTO;
 		}
 		catch (Exception e) {
 			logger.error("Error updating product: {}", e.getMessage(), e);
@@ -848,13 +870,94 @@ public class ProductServiceImpl implements ProductService {
 
 		// ── Step 9: sort ────────────────────────────────────────────────────────────
 		if ("lowPrice".equals(sort)) {
-			productDTOs.sort(Comparator.comparing(ProductDTO::getPrice,
+			// Separate in-stock and out-of-stock products
+			List<ProductDTO> inStockProducts = new ArrayList<>();
+			List<ProductDTO> outOfStockProducts = new ArrayList<>();
+
+			for (ProductDTO p : productDTOs) {
+				if (p.getStock() != null && p.getStock() > 0) {
+					inStockProducts.add(p);
+				} else {
+					outOfStockProducts.add(p);
+				}
+			}
+
+			// Sort in-stock products by price ascending
+			inStockProducts.sort(Comparator.comparing(ProductDTO::getPrice,
 					Comparator.nullsLast(Comparator.naturalOrder())));
+
+			// Sort out-of-stock products by price ascending
+			outOfStockProducts.sort(Comparator.comparing(ProductDTO::getPrice,
+					Comparator.nullsLast(Comparator.naturalOrder())));
+
+			// Combine: in-stock first, then out-of-stock
+			productDTOs.clear();
+			productDTOs.addAll(inStockProducts);
+			productDTOs.addAll(outOfStockProducts);
 		}
 		else if ("highPrice".equals(sort)) {
-			productDTOs.sort(Comparator.comparing(ProductDTO::getPrice,
+			// Separate in-stock and out-of-stock products
+			List<ProductDTO> inStockProducts = new ArrayList<>();
+			List<ProductDTO> outOfStockProducts = new ArrayList<>();
+
+			for (ProductDTO p : productDTOs) {
+				if (p.getStock() != null && p.getStock() > 0) {
+					inStockProducts.add(p);
+				} else {
+					outOfStockProducts.add(p);
+				}
+			}
+
+			// Sort in-stock products by price descending
+			inStockProducts.sort(Comparator.comparing(ProductDTO::getPrice,
 					Comparator.nullsLast(Comparator.reverseOrder())));
+
+			// Sort out-of-stock products by price descending
+			outOfStockProducts.sort(Comparator.comparing(ProductDTO::getPrice,
+					Comparator.nullsLast(Comparator.reverseOrder())));
+
+			// Combine: in-stock first, then out-of-stock
+			productDTOs.clear();
+			productDTOs.addAll(inStockProducts);
+			productDTOs.addAll(outOfStockProducts);
 		}
+		else if("defaultSort".equals(sort))
+		{
+			// Sort products: in-stock items first (sorted by priority ascending), then out-of-stock items
+			productDTOs.sort((p1, p2) -> {
+				// First, separate by stock availability: in-stock (stock > 0) comes first
+				Integer stock1 = p1.getStock() != null ? p1.getStock() : 0;
+				Integer stock2 = p2.getStock() != null ? p2.getStock() : 0;
+				boolean isInStock1 = stock1 > 0;
+				boolean isInStock2 = stock2 > 0;
+
+				// If stock availability differs, in-stock products come first
+				if (isInStock1 != isInStock2) {
+					return isInStock1 ? -1 : 1; // in-stock first (return -1)
+				}
+
+				// Both are in same stock category (both in-stock or both out-of-stock)
+				// Now sort by priority ascending (lower priority value first)
+				Integer priority1 = p1.getPriority();
+				Integer priority2 = p2.getPriority();
+
+				// Both null: maintain order
+				if (priority1 == null && priority2 == null) {
+					return 0;
+				}
+				// p1 null: p1 goes after p2 (p1 is lower priority)
+				if (priority1 == null) {
+					return 1;
+				}
+				// p2 null: p2 goes after p1 (p2 is lower priority)
+				if (priority2 == null) {
+					return -1;
+				}
+				// Both non-null: sort ascending (lower priority value first)
+				return priority1.compareTo(priority2);
+			});
+		}
+
 
 		// ── Step 10: paginate ────────────────────────────────────────────────────────
 		if (isAllCategories) {
@@ -913,10 +1016,12 @@ public class ProductServiceImpl implements ProductService {
 						.min(Comparator.comparing(ProductVariantEO::getSellingPrice))
 						.orElse(finalExistingVariants.get(0)));
 
-				productDTO.setId(existingVariant.getId());
-				productDTO.setProductId(product.getId());
-				List<ProductImageEO> productImages = productImageRepository
-					.findByProductVarOrderByDisplayOrderAsc(existingVariant);
+			productDTO.setId(existingVariant.getId());
+			productDTO.setProductId(product.getId());
+			productDTO.setPriority(product.getPriority());
+			productDTO.setTopFlag(product.getTopFlag());
+			List<ProductImageEO> productImages = productImageRepository
+				.findByProductVarOrderByDisplayOrderAsc(existingVariant);
 				List<ProductAttributeEO> attributes = productAttributeRepository
 					.findByProductVarOrderByDisplayOrderAsc(existingVariant);
 				if (attributes != null && attributes.size() > 0) {
@@ -1459,10 +1564,12 @@ public class ProductServiceImpl implements ProductService {
 			if (products == null || products.isEmpty()) {
 				return productDTOs;
 			}
-			for (ProductEO product : products) {
-				ProductDTO productDTO = UserMapper.toProductDTO(product);
-				productDTO.setId(product.getId());
-				List<ProductVariantEO> existingVariants = productVariantRepository.findByProduct(product);
+		for (ProductEO product : products) {
+			ProductDTO productDTO = UserMapper.toProductDTO(product);
+			productDTO.setId(product.getId());
+			productDTO.setPriority(product.getPriority());
+			productDTO.setTopFlag(product.getTopFlag());
+			List<ProductVariantEO> existingVariants = productVariantRepository.findByProduct(product);
 				if (existingVariants != null && !existingVariants.isEmpty()) {
 					ProductVariantEO cheapestVariant = existingVariants.stream()
 						.filter(v -> v.getSellingPrice() != null)

@@ -165,6 +165,8 @@ public final class UserMapper {
 			.name(productCreateDTO.getName())
 			.description(productCreateDTO.getDescription())
 			.slug(productCreateDTO.getSlug())
+			.priority(productCreateDTO.getPriority())
+			.topFlag(productCreateDTO.getTopFlag())
 			.build();
 	}
 
@@ -177,6 +179,8 @@ public final class UserMapper {
 			.title(productEO.getName())
 			.description(productEO.getDescription())
 			.slug(productEO.getSlug())
+			.priority(productEO.getPriority())
+			.topFlag(productEO.getTopFlag())
 			.build();
 	}
 

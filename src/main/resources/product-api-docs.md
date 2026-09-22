@@ -63,6 +63,224 @@
 
 ---
 
+## Product CRUD APIs
+
+### `POST /api/products/product` — Create Product
+
+Creates a new product with basic information.
+
+**Content-Type:** `application/json`
+
+#### Request Body
+
+```json
+{
+  "name": "Premium Walnuts",
+  "description": "Fresh whole walnuts, rich in omega-3 fatty acids",
+  "categoryId": 5,
+  "slug": "premium-walnuts",
+  "priority": 10,
+  "topFlag": "Y"
+}
+```
+
+#### Request Fields
+
+| Field       | Type      | Required | Description |
+|-------------|-----------|----------|-------------|
+| `name`      | `String`  | ✅ Yes   | Product name (max 255 chars) |
+| `description` | `String` | ❌ No   | Product description |
+| `categoryId` | `Integer` | ✅ Yes  | Category ID |
+| `slug`      | `String`  | ❌ No    | URL-friendly slug (unique, max 100 chars) |
+| `priority`  | `Integer` | ❌ No    | Display priority number for sorting (higher = featured). Not unique, nullable. |
+| `topFlag`   | `String`  | ❌ No    | Mark product as top featured: `"Y"` (yes) or `"N"` (no). Defaults to `"N"`. |
+
+#### Response — `200 OK`
+
+```json
+{
+  "id": 25,
+  "productId": 25,
+  "title": "Premium Walnuts",
+  "description": "Fresh whole walnuts, rich in omega-3 fatty acids",
+  "slug": "premium-walnuts",
+  "category": "Dry Fruits & Nuts",
+  "priority": 10,
+  "topFlag": "Y",
+  "price": null,
+  "mrp": null,
+  "currency": null,
+  "mainImage": null,
+  "stock": 0,
+  "inStock": 0,
+  "isReturnable": "N",
+  "returnPolicy": null,
+  "videoUrl": null,
+  "attributes": [],
+  "productvarlist": []
+}
+```
+
+#### curl Example
+
+```bash
+curl -X POST http://localhost:8080/api/products/product \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Premium Walnuts","description":"Fresh walnuts","categoryId":5,"slug":"premium-walnuts","priority":10,"topFlag":"Y"}'
+```
+
+---
+
+### `GET /api/products/product` — Get All Products
+
+Retrieves all active products.
+
+#### Response — `200 OK`
+
+```json
+[
+  {
+    "id": 1,
+    "productId": 1,
+    "title": "Premium Walnuts",
+    "description": "Fresh whole walnuts...",
+    "slug": "premium-walnuts",
+    "category": "Dry Fruits & Nuts",
+    "priority": 10,
+    "topFlag": "Y",
+    "price": 350.00,
+    "mrp": 399.00,
+    "currency": "INR",
+    "mainImage": "1716123456789_walnut.png",
+    "stock": 25,
+    "inStock": 1,
+    "isReturnable": "N",
+    "returnPolicy": null,
+    "videoUrl": null,
+    "attributes": [],
+    "productvarlist": []
+  }
+]
+```
+
+---
+
+### `GET /api/products/product/{product_id}` — Get Product by ID
+
+Retrieves a specific product by its ID.
+
+#### Path Parameter
+
+| Parameter    | Type    | Description |
+|--------------|---------|-------------|
+| `product_id` | `Long`  | Product ID  |
+
+#### Response — `200 OK`
+
+Returns a single ProductDTO (same structure as GET all products).
+
+#### Response — `404 Not Found`
+
+Returned when product doesn't exist.
+
+---
+
+### `PUT /api/products/{product_id}` — Update Product
+
+Updates product information including priority and other fields.
+
+**Content-Type:** `application/json`
+
+#### Path Parameter
+
+| Parameter    | Type      | Description |
+|--------------|-----------|-------------|
+| `product_id` | `Integer` | Product ID  |
+
+#### Request Body (all fields optional — only provided fields are updated)
+
+```json
+{
+  "name": "Premium Walnuts - Updated",
+  "description": "Fresh premium walnuts enriched with antioxidants",
+  "categoryId": 5,
+  "slug": "premium-walnuts-updated",
+  "priority": 15,
+  "topFlag": "Y"
+}
+```
+
+#### Request Fields
+
+| Field       | Type      | Required | Description |
+|-------------|-----------|----------|-------------|
+| `name`      | `String`  | ❌ No    | New product name |
+| `description` | `String` | ❌ No   | New product description |
+| `categoryId` | `Integer` | ❌ No   | New category ID |
+| `slug`      | `String`  | ❌ No    | New product slug |
+| `priority`  | `Integer` | ❌ No    | New display priority (higher value = more featured) |
+| `topFlag`   | `String`  | ❌ No    | Mark as top featured: `"Y"` or `"N"` |
+
+#### Response — `200 OK`
+
+Returns updated ProductDTO.
+
+```json
+{
+  "id": 25,
+  "productId": 25,
+  "title": "Premium Walnuts - Updated",
+  "description": "Fresh premium walnuts enriched with antioxidants",
+  "slug": "premium-walnuts-updated",
+  "category": "Dry Fruits & Nuts",
+  "priority": 15,
+  "topFlag": "Y",
+  "price": 350.00,
+  "mrp": 399.00,
+  "currency": "INR",
+  "mainImage": "1716123456789_walnut.png",
+  "stock": 25,
+  "inStock": 1,
+  "isReturnable": "N",
+  "returnPolicy": null,
+  "videoUrl": null,
+  "attributes": [],
+  "productvarlist": []
+}
+```
+
+#### curl Example
+
+```bash
+curl -X PUT http://localhost:8080/api/products/25 \
+  -H "Content-Type: application/json" \
+  -d '{"priority":15,"topFlag":"Y","description":"Fresh premium walnuts enriched with antioxidants"}'
+```
+
+---
+
+### `DELETE /api/products/{product_id}` — Delete Product
+
+Soft-deletes a product (sets status to inactive).
+
+#### Path Parameter
+
+| Parameter    | Type      | Description |
+|--------------|-----------|-------------|
+| `product_id` | `Integer` | Product ID  |
+
+#### Response — `204 No Content`
+
+Product deleted successfully.
+
+#### curl Example
+
+```bash
+curl -X DELETE http://localhost:8080/api/products/25
+```
+
+---
+
 ## Create Product Variant
 
 ### `POST /api/products/productsVariant`
@@ -391,10 +609,13 @@ GET /api/products/productSlug/walnuts
 | Field            | Type          | Description |
 |------------------|---------------|-------------|
 | `id`             | `Integer`     | Variant ID (cheapest variant selected as main) |
+| `productId`      | `Integer`     | Product ID |
 | `title`          | `String`      | Product name |
 | `description`    | `String`      | Product description |
 | `slug`           | `String`      | URL-friendly slug |
 | `category`       | `String`      | Category name |
+| `priority`       | `Integer`     | Display priority for sorting (higher = featured). Nullable. |
+| `topFlag`        | `String`      | Top featured product flag: `"Y"` (yes) or `"N"` (no). Defaults to `"N"`. |
 | `sku`            | `String`      | SKU of the selected variant |
 | `price`          | `BigDecimal`  | Selling price |
 | `mrp`            | `BigDecimal`  | MRP |
@@ -1107,6 +1328,8 @@ GET /api/products/search?query=snacks&page=2&limit=10
 | `description`    | `String`      | Product description |
 | `slug`           | `String`      | URL-friendly slug |
 | `category`       | `String`      | Category name |
+| `priority`       | `Integer`     | Display priority for sorting. Nullable. |
+| `topFlag`        | `String`      | Top featured product flag (`"Y"` or `"N"`). |
 | `sku`            | `String`      | SKU of selected variant |
 | `price`          | `BigDecimal`  | Selling price |
 | `mrp`            | `BigDecimal`  | MRP |

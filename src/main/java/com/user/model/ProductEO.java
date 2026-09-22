@@ -51,6 +51,12 @@ public class ProductEO {
 	@Column(name = "status")
 	private String status = "A";
 
+	@Column(name = "priority")
+	private Integer priority;
+
+	@Column(name = "top_flag", length = 1)
+	private String topFlag;
+
 	@Column(name = "created_at", updatable = false)
 	private OffsetDateTime createdAt;
 

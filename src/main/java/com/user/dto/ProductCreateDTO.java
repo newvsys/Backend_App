@@ -13,4 +13,8 @@ public class ProductCreateDTO {
 
 	private String slug;
 
+	private Integer priority;
+
+	private String topFlag;
+
 }
