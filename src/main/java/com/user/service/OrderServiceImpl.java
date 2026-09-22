@@ -90,6 +90,9 @@ public class OrderServiceImpl implements OrderService {
 	@Value("${admin.notification.email:}")
 	private String adminNotificationEmail;
 
+	@Value("${admin.frontend.url:http://localhost:3000}")
+	private String adminFrontendUrl;
+
 	@Autowired
 	@Lazy
 	private ShippingService shippingService;
@@ -1032,11 +1035,15 @@ public class OrderServiceImpl implements OrderService {
 						"Order %s has been confirmed and payment received. Please process the shipment.",
 						orderNumber);
 
+				// Build tracking URL for admin panel
+				String trackingUrl = String.format("%s/admin/order-details/%s", adminFrontendUrl, orderNumber);
+
 				EmailDetails adminEmailDetails = EmailDetails.builder()
 					.orderId(orderNumber)
 					.customerName("Admin")
 					.orderStatus(orderStatus)
 					.message(adminMessage)
+					.trackingUrl(trackingUrl)
 					.build();
 
 				Event adminNotificationEvent = Event.builder()
@@ -4182,4 +4189,136 @@ public class OrderServiceImpl implements OrderService {
 		return responseDTO;
 	}
 
+	@Override
+	public OrderDetailWithItemsDTO getOrderDetailsWithItems(String orderNumber) {
+		try {
+			logger.info("getOrderDetailsWithItems: fetching details for orderNumber={}", orderNumber);
+
+			// Fetch the order by order number
+			OrderEO order = orderRepository.findByOrderNumber(orderNumber).orElse(null);
+			if (order == null) {
+				logger.warn("getOrderDetailsWithItems: order not found for orderNumber={}", orderNumber);
+				return null;
+			}
+
+		// Fetch delivery address - try SHIPPING first, then fall back to BOTH
+		OrderAddressEO deliveryAddress = orderAddressRepository
+				.findByOrderAndAddressType(order, Constants.ADDRESS_TYPE_SHIPPING).orElse(null);
+		if (deliveryAddress == null) {
+			// If SHIPPING not found, try BOTH (used when same address for delivery and billing)
+			deliveryAddress = orderAddressRepository
+					.findByOrderAndAddressType(order, Constants.ADDRESS_TYPE_BOTH).orElse(null);
+		}
+
+		// Fetch billing address - try BILLING first, then fall back to BOTH
+		OrderAddressEO billingAddress = orderAddressRepository
+				.findByOrderAndAddressType(order, Constants.ADDRESS_TYPE_BILLING).orElse(null);
+		if (billingAddress == null) {
+			// If BILLING not found, try BOTH (used when same address for delivery and billing)
+			billingAddress = orderAddressRepository
+					.findByOrderAndAddressType(order, Constants.ADDRESS_TYPE_BOTH).orElse(null);
+		}
+
+			// Fetch all order items
+			List<OrderItemEO> orderItems = orderProductRepository.findByOrder(order);
+			if (orderItems == null) {
+				orderItems = new ArrayList<>();
+			}
+
+			// Get userId from customer
+			Integer userId = (order.getCustomer() != null) ? order.getCustomer().getCustomerId() : null;
+
+			// Build the response DTO
+			OrderDetailWithItemsDTO.OrderDetailWithItemsDTOBuilder builder = OrderDetailWithItemsDTO.builder()
+					.orderId(order.getOrderId()).orderNumber(order.getOrderNumber()).userId(userId)
+					.orderStatus(order.getOrderStatus()).paymentStatus(order.getPaymentStatus())
+					.totalAmount(order.getTotalAmount()).discountAmount(order.getDiscountAmount())
+					.taxAmount(order.getTaxAmount()).shippingCost(order.getShippingFee())
+					.createdAt(order.getCreatedAt()).updatedAt(null);  // No updatedAt field in OrderEO
+
+			// Set delivery address with email from customer
+			if (deliveryAddress != null) {
+				String email = (order.getCustomer() != null) ? order.getCustomer().getEmail() : null;
+				builder.deliveryName(deliveryAddress.getRecipientName())
+						.deliveryPhone(deliveryAddress.getContactNumber())
+						.deliveryEmail(email)
+						.deliveryAddressLine1(deliveryAddress.getAddressLine1())
+						.deliveryAddressLine2(deliveryAddress.getAddressLine2())
+						.deliveryLandmark(deliveryAddress.getLandMark())
+						.deliveryCity(deliveryAddress.getCity())
+						.deliveryState(deliveryAddress.getState())
+						.deliveryPostalCode(deliveryAddress.getPostalCode())
+						.deliveryCountry(deliveryAddress.getCountry());
+			}
+
+			// Set billing address
+			if (billingAddress != null) {
+				builder.billingName(billingAddress.getRecipientName())
+						.billingPhone(billingAddress.getContactNumber())
+						.billingAddressLine1(billingAddress.getAddressLine1())
+						.billingAddressLine2(billingAddress.getAddressLine2())
+						.billingCity(billingAddress.getCity())
+						.billingState(billingAddress.getState())
+						.billingPostalCode(billingAddress.getPostalCode())
+						.billingCountry(billingAddress.getCountry());
+			}
+
+			// Build order items with product and variant details
+			List<OrderDetailWithItemsDTO.OrderItemDetailDTO> itemDTOs = new ArrayList<>();
+			for (OrderItemEO orderItem : orderItems) {
+				ProductVariantEO variant = orderItem.getProductVar();
+				if (variant == null) {
+					logger.warn("getOrderDetailsWithItems: productVariant is null for orderItemId={}",
+							orderItem.getOrderItemId());
+					continue;
+				}
+
+				ProductEO product = variant.getProduct();
+				if (product == null) {
+					logger.warn("getOrderDetailsWithItems: product is null for variantId={}", variant.getId());
+					continue;
+				}
+
+				// Calculate discount and discount percentage
+				BigDecimal unitPrice = orderItem.getUnitPrice() != null ? orderItem.getUnitPrice() : BigDecimal.ZERO;
+				BigDecimal sellingPrice = variant.getSellingPrice() != null ? variant.getSellingPrice() : BigDecimal.ZERO;
+				BigDecimal discount = unitPrice.subtract(sellingPrice).max(BigDecimal.ZERO);
+				BigDecimal discountPercentage = unitPrice.compareTo(BigDecimal.ZERO) > 0
+						? discount.multiply(BigDecimal.valueOf(100)).divide(unitPrice, 2, RoundingMode.HALF_UP)
+						: BigDecimal.ZERO;
+
+				OrderDetailWithItemsDTO.OrderItemDetailDTO itemDTO = OrderDetailWithItemsDTO.OrderItemDetailDTO.builder()
+						.orderItemId(orderItem.getOrderItemId()).quantity(orderItem.getQuantity())
+						.unitPrice(orderItem.getUnitPrice()).totalPrice(orderItem.getTotalPrice())
+						.itemStatus(orderItem.getStatus())
+						// Product details - using id and name fields from ProductEO
+						.productId(product.getId()).productName(product.getName())
+						.productDescription(product.getDescription()).productSlug(product.getSlug())
+						// Variant details
+						.variantId(variant.getId()).skuCode(variant.getSkuCode()).packSize(variant.getPackSize())
+						.uom(variant.getUom()).containerType(variant.getContainerType()).mrp(variant.getMrp())
+						.sellingPrice(variant.getSellingPrice()).currency(variant.getCurrency())
+						.variantStatus(variant.getStatus())
+						// Calculated fields
+						.discount(discount).discountPercentage(discountPercentage).build();
+
+				itemDTOs.add(itemDTO);
+			}
+
+			// Set items and item count
+			builder.items(itemDTOs).itemCount((long) itemDTOs.size());
+
+			OrderDetailWithItemsDTO response = builder.build();
+			logger.info("getOrderDetailsWithItems: successfully built response for orderNumber={} with {} items",
+					orderNumber, itemDTOs.size());
+			return response;
+
+		}
+		catch (Exception e) {
+			logger.error("getOrderDetailsWithItems: error fetching details for orderNumber={}", orderNumber, e);
+			return null;
+		}
+	}
+
 }
+

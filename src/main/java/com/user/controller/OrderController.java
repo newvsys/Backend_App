@@ -597,4 +597,29 @@ public class OrderController {
 		}
 	}
 
+	/**
+	 * GET /api/order-details/{order_id}
+	 * Fetch complete order details including order items with product and variant information.
+	 * @param orderId: Order number (e.g., "ORD-260908151808-001019")
+	 * @return OrderDetailWithItemsDTO with all order, item, product, and variant details
+	 */
+	@GetMapping("/order-details/{order_id}")
+	public ResponseEntity<?> getOrderDetailsWithItems(@PathVariable("order_id") String orderId) {
+		try {
+			if (orderId == null || orderId.isBlank()) {
+				return ResponseEntity.badRequest().body(Map.of("status", "failed", "message", "order_id is required"));
+			}
+			logger.info("Received getOrderDetailsWithItems request for orderId: {}", orderId);
+			OrderDetailWithItemsDTO orderDetails = orderService.getOrderDetailsWithItems(orderId);
+			if (orderDetails == null) {
+				return ResponseEntity.notFound().build();
+			}
+			return ResponseEntity.ok(orderDetails);
+		}
+		catch (Exception e) {
+			logger.error("Error in getOrderDetailsWithItems for orderId: {}", orderId, e);
+			return ResponseEntity.status(500).body(Map.of("status", "failed", "message", "Error fetching order details"));
+		}
+	}
+
 }

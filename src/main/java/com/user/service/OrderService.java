@@ -102,4 +102,14 @@ public interface OrderService {
 	// ── Retry Payment ────────────────────────────────────────────────────────
 	OrderResponseDTO retryPayment(RetryPaymentRequestDTO request);
 
+	// ── Order Details with Items ─────────────────────────────────────────────
+	/**
+	 * Fetch complete order details including order items with product and variant information.
+	 * Returns order details, delivery address, billing address, and list of items with product details.
+	 * @param orderNumber the order number (e.g., "ORD-260908151808-001019")
+	 * @return OrderDetailWithItemsDTO containing all order and item details, or null if order not found
+	 */
+	OrderDetailWithItemsDTO getOrderDetailsWithItems(String orderNumber);
+
+
 }

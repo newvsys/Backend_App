@@ -323,9 +323,9 @@ public class Constants {
 	// MSG91 Email
 	public static final String MSG91_EMAIL_DOMAIN = "mail.trynat.com";
 
-	public static final String MSG91_EMAIL_TEMPLATE_ORDER_STATUS_UPDATE = "orderstatusupdatetem";
+	public static final String MSG91_EMAIL_TEMPLATE_ORDER_STATUS_UPDATE = "orderstatusupdatet";
 
-	public static final String MSG91_EMAIL_TEMPLATE_ORDER_CANCEL = "ordercanceltem";
+	public static final String MSG91_EMAIL_TEMPLATE_ORDER_CANCEL = "ordercancelt";
 
 	// Label / Branding
 	/**

@@ -13,4 +13,6 @@ public interface OrderAddressRepository extends JpaRepository<OrderAddressEO, In
 
 	List<OrderAddressEO> findAllByOrder(OrderEO order);
 
+	Optional<OrderAddressEO> findByOrderAndAddressType(OrderEO order, String addressType);
+
 }
