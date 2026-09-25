@@ -43,5 +43,8 @@ target/
 
 ### Secrets ###
 secrets/
-*firebase-adminsdk*.json
+*firebase-admissdk*.json
 
+### Docker ###
+data/
+.docker/

@@ -12,7 +12,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -46,9 +46,6 @@ services:
       - ./secrets/kuchimittai-dd858-firebase-adminsdk-fbsvc-5caaee8749.json:/app/secrets/firebase-service-account.json:ro
     networks:
       - mynetwork
-
-volumes:
-  postgres_data:
 
 networks:
   mynetwork:
