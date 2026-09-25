@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
 
   nginx:
@@ -97,12 +95,11 @@ services:
       - mynetwork
 
 volumes:
+  # Docker-managed named volume. Docker creates & owns the underlying
+  # directory, so it never fails with "no such file or directory" and the
+  # data persists across container restarts / rebuilds.
   postgres_data:
     driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${PWD}/data/postgres
 
 
 networks:
