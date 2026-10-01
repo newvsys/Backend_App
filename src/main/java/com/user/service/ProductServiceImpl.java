@@ -802,10 +802,27 @@ public class ProductServiceImpl implements ProductService {
 						}
 					}
 				} else {
-					// inStock is null/false: select cheapest variant regardless of stock
-					// (variants are already sorted by price ASC)
-					if (!variants.isEmpty()) {
-						chosenVariantByProductId.put(product.getId(), variants.get(0));
+					// inStock is null/false: PREFER the cheapest IN-STOCK variant so that the
+					// search result never surfaces an out-of-stock variant while another
+					// variant of the same product is actually available.
+					// Variants are sorted price ASC, so the first in-stock match is the
+					// cheapest in-stock variant. e.g. Groundnut Oil [250ML, 500ML, 1L] where
+					// only 1L is in stock -> 1L is chosen instead of out-of-stock 250ML/500ML.
+					ProductVariantEO chosen = null;
+					for (ProductVariantEO v : variants) {
+						InventoryEO inv = inventoryByVariantId.get(v.getId().longValue());
+						if (inv != null && inv.getAvailableQty() != null && inv.getAvailableQty() > 0) {
+							chosen = v;
+							break;
+						}
+					}
+					// Fallback: no variant is in stock — show the cheapest variant so the
+					// product still appears (flagged out-of-stock in the DTO below).
+					if (chosen == null && !variants.isEmpty()) {
+						chosen = variants.get(0);
+					}
+					if (chosen != null) {
+						chosenVariantByProductId.put(product.getId(), chosen);
 					}
 				}
 			}
