@@ -860,7 +860,9 @@ public class ProductServiceImpl implements ProductService {
 			InventoryEO inventory = inventoryByVariantId.get(chosenVariant.getId().longValue());
 
 			ProductDTO productDTO = UserMapper.toProductDTO(product);
-			productDTO.setId(product.getId());
+			// Mirror findBySlug: id = chosen product-variant id, productId = product id
+			productDTO.setId(chosenVariant.getId());
+			productDTO.setProductId(product.getId());
 			productDTO.setIsReturnable("N"); // detail page fetches the real return policy
 
 			List<ProductImageEO> images = imagesByVariantId.get(chosenVariant.getId());
@@ -1002,9 +1004,16 @@ public class ProductServiceImpl implements ProductService {
 			List<ProductVariantEO> existingVariants = null;
 			if (product != null) {
 				existingVariants = productVariantRepository.findByProduct(product);
+				// Exclude inactive variants (status != 'A') so only ACTIVE product
+				// variants are returned in the response / productvarlist.
+				if (existingVariants != null) {
+					existingVariants = existingVariants.stream()
+						.filter(v -> Constants.STATUS_ACTIVE.equalsIgnoreCase(v.getStatus()))
+						.collect(Collectors.toList());
+				}
 			}
 
-			if (product != null && existingVariants != null) {
+			if (product != null && existingVariants != null && !existingVariants.isEmpty()) {
 
 				final List<ProductVariantEO> finalExistingVariants = existingVariants;
 
