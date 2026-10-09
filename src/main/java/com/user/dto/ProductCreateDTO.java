@@ -7,6 +7,8 @@ public class ProductCreateDTO {
 
 	private String name;
 
+	private String shortName;
+
 	private String description;
 
 	private Integer categoryId;

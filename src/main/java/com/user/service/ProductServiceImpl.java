@@ -361,6 +361,9 @@ public class ProductServiceImpl implements ProductService {
 			if (productUpdateDTO.getName() != null) {
 				product.setName(productUpdateDTO.getName());
 			}
+			if (productUpdateDTO.getShortName() != null) {
+				product.setShortName(productUpdateDTO.getShortName());
+			}
 			if (productUpdateDTO.getDescription() != null) {
 				product.setDescription(productUpdateDTO.getDescription());
 			}

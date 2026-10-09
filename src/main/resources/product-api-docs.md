@@ -76,6 +76,7 @@ Creates a new product with basic information.
 ```json
 {
   "name": "Premium Walnuts",
+  "shortName": "Walnuts",
   "description": "Fresh whole walnuts, rich in omega-3 fatty acids",
   "categoryId": 5,
   "slug": "premium-walnuts",
@@ -89,6 +90,7 @@ Creates a new product with basic information.
 | Field       | Type      | Required | Description |
 |-------------|-----------|----------|-------------|
 | `name`      | `String`  | ✅ Yes   | Product name (max 255 chars) |
+| `shortName` | `String`  | ❌ No    | Short/display name for the product (max 255 chars). Nullable. |
 | `description` | `String` | ❌ No   | Product description |
 | `categoryId` | `Integer` | ✅ Yes  | Category ID |
 | `slug`      | `String`  | ❌ No    | URL-friendly slug (unique, max 100 chars) |
@@ -102,6 +104,7 @@ Creates a new product with basic information.
   "id": 25,
   "productId": 25,
   "title": "Premium Walnuts",
+  "shortName": "Walnuts",
   "description": "Fresh whole walnuts, rich in omega-3 fatty acids",
   "slug": "premium-walnuts",
   "category": "Dry Fruits & Nuts",
@@ -126,7 +129,7 @@ Creates a new product with basic information.
 ```bash
 curl -X POST http://localhost:8080/api/products/product \
   -H "Content-Type: application/json" \
-  -d '{"name":"Premium Walnuts","description":"Fresh walnuts","categoryId":5,"slug":"premium-walnuts","priority":10,"topFlag":"Y"}'
+  -d '{"name":"Premium Walnuts","shortName":"Walnuts","description":"Fresh walnuts","categoryId":5,"slug":"premium-walnuts","priority":10,"topFlag":"Y"}'
 ```
 
 ---
@@ -202,6 +205,7 @@ Updates product information including priority and other fields.
 ```json
 {
   "name": "Premium Walnuts - Updated",
+  "shortName": "Walnuts",
   "description": "Fresh premium walnuts enriched with antioxidants",
   "categoryId": 5,
   "slug": "premium-walnuts-updated",
@@ -215,6 +219,7 @@ Updates product information including priority and other fields.
 | Field       | Type      | Required | Description |
 |-------------|-----------|----------|-------------|
 | `name`      | `String`  | ❌ No    | New product name |
+| `shortName` | `String`  | ❌ No    | New short/display name for the product (max 255 chars) |
 | `description` | `String` | ❌ No   | New product description |
 | `categoryId` | `Integer` | ❌ No   | New category ID |
 | `slug`      | `String`  | ❌ No    | New product slug |
@@ -230,6 +235,7 @@ Returns updated ProductDTO.
   "id": 25,
   "productId": 25,
   "title": "Premium Walnuts - Updated",
+  "shortName": "Walnuts",
   "description": "Fresh premium walnuts enriched with antioxidants",
   "slug": "premium-walnuts-updated",
   "category": "Dry Fruits & Nuts",
@@ -254,7 +260,7 @@ Returns updated ProductDTO.
 ```bash
 curl -X PUT http://localhost:8080/api/products/25 \
   -H "Content-Type: application/json" \
-  -d '{"priority":15,"topFlag":"Y","description":"Fresh premium walnuts enriched with antioxidants"}'
+  -d '{"shortName":"Walnuts","priority":15,"topFlag":"Y","description":"Fresh premium walnuts enriched with antioxidants"}'
 ```
 
 ---
@@ -611,6 +617,7 @@ GET /api/products/productSlug/walnuts
 | `id`             | `Integer`     | Variant ID (cheapest variant selected as main) |
 | `productId`      | `Integer`     | Product ID |
 | `title`          | `String`      | Product name |
+| `shortName`      | `String`      | Short/display name for the product. Nullable. |
 | `description`    | `String`      | Product description |
 | `slug`           | `String`      | URL-friendly slug |
 | `category`       | `String`      | Category name |
@@ -1325,6 +1332,7 @@ GET /api/products/search?query=snacks&page=2&limit=10
 |------------------|---------------|-------------|
 | `id`             | `Integer`     | Variant ID (cheapest matching variant) |
 | `title`          | `String`      | Product name |
+| `shortName`      | `String`      | Short/display name for the product. Nullable. |
 | `description`    | `String`      | Product description |
 | `slug`           | `String`      | URL-friendly slug |
 | `category`       | `String`      | Category name |

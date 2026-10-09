@@ -20,6 +20,8 @@ public class ProductDTO {
 
 	private String title;
 
+	private String shortName;
+
 	private String description;
 
 	private BigDecimal price;

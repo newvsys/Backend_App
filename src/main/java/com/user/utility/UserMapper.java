@@ -163,6 +163,7 @@ public final class UserMapper {
 
 		return ProductEO.builder()
 			.name(productCreateDTO.getName())
+			.shortName(productCreateDTO.getShortName())
 			.description(productCreateDTO.getDescription())
 			.slug(productCreateDTO.getSlug())
 			.priority(productCreateDTO.getPriority())
@@ -177,6 +178,7 @@ public final class UserMapper {
 
 		return ProductDTO.builder()
 			.title(productEO.getName())
+			.shortName(productEO.getShortName())
 			.description(productEO.getDescription())
 			.slug(productEO.getSlug())
 			.priority(productEO.getPriority())

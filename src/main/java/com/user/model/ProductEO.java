@@ -42,6 +42,9 @@ public class ProductEO {
 	@Column(length = 255, nullable = false)
 	private String name;
 
+	@Column(name = "short_name", length = 255)
+	private String shortName;
+
 	@Column(columnDefinition = "text")
 	private String description;
 
