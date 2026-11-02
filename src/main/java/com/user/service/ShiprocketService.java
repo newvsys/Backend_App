@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -76,9 +77,36 @@ public class ShiprocketService {
 	// ✅ Create Order
 	public Map createOrder(Map<String, Object> orderData) {
 		String url = baseUrl + "/orders/create/adhoc";
-		HttpEntity<Map<String, Object>> request = new HttpEntity<>(orderData, getAuthHeaders());
-		ResponseEntity<Map> response = restTemplate.postForEntity(url, request, Map.class);
-		return response.getBody();
+		try {
+			HttpEntity<Map<String, Object>> request = new HttpEntity<>(orderData, getAuthHeaders());
+			ResponseEntity<Map> response = restTemplate.postForEntity(url, request, Map.class);
+			return response.getBody();
+		}
+		catch (HttpClientErrorException.Unauthorized ex) {
+			// The cached token was rejected (expired/invalidated server-side). Drop it,
+			// force a fresh login, and retry the order creation exactly once.
+			logger.warn("Shiprocket createOrder returned 401 Unauthorized. Refreshing token and retrying once.");
+			authService.invalidateToken();
+			authService.forceRefreshToken();
+			try {
+				HttpEntity<Map<String, Object>> retryRequest = new HttpEntity<>(orderData, getAuthHeaders());
+				ResponseEntity<Map> retryResponse = restTemplate.postForEntity(url, retryRequest, Map.class);
+				return retryResponse.getBody();
+			}
+			catch (HttpClientErrorException.Unauthorized retryEx) {
+				// A freshly-minted token was STILL rejected. This is no longer a stale-token
+				// problem — the credentials themselves are being refused by Shiprocket.
+				// Common causes on a server (e.g. AWS) that work locally:
+				//   1. The server's public IP is not whitelisted in the Shiprocket API-User.
+				//   2. The deployed shiprocket.email / shiprocket.password are wrong/stale.
+				//   3. The account requires a dedicated "API User" (Settings > API > Configure).
+				logger.error("Shiprocket createOrder failed with 401 even after a fresh login. "
+						+ "Response body: {}. Verify the deployed shiprocket.email/password and that this "
+						+ "server's outbound IP is whitelisted in the Shiprocket API User settings.",
+						retryEx.getResponseBodyAsString());
+				throw retryEx;
+			}
+		}
 	}
 
 	// ✅ Create Return / Reverse Order on Shiprocket
