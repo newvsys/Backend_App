@@ -6,6 +6,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import com.user.utility.AddressUtil;
+
 @Entity
 @Table(name = "order_addresses")
 @Data
@@ -56,6 +58,7 @@ public class OrderAddressEO {
 	/** Ensures country defaults to "India" if not supplied on INSERT. */
 	@PrePersist
 	protected void onCreate() {
+		sanitizeAddressFields();
 		if (country == null || country.trim().isEmpty()) {
 			country = "India";
 		}
@@ -64,9 +67,25 @@ public class OrderAddressEO {
 	/** Ensures country is never blanked-out on UPDATE. */
 	@PreUpdate
 	protected void onUpdate() {
+		sanitizeAddressFields();
 		if (country == null || country.trim().isEmpty()) {
 			country = "India";
 		}
+	}
+
+	/**
+	 * Strips special characters (e.g. , @ # $ % ^ &amp;) from the address text
+	 * fields before persisting, keeping only letters, digits, whitespace and the
+	 * address-friendly characters {@code - . /}.
+	 */
+	private void sanitizeAddressFields() {
+		recipientName = AddressUtil.sanitize(recipientName);
+		addressLine1 = AddressUtil.sanitize(addressLine1);
+		addressLine2 = AddressUtil.sanitize(addressLine2);
+		landMark = AddressUtil.sanitize(landMark);
+		city = AddressUtil.sanitize(city);
+		state = AddressUtil.sanitize(state);
+		country = AddressUtil.sanitize(country);
 	}
 
 }
